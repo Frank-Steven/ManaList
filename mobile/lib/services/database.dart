@@ -66,6 +66,9 @@ Future<void> migrateLinksToV6(DatabaseExecutor db) async {
 
 /// DB v8 建表（design-v3 §1.1/§1.3/§1.4）：task_anchors / files /
 /// conversations / chat_messages / change_proposals。onCreate 与 v8 迁移共用。
+///
+/// v9 起初始建表直接带上新列（files.folder、conversations.draft_attachments）；
+/// 老库升级链走 [migrateToV9] 的幂等 ALTER（先查 PRAGMA 再加列），两条路径收敛。
 Future<void> createV8Tables(DatabaseExecutor db) async {
   await db.execute('''
     CREATE TABLE IF NOT EXISTS task_anchors(
@@ -90,6 +93,7 @@ Future<void> createV8Tables(DatabaseExecutor db) async {
       size INTEGER,
       local_path TEXT NOT NULL,
       source TEXT NOT NULL,
+      folder TEXT NOT NULL DEFAULT '',
       created_at INTEGER NOT NULL
     )
   ''');
@@ -98,6 +102,7 @@ Future<void> createV8Tables(DatabaseExecutor db) async {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       model_config_id TEXT,
+      draft_attachments TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
@@ -206,6 +211,23 @@ Future<void> migrateToV8(DatabaseExecutor db) async {
   if (!noteCols.any((c) => c['name'] == 'attachments')) {
     await db.execute(
         "ALTER TABLE notes ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'");
+  }
+}
+
+/// v8 → v9 迁移：files 加 folder 列（路径式虚拟文件夹，'' = 根目录）；
+/// conversations 加 draft_attachments 列（草稿附件 JSON 数组 [{type,id}]，
+/// 库页「发送给助理」与对话页附件选择器的落点，发送后清空）。
+/// 幂等：先查 PRAGMA 再 ALTER，初始建表（createV8Tables）已带新列时不重复加。
+Future<void> migrateToV9(DatabaseExecutor db) async {
+  final fileCols = await db.rawQuery('PRAGMA table_info(files)');
+  if (!fileCols.any((c) => c['name'] == 'folder')) {
+    await db.execute(
+        "ALTER TABLE files ADD COLUMN folder TEXT NOT NULL DEFAULT ''");
+  }
+  final convCols = await db.rawQuery('PRAGMA table_info(conversations)');
+  if (!convCols.any((c) => c['name'] == 'draft_attachments')) {
+    await db.execute(
+        "ALTER TABLE conversations ADD COLUMN draft_attachments TEXT NOT NULL DEFAULT '[]'");
   }
 }
 
@@ -356,7 +378,7 @@ class AppDatabase {
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'msgrepo.db'),
-      version: 8,
+      version: 9,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -390,6 +412,10 @@ class AppDatabase {
     if (oldVersion < 8) {
       // v8（design-v3 §1.5）：任务锚点/文件/对话/提案；links → 锚点迁移。
       await migrateToV8(db);
+    }
+    if (oldVersion < 9) {
+      // v9：files.folder（虚拟文件夹）+ conversations.draft_attachments（草稿附件）。
+      await migrateToV9(db);
     }
   }
 
@@ -1459,6 +1485,31 @@ class AppDatabase {
     return rows.map(LibraryFile.fromRow).toList();
   }
 
+  /// 某个文件夹（v9，'' = 根目录）下的直接文件，按创建时间倒序。
+  Future<List<LibraryFile>> getFilesInFolder(String folder) async {
+    final db = await database;
+    final rows = await db.query('files',
+        where: 'folder = ?', whereArgs: [folder], orderBy: 'created_at DESC');
+    return rows.map(LibraryFile.fromRow).toList();
+  }
+
+  /// 全部非空文件夹路径（去重，按字典序；文件夹是虚拟的，由文件 folder 字段派生）。
+  Future<List<String>> getFileFolders() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+        "SELECT DISTINCT folder FROM files WHERE folder != '' ORDER BY folder ASC");
+    return [for (final r in rows) r['folder'] as String];
+  }
+
+  /// 批量移动文件到目标文件夹（v9；'' = 根目录）。
+  Future<void> moveFilesToFolder(List<String> ids, String folder) async {
+    if (ids.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(ids.length, '?').join(',');
+    await db.update('files', {'folder': folder},
+        where: 'id IN ($placeholders)', whereArgs: ids);
+  }
+
   Future<LibraryFile?> getFileById(String id) async {
     final db = await database;
     final rows =
@@ -1533,6 +1584,39 @@ class AppDatabase {
     await db.update('conversations',
         {'updated_at': DateTime.now().millisecondsSinceEpoch},
         where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 整份覆盖草稿附件（v9；对话页附件选择器与移除 chip 的写透路径）。
+  Future<void> setConversationDraftAttachments(
+      String id, List<ChatAttachment> attachments) async {
+    final db = await database;
+    await db.update(
+        'conversations',
+        {'draft_attachments': jsonEncode(attachments.map((e) => e.toJson()).toList())},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 追加草稿附件（v9，库页「发送给助理」用）：按 type:id 去重，返回追加后的全量。
+  Future<List<ChatAttachment>> appendConversationDraftAttachments(
+      String id, List<ChatAttachment> items) async {
+    final db = await database;
+    final rows = await db.query('conversations',
+        columns: ['draft_attachments'], where: 'id = ?', whereArgs: [id], limit: 1);
+    if (rows.isEmpty) return const [];
+    final current = rows.first['draft_attachments'] == null
+        ? <ChatAttachment>[]
+        : (jsonDecode(rows.first['draft_attachments'] as String) as List)
+            .map((e) => ChatAttachment.fromJson(e as Map<String, dynamic>))
+            .toList();
+    final seen = {for (final a in current) '${a.type}:${a.id}'};
+    for (final a in items) {
+      if (seen.add('${a.type}:${a.id}')) current.add(a);
+    }
+    await db.update(
+        'conversations',
+        {'draft_attachments': jsonEncode(current.map((e) => e.toJson()).toList())},
+        where: 'id = ?', whereArgs: [id]);
+    return current;
   }
 
   /// 删除对话：chat_messages 级联删（应用层）；change_proposals 松耦合，

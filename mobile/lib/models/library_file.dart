@@ -2,6 +2,9 @@
 ///
 /// 文件本体由 attachment_store 管理（沙盒路径），本表只存元数据；
 /// 笔记 attachments、任务锚点（target_type='file'）、助理附件都引用这里的 id。
+///
+/// DB v9：新增 [folder] 路径式文件夹（如 `工作/截图`，'' = 根目录）；
+/// 文件夹是虚拟的，只落在文件的 folder 字段上，无独立文件夹表。
 class FileSource {
   static const userUpload = 'user_upload';
   static const aiGenerated = 'ai_generated';
@@ -19,6 +22,9 @@ class LibraryFile {
   /// attachment_store 管理的沙盒路径。
   final String localPath;
   final String source;
+
+  /// 所在文件夹路径（'' = 根目录），DB v9 起。
+  final String folder;
   final int createdAt;
 
   const LibraryFile({
@@ -28,6 +34,7 @@ class LibraryFile {
     this.size,
     required this.localPath,
     required this.source,
+    this.folder = '',
     required this.createdAt,
   });
 
@@ -38,6 +45,7 @@ class LibraryFile {
         size: (row['size'] as num?)?.toInt(),
         localPath: row['local_path'] as String,
         source: row['source'] as String,
+        folder: row['folder'] as String? ?? '',
         createdAt: (row['created_at'] as num).toInt(),
       );
 
@@ -48,6 +56,7 @@ class LibraryFile {
         'size': size,
         'local_path': localPath,
         'source': source,
+        'folder': folder,
         'created_at': createdAt,
       };
 
@@ -58,6 +67,7 @@ class LibraryFile {
     int? Function()? size,
     String? localPath,
     String? source,
+    String? folder,
     int? createdAt,
   }) =>
       LibraryFile(
@@ -67,6 +77,7 @@ class LibraryFile {
         size: size != null ? size() : this.size,
         localPath: localPath ?? this.localPath,
         source: source ?? this.source,
+        folder: folder ?? this.folder,
         createdAt: createdAt ?? this.createdAt,
       );
 }

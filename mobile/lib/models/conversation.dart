@@ -19,6 +19,10 @@ class Conversation {
 
   /// 该对话绑定的模型配置（可切换）。
   final String? modelConfigId;
+
+  /// 草稿附件（DB v9，conversations.draft_attachments）：库页「发送给助理」
+  /// 与对话页附件选择器都写到这里；发送时随消息落 chat_messages.attachments 并清空。
+  final List<ChatAttachment> draftAttachments;
   final int createdAt;
   final int updatedAt;
 
@@ -26,6 +30,7 @@ class Conversation {
     required this.id,
     required this.title,
     this.modelConfigId,
+    this.draftAttachments = const [],
     required this.createdAt,
     required this.updatedAt,
   });
@@ -34,6 +39,11 @@ class Conversation {
         id: row['id'] as String,
         title: row['title'] as String,
         modelConfigId: row['model_config_id'] as String?,
+        draftAttachments: row['draft_attachments'] == null
+            ? const []
+            : (jsonDecode(row['draft_attachments'] as String) as List)
+                .map((e) => ChatAttachment.fromJson(e as Map<String, dynamic>))
+                .toList(),
         createdAt: (row['created_at'] as num).toInt(),
         updatedAt: (row['updated_at'] as num).toInt(),
       );
@@ -42,6 +52,8 @@ class Conversation {
         'id': id,
         'title': title,
         'model_config_id': modelConfigId,
+        'draft_attachments':
+            jsonEncode(draftAttachments.map((e) => e.toJson()).toList()),
         'created_at': createdAt,
         'updated_at': updatedAt,
       };
@@ -50,6 +62,7 @@ class Conversation {
     String? id,
     String? title,
     String? Function()? modelConfigId,
+    List<ChatAttachment>? draftAttachments,
     int? createdAt,
     int? updatedAt,
   }) =>
@@ -58,6 +71,7 @@ class Conversation {
         title: title ?? this.title,
         modelConfigId:
             modelConfigId != null ? modelConfigId() : this.modelConfigId,
+        draftAttachments: draftAttachments ?? this.draftAttachments,
         createdAt: createdAt ?? this.createdAt,
         updatedAt: updatedAt ?? this.updatedAt,
       );

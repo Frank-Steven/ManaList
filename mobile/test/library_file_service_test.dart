@@ -22,6 +22,7 @@ Future<void> createTables(Database db) async {
       size INTEGER,
       local_path TEXT NOT NULL,
       source TEXT NOT NULL,
+      folder TEXT NOT NULL DEFAULT '',
       created_at INTEGER NOT NULL
     )
   ''');

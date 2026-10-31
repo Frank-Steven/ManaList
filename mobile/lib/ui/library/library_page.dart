@@ -29,8 +29,9 @@ class LibraryPageState extends State<LibraryPage>
   final _messagesKey = GlobalKey<MessagesPageState>();
   final _filesKey = GlobalKey<FilesPageState>();
 
-  /// 消息分区处于多选态时隐藏 FAB（避免遮挡底部批量操作条）。
+  /// 消息/文件分区处于多选态时隐藏 FAB（避免遮挡底部批量操作条）。
   bool _messagesSelecting = false;
+  bool _filesSelecting = false;
 
   @override
   void initState() {
@@ -87,6 +88,9 @@ class LibraryPageState extends State<LibraryPage>
   Widget? _buildFab() {
     if (_tab.index == AppUiState.librarySectionMessages &&
         _messagesSelecting) {
+      return null;
+    }
+    if (_tab.index == AppUiState.librarySectionFiles && _filesSelecting) {
       return null;
     }
     final (tooltip, onPressed) = switch (_tab.index) {
@@ -155,7 +159,11 @@ class LibraryPageState extends State<LibraryPage>
                 setState(() => _messagesSelecting = selecting),
           ),
           NotesPage(key: _notesKey),
-          FilesPage(key: _filesKey),
+          FilesPage(
+            key: _filesKey,
+            onSelectionChanged: (selecting) =>
+                setState(() => _filesSelecting = selecting),
+          ),
         ],
       ),
       floatingActionButton: _buildFab(),

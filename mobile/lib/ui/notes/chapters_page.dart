@@ -2,7 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../models/note.dart';
+import '../../services/assistant/models.dart';
 import '../../services/database.dart';
+import '../assistant/send_to_assistant.dart';
+import '../messages/message_widgets.dart'
+    show SelectionAction, SelectionActionBar;
 import 'note_editor_page.dart';
 import 'notes_page.dart';
 
@@ -167,6 +171,7 @@ class _ChaptersPageState extends State<ChaptersPage> {
 }
 
 /// 笔记模块第三层：章节内笔记列表（updated_at 倒序）。
+/// 多选态（长按进入）底部操作条带「发送给助理」（草稿附件，DB v9）。
 class NotesListPage extends StatefulWidget {
   final Chapter chapter;
 
@@ -179,6 +184,9 @@ class NotesListPage extends StatefulWidget {
 class _NotesListPageState extends State<NotesListPage> {
   List<Note> _notes = [];
 
+  bool _selecting = false;
+  final Set<String> _selected = {};
+
   @override
   void initState() {
     super.initState();
@@ -187,7 +195,33 @@ class _NotesListPageState extends State<NotesListPage> {
 
   Future<void> _reload() async {
     final notes = await AppDatabase.instance.getNotes(widget.chapter.id);
-    if (mounted) setState(() => _notes = notes);
+    if (mounted) {
+      setState(() {
+        _notes = notes;
+        _selected.removeWhere((id) => !notes.any((n) => n.id == id));
+        if (_selected.isEmpty) _selecting = false;
+      });
+    }
+  }
+
+  void _toggleSelect(Note n) {
+    setState(() {
+      if (!_selected.remove(n.id)) _selected.add(n.id);
+      if (_selected.isEmpty) _selecting = false;
+    });
+  }
+
+  Future<void> _sendSelectedToAssistant() async {
+    final targets = _notes.where((n) => _selected.contains(n.id)).toList();
+    if (targets.isEmpty) return;
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+    await sendToAssistant(context, [
+      for (final n in targets)
+        ChatAttachment(type: ChatAttachmentType.note, id: n.id),
+    ]);
   }
 
   Future<void> _addNote() async {
@@ -225,9 +259,20 @@ class _NotesListPageState extends State<NotesListPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.chapter.name),
+        leading: _selecting
+            ? IconButton(
+                tooltip: '退出',
+                icon: const Icon(Icons.close),
+                onPressed: () => setState(() {
+                  _selecting = false;
+                  _selected.clear();
+                }),
+              )
+            : null,
+        title: Text(_selecting ? '已选 ${_selected.length} 项' : widget.chapter.name),
         actions: [
-          IconButton(icon: const Icon(Icons.add), onPressed: _addNote),
+          if (!_selecting)
+            IconButton(icon: const Icon(Icons.add), onPressed: _addNote),
         ],
       ),
       body: _notes.isEmpty
@@ -236,11 +281,17 @@ class _NotesListPageState extends State<NotesListPage> {
               itemCount: _notes.length,
               itemBuilder: (context, index) {
                 final note = _notes[index];
+                final selected = _selected.contains(note.id);
                 final firstLine = note.content
                     .split('\n')
                     .map((l) => l.trim())
                     .firstWhere((l) => l.isNotEmpty, orElse: () => '');
                 return ListTile(
+                  leading: _selecting
+                      ? Icon(selected
+                          ? Icons.check_circle
+                          : Icons.radio_button_unchecked)
+                      : null,
                   title: Text(note.title,
                       maxLines: 1, overflow: TextOverflow.ellipsis),
                   subtitle: Column(
@@ -253,16 +304,44 @@ class _NotesListPageState extends State<NotesListPage> {
                           style: Theme.of(context).textTheme.bodySmall),
                     ],
                   ),
-                  trailing: PopupMenuButton<String>(
-                    onSelected: (_) => _deleteNote(note),
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(value: 'delete', child: Text('删除')),
-                    ],
-                  ),
-                  onTap: () => _openNote(note),
+                  trailing: _selecting
+                      ? null
+                      : PopupMenuButton<String>(
+                          onSelected: (_) => _deleteNote(note),
+                          itemBuilder: (_) => const [
+                            PopupMenuItem(value: 'delete', child: Text('删除')),
+                          ],
+                        ),
+                  onTap: () {
+                    if (_selecting) {
+                      _toggleSelect(note);
+                    } else {
+                      _openNote(note);
+                    }
+                  },
+                  onLongPress: () {
+                    if (!_selecting) {
+                      setState(() {
+                        _selecting = true;
+                        _selected.add(note.id);
+                      });
+                    }
+                  },
                 );
               },
             ),
+      bottomNavigationBar: _selecting
+          ? SelectionActionBar(
+              actions: [
+                SelectionAction(
+                  icon: Icons.send_outlined,
+                  tooltip: '发送给助理',
+                  enabled: _selected.isNotEmpty,
+                  onTap: _sendSelectedToAssistant,
+                ),
+              ],
+            )
+          : null,
     );
   }
 }

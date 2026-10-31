@@ -11,6 +11,7 @@ import '../../services/database.dart';
 import '../../services/notification_bridge.dart';
 import '../../services/undo_service.dart';
 import '../add_message_page.dart';
+import '../assistant/send_to_assistant.dart';
 import '../tasks/task_editor.dart';
 import 'archived_page.dart';
 import 'message_detail_sheet.dart';
@@ -856,6 +857,15 @@ class MessagesPageState extends State<MessagesPage> {
         targets.every((m) => _linkedTaskIds(m).isNotEmpty);
     return SelectionActionBar(
       actions: [
+        SelectionAction(
+          icon: Icons.send_outlined,
+          tooltip: '发送给助理',
+          enabled: hasSelection,
+          onTap: () => _runBatch((targets) => sendToAssistant(context, [
+                for (final m in targets)
+                  ChatAttachment(type: ChatAttachmentType.message, id: m.id),
+              ])),
+        ),
         SelectionAction(
           icon: Icons.archive_outlined,
           tooltip: '归档',

@@ -11,6 +11,10 @@ import 'widgets/proposal_card.dart';
 
 /// 对话页（design-v3 §5.1）：流式渲染、附件 chip、工具调用提案卡片内联
 /// （摘要 + 跳待确认区）、streaming/error 状态展示。
+///
+/// 附件 bar 即草稿附件（DB v9 conversations.draft_attachments）：打开对话时
+/// 从草稿加载，附件选择器与 chip 移除都写透到草稿；库页「发送给助理」追加的
+/// 条目也会出现在这里。发送时草稿随消息落 chat_messages.attachments 并清空。
 class ChatPage extends StatefulWidget {
   final Conversation conversation;
 
@@ -65,7 +69,11 @@ class _ChatPageState extends State<ChatPage> {
     setState(() {
       _messages = messages;
       _proposalsByBatch = byBatch;
-      if (conv != null) _conversation = conv;
+      if (conv != null) {
+        _conversation = conv;
+        // 草稿附件是附件 bar 的唯一事实源（库页「发送给助理」会追加到这里）
+        _pendingAttachments = conv.draftAttachments;
+      }
     });
     _scrollToBottom();
   }
@@ -85,6 +93,8 @@ class _ChatPageState extends State<ChatPage> {
     );
     if (picked != null && mounted) {
       setState(() => _pendingAttachments = picked);
+      await AppDatabase.instance
+          .setConversationDraftAttachments(_conversation.id, picked);
     }
   }
 
@@ -113,6 +123,9 @@ class _ChatPageState extends State<ChatPage> {
       _streamingText = '';
       _errorText = null;
     });
+    // 草稿附件随消息落库（sendTurn 的 attachments 参数），草稿立即清空
+    await AppDatabase.instance
+        .setConversationDraftAttachments(_conversation.id, const []);
 
     final stream = AssistantService.instance.sendTurn(
       conversation: _conversation,
@@ -320,8 +333,11 @@ class _ChatPageState extends State<ChatPage> {
               child: InputChip(
                 label: Text('${a.type}:${_short(a.id)}',
                     style: const TextStyle(fontSize: 11)),
-                onDeleted: () =>
-                    setState(() => _pendingAttachments.remove(a)),
+                onDeleted: () {
+                  setState(() => _pendingAttachments.remove(a));
+                  AppDatabase.instance.setConversationDraftAttachments(
+                      _conversation.id, _pendingAttachments);
+                },
               ),
             ),
         ],
