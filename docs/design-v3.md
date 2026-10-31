@@ -164,6 +164,12 @@ CREATE INDEX idx_proposals_status ON change_proposals(status);
 3. `notes` 加列 `attachments TEXT`；
 4. 迁移测试：`mobile/test/` 新增 `db_v8_migration_test.dart`（内存 SQLite 走 `sqflite_common_ffi`，沿用现有测试基建）。
 
+### 1.6 v9 增量（2026-11-01，UI 批次落地）
+
+- `files` 加列 `folder TEXT NOT NULL DEFAULT ''`：路径式虚拟文件夹（`/` 分段，`''` 为根目录），无独立文件夹表；
+- `conversations` 加列 `draft_attachments TEXT NOT NULL DEFAULT '[]'`：对话草稿附件（JSON 数组 `[{type,id}]`），库内「发送给助理」与对话页附件 bar 的唯一事实源；
+- 迁移测试：`mobile/test/db_v9_migration_test.dart`。
+
 ---
 
 ## 2. shared/ 契约更新
