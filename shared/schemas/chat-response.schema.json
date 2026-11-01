@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://msgrepo.dev/schemas/chat-response.schema.json",
+  "title": "ChatEvent",
+  "description": "POST /v1/chat 的流式响应事件（SSE/NDJSON，design-v3 §2、§5.4）。desktop 不解析不执行工具：token_delta 为模型原始输出透传（含 ```tool 工具调用块原文，design-v3-details §2）；proposal 事件承载 AI 输出的一个原子工具调用，proposalId 由客户端（手机端解析层）生成，对应一条待确认区 change_proposals 落库通知。",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["type", "delta"],
+      "properties": {
+        "type": { "const": "token_delta" },
+        "delta": {
+          "type": "string",
+          "description": "模型输出的增量文本，可含工具调用块片段"
+        }
+      },
+      "description": "增量 token 事件"
+    },
+    {
+      "type": "object",
+      "required": ["type", "proposalId", "tool", "args"],
+      "properties": {
+        "type": { "const": "proposal" },
+        "proposalId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "提案 id，由客户端生成，与 change_proposals.id 一致"
+        },
+        "tool": {
+          "type": "string",
+          "description": "原子工具名，如 task.create / note.append / anchor.create（清单见 design-v3 §5.2）"
+        },
+        "args": {
+          "type": "object",
+          "description": "原子变更的完整参数，审批通过后据此执行"
+        }
+      },
+      "description": "原子工具调用提案事件：一个调用 = 一个最小变更，落待确认区由人工审批"
+    },
+    {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "done" }
+      },
+      "description": "流正常结束"
+    },
+    {
+      "type": "object",
+      "required": ["type", "error"],
+      "properties": {
+        "type": { "const": "error" },
+        "error": {
+          "type": "string",
+          "description": "错误描述（网络中断、模型错误等）；未闭合的工具调用块整体丢弃"
+        }
+      },
+      "description": "流异常终止"
+    }
+  ]
+}

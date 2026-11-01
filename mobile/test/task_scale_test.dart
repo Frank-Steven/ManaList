@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:msgrepo_mobile/models/task.dart';
 import 'package:msgrepo_mobile/services/task_scale.dart';
 
 DateTime _d(int year, int month, int day, [int hour = 9]) =>
@@ -124,4 +125,42 @@ void main() {
       expect(scalesForView('其他'), isEmpty);
     });
   });
+
+  group('P1-1：point 任务即使带 endAt 也只按点派生', () {
+    test('同日 → timed（与不带 kind 的旧行为一致）', () {
+      expect(
+          deriveTimeScale(_d(2026, 10, 13, 9), _d(2026, 10, 13, 18),
+              kind: TaskKind.point),
+          'timed');
+    });
+
+    test('跨周 → 仍为 timed（修复前误判 daily）', () {
+      final s = _d(2026, 10, 13);
+      final e = _d(2026, 10, 20, 9);
+      expect(deriveTimeScale(s, e), 'daily', reason: '不传 kind 时保持旧行为');
+      expect(deriveTimeScale(s, e, kind: TaskKind.point), 'timed');
+    });
+
+    test('跨月 → 仍为 timed（修复前误判 weekly）', () {
+      final s = _d(2026, 10, 5);
+      final e = _d(2026, 11, 20);
+      expect(deriveTimeScale(s, e), 'weekly', reason: '不传 kind 时保持旧行为');
+      expect(deriveTimeScale(s, e, kind: TaskKind.point), 'timed');
+    });
+
+    test('range 任务不受影响', () {
+      expect(
+          deriveTimeScale(_d(2026, 10, 13), _d(2026, 11, 20),
+              kind: TaskKind.range),
+          'weekly');
+    });
+
+    test('deriveTaskScale 同样归一化（毫秒时间戳入口）', () {
+      final s = _d(2026, 10, 13).millisecondsSinceEpoch;
+      final e = _d(2026, 12, 30).millisecondsSinceEpoch;
+      expect(deriveTaskScale(s, e), 'monthly');
+      expect(deriveTaskScale(s, e, kind: TaskKind.point), 'timed');
+    });
+  });
+
 }

@@ -1,9 +1,12 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/task.dart';
-import 'package:msgrepo_mobile/ui/schedule/layout.dart';
+import 'package:msgrepo_mobile/ui/tasks/views/layout.dart';
 
 Task _task(String id, int startMs,
-        {int? endMs, String title = '任务', String? parentId}) =>
+        {int? endMs,
+        String title = '任务',
+        String? parentId,
+        String priority = TaskPriority.normal}) =>
     Task(
       id: id,
       title: title,
@@ -13,6 +16,7 @@ Task _task(String id, int startMs,
       createdAt: 0,
       updatedAt: 0,
       parentId: parentId,
+      priority: priority,
     );
 
 int _ms(int year, int month, [int day = 1, int hour = 9, int minute = 0]) =>
@@ -126,6 +130,47 @@ void main() {
       expect(items.single.taskId, 'sub');
       expect(items.single.slot, 0);
       expect(items.single.isSubtask, isFalse);
+    });
+
+    // 2026-10-28 分行优先级规则：同一槽位可放多个任务竞争时，
+    // important（红）先放靠上、minor（绿）最后放靠下、normal 居中，
+    // 优先级优先于开始时间。
+    test('槽位竞争时 important 靠上、normal 居中、minor 靠下', () {
+      final items = layoutYearLane([
+        // 开始最早但优先级最低：最后放，被挤到最下
+        _task('minor-line', _ms(2026, 1),
+            endMs: _ms(2026, 4), priority: TaskPriority.minor), // 1-3 月
+        _task('imp', _ms(2026, 2),
+            endMs: _ms(2026, 3, 15), priority: TaskPriority.important), // 2-3 月
+        _task('norm', _ms(2026, 3), priority: TaskPriority.normal), // 3 月
+      ], 2026);
+      final byId = {for (final e in items) e.taskId: e};
+      expect(byId['imp']!.slot, 0); // 最重要：先放最上槽
+      expect(byId['norm']!.slot, 1); // 3 月被 imp 占据
+      expect(byId['minor-line']!.slot, 2); // 1-3 月与 imp/norm 均冲突，落最下
+    });
+
+    test('同优先级内仍按开始时间填充（跳位规则不变）', () {
+      final items = layoutYearLane([
+        _task('line', _ms(2026, 1),
+            endMs: _ms(2026, 4), priority: TaskPriority.important),
+        _task('n1', _ms(2026, 2),
+            endMs: _ms(2026, 3, 15), priority: TaskPriority.important),
+        _task('n2', _ms(2026, 3), priority: TaskPriority.important),
+      ], 2026);
+      final byId = {for (final e in items) e.taskId: e};
+      expect(byId['line']!.slot, 0);
+      expect(byId['n1']!.slot, 1);
+      expect(byId['n2']!.slot, 2);
+    });
+
+    test('优先级只影响填充顺序，不相交时仍共享最上槽位', () {
+      final items = layoutYearLane([
+        _task('minor', _ms(2026, 6), priority: TaskPriority.minor),
+        _task('imp', _ms(2026, 10), priority: TaskPriority.important),
+      ], 2026);
+      // 互不重叠：都占 slot 0
+      expect(items.every((e) => e.slot == 0), isTrue);
     });
   });
 

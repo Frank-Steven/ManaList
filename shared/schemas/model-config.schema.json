@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://msgrepo.dev/schemas/model-config.schema.json",
+  "title": "ModelConfig",
+  "description": "模型配置（design-v3 §6.2）：desktop config/default.json 的 models[] 条目，经 GET /v1/models 上报手机端；手机端本地保存的远程端点配置同构。每个对话绑定一个模型配置（conversations.model_config_id）。Ollama 暂缓，provider 枚举暂只列 openai-compat / mock。",
+  "type": "object",
+  "required": ["id", "name", "provider", "baseUrl", "model"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "配置唯一标识，如 local-gemma"
+    },
+    "name": {
+      "type": "string",
+      "description": "显示名，如 Gemma 4 26B (本地)"
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["openai-compat", "mock"],
+      "description": "openai-compat=OpenAI 兼容端点（本地推理服务或远程 API）；mock=内置假模型，无真实模型时跑通全链路（测试用）"
+    },
+    "baseUrl": {
+      "type": "string",
+      "description": "OpenAI 兼容 API 根地址，如 http://127.0.0.1:8080/v1"
+    },
+    "model": {
+      "type": "string",
+      "description": "模型名，如 gemma-4-26b-a4b-it"
+    },
+    "apiKeyEnv": {
+      "type": "string",
+      "description": "API key 所在环境变量名（desktop 侧远程端点用），不直接存密钥。可选"
+    },
+    "vision": {
+      "type": "boolean",
+      "description": "模型是否支持图像输入（多模态）。true 时手机端会把图片附件内联进请求（OpenAI image_url 内容块）；缺省 false。可选"
+    }
+  }
+}

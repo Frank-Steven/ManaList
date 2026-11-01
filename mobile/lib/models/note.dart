@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 /// v2 笔记三级模型，对应设计文档 §1.3 的 notebooks / chapters / notes 表。
+/// v3（DB v8）：notes 增加 attachments 列（JSON 数组，引用 files.id）。
 class Notebook {
   final String id;
   final String name;
@@ -88,6 +91,9 @@ class Note {
   final String title;
   final String content;
   final String contentFormat;
+
+  /// 附件文件 id 列表（引用 files.id，DB v8 新增列；旧库行缺省为空）。
+  final List<String> attachments;
   final int createdAt;
   final int updatedAt;
 
@@ -97,6 +103,7 @@ class Note {
     required this.title,
     this.content = '',
     this.contentFormat = 'plain',
+    this.attachments = const [],
     required this.createdAt,
     required this.updatedAt,
   });
@@ -107,6 +114,11 @@ class Note {
         title: row['title'] as String,
         content: row['content'] as String,
         contentFormat: row['content_format'] as String,
+        attachments: row['attachments'] == null
+            ? const []
+            : (jsonDecode(row['attachments'] as String) as List)
+                .map((e) => e.toString())
+                .toList(),
         createdAt: (row['created_at'] as num).toInt(),
         updatedAt: (row['updated_at'] as num).toInt(),
       );
@@ -117,6 +129,7 @@ class Note {
         'title': title,
         'content': content,
         'content_format': contentFormat,
+        'attachments': jsonEncode(attachments),
         'created_at': createdAt,
         'updated_at': updatedAt,
       };
@@ -127,6 +140,7 @@ class Note {
     String? title,
     String? content,
     String? contentFormat,
+    List<String>? attachments,
     int? createdAt,
     int? updatedAt,
   }) =>
@@ -136,6 +150,7 @@ class Note {
         title: title ?? this.title,
         content: content ?? this.content,
         contentFormat: contentFormat ?? this.contentFormat,
+        attachments: attachments ?? this.attachments,
         createdAt: createdAt ?? this.createdAt,
         updatedAt: updatedAt ?? this.updatedAt,
       );

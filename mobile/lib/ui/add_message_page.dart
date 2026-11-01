@@ -4,6 +4,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/message.dart';
+import '../services/attachment_store.dart';
 import '../services/database.dart';
 
 /// 手动添加消息：附件只存访问方式（本地路径 / content URI / 链接 / 小程序路径），
@@ -33,36 +34,47 @@ class _AddMessagePageState extends State<AddMessagePage> {
   Future<void> _pickImage() async {
     final x = await ImagePicker().pickImage(source: ImageSource.gallery);
     if (x == null) return;
-    setState(() {
-      _attachments.add(Attachment(
-        id: _uuid.v4(),
-        kind: Attachment.kindImage,
-        label: x.name,
-        access: AttachmentAccess(
-          type: AttachmentAccess.typeLocalPath,
-          value: x.path,
-          mimeType: x.mimeType,
-        ),
-      ));
-    });
+    if (!mounted) return; // P3-5：await 之后页面可能已销毁
+    // P3-2：image_picker 给的是缓存路径，必须复制进应用私有目录
+    final stored = await AttachmentStore.instance.importPath(
+      x.path,
+      kind: Attachment.kindImage,
+      label: x.name,
+      mimeType: x.mimeType,
+    );
+    if (!mounted) return;
+    if (stored == null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('图片读取失败，未添加')));
+      return;
+    }
+    setState(() => _attachments.add(stored));
   }
 
   Future<void> _pickFile() async {
     final result = await FilePicker.platform.pickFiles();
     final f = result?.files.firstOrNull;
     if (f == null) return;
+    if (!mounted) return; // P3-5：await 之后页面可能已销毁
+    // P3-2：同样复制进仓库；没有本地路径（纯 content://）时退化为只记访问方式
+    final stored = f.path == null
+        ? null
+        : await AttachmentStore.instance.importPath(f.path!,
+            kind: Attachment.kindFile,
+            label: f.name,
+          );
+    if (!mounted) return;
     setState(() {
-      _attachments.add(Attachment(
-        id: _uuid.v4(),
-        kind: Attachment.kindFile,
-        label: f.name,
-        access: AttachmentAccess(
-          type: f.path != null
-              ? AttachmentAccess.typeLocalPath
-              : AttachmentAccess.typeContentUri,
-          value: f.path ?? '',
-        ),
-      ));
+      _attachments.add(stored ??
+          Attachment(
+            id: _uuid.v4(),
+            kind: Attachment.kindFile,
+            label: f.name,
+            access: AttachmentAccess(
+              type: AttachmentAccess.typeContentUri,
+              value: f.path ?? '',
+            ),
+          ));
     });
   }
 
@@ -73,6 +85,7 @@ class _AddMessagePageState extends State<AddMessagePage> {
       hint: '粘贴网页链接',
     );
     if (value == null || value.isEmpty) return;
+    if (!mounted) return; // P3-5：await 之后页面可能已销毁
     setState(() {
       _attachments.add(Attachment(
         id: _uuid.v4(),
@@ -90,6 +103,7 @@ class _AddMessagePageState extends State<AddMessagePage> {
       hint: '小程序页面路径',
     );
     if (value == null || value.isEmpty) return;
+    if (!mounted) return; // P3-5：await 之后页面可能已销毁
     setState(() {
       _attachments.add(Attachment(
         id: _uuid.v4(),

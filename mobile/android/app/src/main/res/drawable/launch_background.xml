@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 启动窗：品牌底色 + 居中 64dp 图标（2026-11-01：Flutter 启动页已移除，
+     启动画面完全由此构成，引擎就绪、首帧画出即进入主界面）。
+     Manifest 的 io.flutter.embedding.android.SplashScreenDrawable
+     也指向本文件，引擎初始化期间由它持续铺同一画面。 -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/white"/>
+    <item android:drawable="@color/splash_bg" />
+    <item android:drawable="@drawable/splash_icon_centered" />
 </layer-list>

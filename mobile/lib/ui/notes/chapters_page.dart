@@ -2,15 +2,30 @@ import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../models/note.dart';
+import '../../services/assistant/models.dart';
 import '../../services/database.dart';
+import '../assistant/attachment_pick_controller.dart';
+import '../assistant/send_to_assistant.dart';
+import '../messages/message_widgets.dart'
+    show SelectionAction, SelectionActionBar;
 import 'note_editor_page.dart';
 import 'notes_page.dart';
 
 /// 笔记模块第二层：章节列表。长按拖动排序；行尾菜单重命名/删除（级联 + 复合撤销）。
+/// pick 模式（2026-11-01，附件选择）：仅下钻传参，本层无可选条目。
 class ChaptersPage extends StatefulWidget {
   final Notebook notebook;
 
-  const ChaptersPage({super.key, required this.notebook});
+  /// 附件选择模式：下钻笔记列表复用多选，选择状态写入 [pickController]。
+  final bool pickMode;
+  final AttachmentPickController? pickController;
+
+  const ChaptersPage({
+    super.key,
+    required this.notebook,
+    this.pickMode = false,
+    this.pickController,
+  });
 
   @override
   State<ChaptersPage> createState() => _ChaptersPageState();
@@ -45,7 +60,12 @@ class _ChaptersPageState extends State<ChaptersPage> {
 
   Future<void> _openNotes(Chapter chapter) async {
     await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => NotesListPage(chapter: chapter)),
+      MaterialPageRoute(
+          builder: (_) => NotesListPage(
+                chapter: chapter,
+                pickMode: widget.pickMode,
+                pickController: widget.pickController,
+              )),
     );
     await _reload();
   }
@@ -167,10 +187,22 @@ class _ChaptersPageState extends State<ChaptersPage> {
 }
 
 /// 笔记模块第三层：章节内笔记列表（updated_at 倒序）。
+/// 多选态（长按进入）底部操作条带「发送给助理」（草稿附件，DB v9）。
+/// pick 模式（2026-11-01，附件选择）：选择状态写入 [pickController]
+/// （退出本页后选择仍保留在控制器里），底部操作条由附件选择页统一提供。
 class NotesListPage extends StatefulWidget {
   final Chapter chapter;
 
-  const NotesListPage({super.key, required this.chapter});
+  /// 附件选择模式。
+  final bool pickMode;
+  final AttachmentPickController? pickController;
+
+  const NotesListPage({
+    super.key,
+    required this.chapter,
+    this.pickMode = false,
+    this.pickController,
+  });
 
   @override
   State<NotesListPage> createState() => _NotesListPageState();
@@ -179,15 +211,92 @@ class NotesListPage extends StatefulWidget {
 class _NotesListPageState extends State<NotesListPage> {
   List<Note> _notes = [];
 
+  bool _selecting = false;
+  final Set<String> _selected = {};
+
   @override
   void initState() {
     super.initState();
+    // pick 模式：本地 _selected 是控制器（唯一事实源）的镜像
+    if (widget.pickMode) {
+      widget.pickController?.addListener(_syncFromPick);
+      _syncFromPick();
+    }
     _reload();
+  }
+
+  @override
+  void dispose() {
+    if (widget.pickMode) {
+      widget.pickController?.removeListener(_syncFromPick);
+    }
+    super.dispose();
+  }
+
+  AttachmentPickController? get _pick =>
+      widget.pickMode ? widget.pickController : null;
+
+  /// pick 模式：控制器 → 本地多选态回同步。
+  void _syncFromPick() {
+    final pick = _pick;
+    if (pick == null || !mounted) return;
+    setState(() {
+      _selected
+        ..clear()
+        ..addAll(pick.idsOfType(ChatAttachmentType.note));
+      if (_selected.isEmpty) _selecting = false;
+    });
   }
 
   Future<void> _reload() async {
     final notes = await AppDatabase.instance.getNotes(widget.chapter.id);
-    if (mounted) setState(() => _notes = notes);
+    if (mounted) {
+      setState(() {
+        _notes = notes;
+        if (!widget.pickMode) {
+          _selected.removeWhere((id) => !notes.any((n) => n.id == id));
+          if (_selected.isEmpty) _selecting = false;
+        }
+      });
+      // pick 模式：为已选条目补充显示名（底栏 chip 用）
+      final pick = _pick;
+      if (pick != null) {
+        for (final n in notes) {
+          if (pick.isSelected(ChatAttachmentType.note, n.id)) {
+            pick.registerMeta(
+                ChatAttachmentType.note, n.id, n.title, Icons.note_outlined);
+          }
+        }
+      }
+    }
+  }
+
+  void _toggleSelect(Note n) {
+    final pick = _pick;
+    if (pick != null) {
+      // pick 模式：写控制器，本地状态由 _syncFromPick 回同步
+      pick.toggle(ChatAttachmentType.note, n.id,
+          title: n.title, icon: Icons.note_outlined);
+      setState(() => _selecting = true);
+      return;
+    }
+    setState(() {
+      if (!_selected.remove(n.id)) _selected.add(n.id);
+      if (_selected.isEmpty) _selecting = false;
+    });
+  }
+
+  Future<void> _sendSelectedToAssistant() async {
+    final targets = _notes.where((n) => _selected.contains(n.id)).toList();
+    if (targets.isEmpty) return;
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+    await sendToAssistant(context, [
+      for (final n in targets)
+        ChatAttachment(type: ChatAttachmentType.note, id: n.id),
+    ]);
   }
 
   Future<void> _addNote() async {
@@ -225,9 +334,28 @@ class _NotesListPageState extends State<NotesListPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.chapter.name),
+        leading: _selecting
+            ? IconButton(
+                tooltip: '退出',
+                icon: const Icon(Icons.close),
+                onPressed: () {
+                  final pick = _pick;
+                  if (pick != null) {
+                    pick.clearType(ChatAttachmentType.note);
+                    setState(() => _selecting = false);
+                    return;
+                  }
+                  setState(() {
+                    _selecting = false;
+                    _selected.clear();
+                  });
+                },
+              )
+            : null,
+        title: Text(_selecting ? '已选 ${_selected.length} 项' : widget.chapter.name),
         actions: [
-          IconButton(icon: const Icon(Icons.add), onPressed: _addNote),
+          if (!_selecting)
+            IconButton(icon: const Icon(Icons.add), onPressed: _addNote),
         ],
       ),
       body: _notes.isEmpty
@@ -236,11 +364,19 @@ class _NotesListPageState extends State<NotesListPage> {
               itemCount: _notes.length,
               itemBuilder: (context, index) {
                 final note = _notes[index];
+                final selected = _selected.contains(note.id);
                 final firstLine = note.content
                     .split('\n')
                     .map((l) => l.trim())
                     .firstWhere((l) => l.isNotEmpty, orElse: () => '');
                 return ListTile(
+                  // pick 模式（附件选择）：点击即选中/取消，无删除菜单、
+                  // 无需先长按进多选
+                  leading: _selecting || widget.pickMode
+                      ? Icon(selected
+                          ? Icons.check_circle
+                          : Icons.radio_button_unchecked)
+                      : null,
                   title: Text(note.title,
                       maxLines: 1, overflow: TextOverflow.ellipsis),
                   subtitle: Column(
@@ -253,16 +389,47 @@ class _NotesListPageState extends State<NotesListPage> {
                           style: Theme.of(context).textTheme.bodySmall),
                     ],
                   ),
-                  trailing: PopupMenuButton<String>(
-                    onSelected: (_) => _deleteNote(note),
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(value: 'delete', child: Text('删除')),
-                    ],
-                  ),
-                  onTap: () => _openNote(note),
+                  trailing: _selecting || widget.pickMode
+                      ? null
+                      : PopupMenuButton<String>(
+                          onSelected: (_) => _deleteNote(note),
+                          itemBuilder: (_) => const [
+                            PopupMenuItem(value: 'delete', child: Text('删除')),
+                          ],
+                        ),
+                  onTap: () {
+                    if (widget.pickMode || _selecting) {
+                      _toggleSelect(note);
+                    } else {
+                      _openNote(note);
+                    }
+                  },
+                  onLongPress: widget.pickMode
+                      ? null
+                      : () {
+                          if (!_selecting) {
+                            setState(() {
+                              _selecting = true;
+                              _selected.add(note.id);
+                            });
+                          }
+                        },
                 );
               },
             ),
+      // pick 模式：底部操作条由附件选择页统一提供（已选附件 + 确认）
+      bottomNavigationBar: _selecting && !widget.pickMode
+          ? SelectionActionBar(
+              actions: [
+                SelectionAction(
+                  icon: Icons.send_outlined,
+                  tooltip: '发送给助理',
+                  enabled: _selected.isNotEmpty,
+                  onTap: _sendSelectedToAssistant,
+                ),
+              ],
+            )
+          : null,
     );
   }
 }

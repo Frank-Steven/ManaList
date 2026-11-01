@@ -27,8 +27,8 @@
     "postedAt": { "type": "integer", "description": "消息发出的 Unix 毫秒时间戳，是 AI 解析相对时间的基准" },
     "captureType": {
       "type": "string",
-      "enum": ["notification", "manual"],
-      "description": "notification=系统自动采集；manual=用户手动添加"
+      "enum": ["notification", "manual", "import"],
+      "description": "notification=系统自动采集；manual=用户手动添加；import=导入（微信/QQ/短信）。import 已废弃：v3 起导入功能整体移除，不再产生新值，仅存于历史数据（design-v3 §1.2）"
     },
     "attachments": {
       "type": "array",

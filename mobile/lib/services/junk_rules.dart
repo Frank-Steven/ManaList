@@ -1,8 +1,9 @@
 import '../models/message.dart';
 
-/// 本地垃圾规则预过滤（v2.6.1 AI 省 Token 策略，宁漏勿错）：
-/// 命中即在送模型前直接判 junk，不消耗 Token；结果 reason 标注「规则判定」。
-/// 规则与 desktop/src/ai/junk-rules.ts 逐条一致（改任何一端必须同步另一端）。
+/// 本地垃圾规则预过滤（宁漏勿错）：inbox.triage 送模型前先跑这里，
+/// 命中即直接产 junk 提案，不消耗 Token；结果 reason 标注「规则判定」。
+/// （v2 时代与 desktop/src/ai/junk-rules.ts 双端同步；desktop 端已随阶段 5
+/// 删除 /v1/process 管线，本文件是唯一事实源。）
 
 /// 营销/运营模板关键词：标题或正文命中任一即判垃圾。
 /// 只收命中率极高的 boilerplate，避免误伤真人聊天（宁漏勿错）。

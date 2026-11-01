@@ -8,11 +8,13 @@ import 'package:uuid/uuid.dart';
 
 import '../models/message.dart';
 import 'database.dart';
+import '../services/app_log.dart';
 
 /// Kotlin ↔ Dart 桥接：
 /// - MethodChannel 负责通知监听授权检查/跳转、附件 deeplink 拉起；
 /// - 通知数据不走 MethodChannel，Kotlin 的 NotificationListenerService 将每条
-///   通知原子写入 filesDir/queue/<日期>/<uuid>.json，Dart 每 10s 轮询读取、
+///   通知原子写入 filesDir/queue/<日期>/<uuid>.json，写完后立即通过 channel 通知
+///   Dart 拉取（P3-3）；另有 20s 兜底轮询，覆盖应用被杀后重启的情况。
 ///   入库后删除文件。
 class NotificationBridge {
   NotificationBridge._();
@@ -20,7 +22,9 @@ class NotificationBridge {
   static final NotificationBridge instance = NotificationBridge._();
 
   static const _channel = MethodChannel('dev.msgrepo.mobile/bridge');
-  static const _pollInterval = Duration(seconds: 10);
+  /// 兜底轮询（P3-3）：Kotlin 采集服务写队列后会主动推 queueAvailable，
+  /// 正常情况秒级可见；轮询只在应用重启/推送丢失时兜底，故放宽到 20 秒。
+  static const _pollInterval = Duration(seconds: 20);
   static const _uuid = Uuid();
 
   final _onNewMessages = StreamController<int>.broadcast();
@@ -88,39 +92,7 @@ class NotificationBridge {
     }
   }
 
-  // ---- 短信导入（v2.6）----
-
-  Future<bool> hasSmsPermission() async {
-    try {
-      return await _channel.invokeMethod<bool>('hasSmsPermission') ?? false;
-    } on MissingPluginException {
-      return false;
-    }
-  }
-
-  /// 弹系统运行时授权框，返回是否授予。
-  Future<bool> requestSmsPermission() async {
-    try {
-      return await _channel.invokeMethod<bool>('requestSmsPermission') ??
-          false;
-    } on MissingPluginException {
-      return false;
-    }
-  }
-
-  /// 读系统短信库（收件箱+已发，时间升序）；无权限/失败返回空表。
-  Future<List<Map<String, dynamic>>> readSmsMessages() async {
-    try {
-      final json =
-          await _channel.invokeMethod<String>('readSmsMessages') ?? '[]';
-      return [
-        for (final e in jsonDecode(json) as List)
-          (e as Map).cast<String, dynamic>(),
-      ];
-    } catch (_) {
-      return const [];
-    }
-  }
+  // ---- 短信导入已随 v3 阶段 3 整体移除（design-v3 §3.2）----
 
   /// 打开附件访问方式（http 链接 / content:// / 应用 deeplink）。
   Future<bool> openDeeplink(String url) async {
@@ -152,9 +124,21 @@ class NotificationBridge {
   }
 
   void startPolling() {
+    _installQueueCallback();
     _timer ??= Timer.periodic(_pollInterval, (_) => pullOnce());
     // 启动时立即拉一次
     unawaited(pullOnce());
+  }
+
+  /// 安装「队列有新数据」回调（P3-3）：采集服务写完文件会调
+  /// `queueAvailable`，此时立刻取一次，不必等兜底轮询。
+  void _installQueueCallback() {
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'queueAvailable') {
+        unawaited(pullOnce());
+      }
+      return null;
+    });
   }
 
   void stopPolling() {
@@ -163,29 +147,57 @@ class NotificationBridge {
   }
 
   /// 读取队列文件并入库，返回新入库条数。
+  bool _pullPending = false;
+
   Future<int> pullOnce() async {
-    if (_pulling) return 0;
+    if (_pulling) {
+      // 正在拉取时又来了 queueAvailable：记一笔，本轮结束后立刻补拉，
+      // 否则这批通知要等 20s 兜底轮询（子代理审查指出）。
+      _pullPending = true;
+      return 0;
+    }
     _pulling = true;
     try {
       final root = Directory(await _getQueueDir());
       if (!await root.exists()) return 0;
 
-      var imported = 0;
+      // O03（2026-10-21）：先把本轮所有队列文件解析成 Message，再**一次事务
+      // 批量入库**。原来每个文件一次 insertMessageIfNew（查重 + 插入，各自隐式
+      // 事务），通知密集时是 N 次 SQL 往返 + N 次事务提交。
+      // 注意：文件读取顺序即插入顺序（与改动前一致），每条消息的 postedTime
+      // 由它自己的文件携带，不会因为合并而丢失或错乱。
+      final pending = <Message>[];
+      final sources = <File>[]; // 与 pending 一一对应的源文件
       await for (final entity in root.list(recursive: true)) {
         if (entity is! File || !entity.path.endsWith('.json')) continue;
         try {
           final map =
               jsonDecode(await entity.readAsString()) as Map<String, dynamic>;
-          if (await AppDatabase.instance
-              .insertMessageIfNew(_fromQueueEntry(map))) {
-            imported++;
-          }
-        } catch (_) {
-          // 单个文件损坏不阻塞其他文件，文件照删避免反复失败
-        } finally {
+          pending.add(_fromQueueEntry(map));
+          sources.add(entity);
+        } catch (e, st) {
+          AppLog.instance.warn('bridge.parse-file', e, st);
+          // 单个文件损坏不阻塞其他文件，文件照删避免反复失败（与改动前一致）
           try {
             await entity.delete();
-          } catch (_) {}
+          } catch (e, st) { AppLog.instance.warn('bridge.delete-file', e, st); }
+        }
+      }
+
+      var imported = 0;
+      if (pending.isNotEmpty) {
+        try {
+          imported = await AppDatabase.instance.insertMessagesIfNew(pending);
+        } catch (e, st) {
+          // 入库失败：**保留**队列文件留给下一轮重试。
+          // （改动前是 finally 里无条件删文件，写库失败就等于丢消息）
+          AppLog.instance.warn('bridge.insert-batch', e, st);
+          sources.clear();
+        }
+        for (final f in sources) {
+          try {
+            await f.delete();
+          } catch (e, st) { AppLog.instance.warn('bridge.delete-file', e, st); }
         }
       }
 
@@ -194,16 +206,21 @@ class NotificationBridge {
         if (entity is Directory) {
           try {
             if (await entity.list().isEmpty) await entity.delete();
-          } catch (_) {}
+          } catch (e, st) { AppLog.instance.warn('bridge.cleanup-dir', e, st); }
         }
       }
 
       if (imported > 0) _onNewMessages.add(imported);
       return imported;
-    } catch (_) {
+    } catch (e, st) {
+      AppLog.instance.warn('bridge.drain', e, st);
       return 0;
     } finally {
       _pulling = false;
+      if (_pullPending) {
+        _pullPending = false;
+        unawaited(pullOnce());
+      }
     }
   }
 

@@ -1,14 +1,45 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'theme_fader.dart';
 import '../main.dart' show themeModeNotifier, themeModeFromString;
+import 'about_page.dart';
 import 'shared/app_icon.dart';
 import 'shared/segmented_selector.dart';
-import '../services/ai_client.dart';
 import '../services/app_filter_service.dart';
+import '../services/archive_export_service.dart';
+import '../services/archive_import_service.dart';
 import '../services/notification_bridge.dart';
+import '../services/reminder_service.dart';
+import '../../services/app_log.dart';
 
-/// v2 设置页（设计 §9）：外观 / 自定义提示词 / AI 接口 / 连接 / 采集过滤。
+/// B03：切到「仅指定应用」前是否需要先让用户选应用。
+///
+/// 空 allowlist 在数据层就等于「一条通知都不采集」（[AppFilterConfig.allows] 的既定契约，
+/// 不在这里改），而切模式只是一键操作，用户很容易在没加任何应用时就切过去。
+/// 所以把「先加应用、再加模式」的顺序提到 UI 层防呆。
+bool filterNeedsAppSelection(String targetMode, List<String> currentPackages) =>
+    targetMode == AppFilterConfig.modeAllowlist && currentPackages.isEmpty;
+
+/// B03：把应用选择结果合进「仅指定应用」配置。
+///
+/// [picked] 为 null（用户按返回取消）或空集合（一个都没勾）时返回 null，
+/// 调用方据此保持原模式不变，避免静默切成「全屏蔽」。
+AppFilterConfig? filterConfigAfterSelection({
+  required List<String> currentPackages,
+  required Set<String>? picked,
+}) {
+  if (picked == null || picked.isEmpty) return null;
+  final merged = <String>{...currentPackages, ...picked};
+  return AppFilterConfig(
+      mode: AppFilterConfig.modeAllowlist, packages: merged.toList());
+}
+
+/// 设置页（design-v3 §3.5）：外观 / 数据 / 采集过滤 / 后台保活。
+/// 「AI 接口配置 / 配对 / 端点管理」段已迁入助理页（model_picker）；
+/// v2 的「自定义提示词」「自动处理」段随批处理管线删除（阶段 7），
+/// 批量评估由助理工具 inbox.triage 承担。
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
 
@@ -17,24 +48,13 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
-  final _promptController = TextEditingController();
-
   String _themeMode = 'system';
-  AiEndpoint _desktop = const AiEndpoint(
-    id: AiClient.desktopEndpointId,
-    name: AiClient.desktopName,
-    baseUrl: AiClient.defaultDesktopBaseUrl,
-    isDesktop: true,
-  );
-  bool? _desktopOnline;
-  String _token = '';
-  String? _desktopDeviceName;
-  List<AiEndpoint> _remotes = [];
-  String? _defaultEndpointId;
-  final Set<String> _testing = {};
 
   bool _listenerEnabled = false;
+  bool _exporting = false;
+  bool _importing = false;
   bool _batteryOptimized = true; // true = 已加入白名单（不需要再优化）
+  bool _exactAlarms = true; // 精确闹钟权限（Android 12+ 可能需要手动开启）
   AppFilterConfig _filterConfig = const AppFilterConfig();
   Map<String, String?> _knownAppNames = {};
 
@@ -44,57 +64,28 @@ class _SettingsPageState extends State<SettingsPage> {
     _load();
   }
 
-  @override
-  void dispose() {
-    _promptController.dispose();
-    super.dispose();
-  }
-
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
-    final ai = AiClient.instance;
-    final desktop = await ai.desktopEndpoint();
-    final remotes = await ai.getRemoteEndpoints();
-    final defaultId = await ai.getDefaultEndpointId();
-    final token = await ai.getDesktopToken();
-    final deviceName = await ai.getDesktopDeviceName();
-    final online = await ai.isDesktopOnline();
     final listenerEnabled =
         await NotificationBridge.instance.isListenerEnabled();
     final batteryOptimized =
         await NotificationBridge.instance.isIgnoringBatteryOptimizations();
+    final exactAlarms = await ReminderService.instance.refreshExactAlarms();
     final filterConfig = await AppFilterService.instance.load();
     final seenApps = await AppFilterService.instance.getSeenApps();
     if (!mounted) return;
     setState(() {
       _themeMode = prefs.getString('theme_mode') ?? 'system';
-      _promptController.text = prefs.getString(AiClient.keyCustomPrompt) ?? '';
-      _desktop = desktop;
-      _remotes = remotes;
-      _defaultEndpointId = defaultId;
-      _token = token;
-      _desktopDeviceName = deviceName.isEmpty ? null : deviceName;
-      _desktopOnline = online;
       _listenerEnabled = listenerEnabled;
       _batteryOptimized = batteryOptimized;
+      _exactAlarms = exactAlarms;
       _filterConfig = filterConfig;
       _knownAppNames = {for (final a in seenApps) a.packageName: a.appName};
     });
   }
 
-  Future<void> _refreshDesktopStatus() async {
-    final ai = AiClient.instance;
-    final online = await ai.isDesktopOnline(force: true);
-    final token = await ai.getDesktopToken();
-    if (mounted) {
-      setState(() {
-        _desktopOnline = online;
-        _token = token;
-      });
-    }
-  }
-
   void _toast(String text) {
+    if (!mounted) return; // P3-5：await 之后调用时页面可能已销毁
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(
@@ -106,176 +97,11 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _setThemeMode(String mode) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('theme_mode', mode);
-    themeModeNotifier.value = themeModeFromString(mode);
+    // O10：走「快照渐变」切换，避免整棵树逐帧重建造成的卡顿
+    await ThemeFader.switchTo(
+      () => themeModeNotifier.value = themeModeFromString(mode),
+    );
     if (mounted) setState(() => _themeMode = mode);
-  }
-
-  // ---- 自定义提示词 ----
-
-  Future<void> _savePrompt(String value) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AiClient.keyCustomPrompt, value.trim());
-  }
-
-  // ---- AI 接口 ----
-
-  Future<void> _testEndpoint(AiEndpoint endpoint) async {
-    setState(() => _testing.add(endpoint.id));
-    try {
-      final msg = await AiClient.instance.testEndpoint(endpoint);
-      _toast('${endpoint.name}：$msg');
-    } catch (e) {
-      _toast('${endpoint.name}：$e');
-    } finally {
-      await _refreshDesktopStatus();
-      if (mounted) setState(() => _testing.remove(endpoint.id));
-    }
-  }
-
-  Future<void> _editEndpoint([AiEndpoint? existing]) async {
-    final ai = AiClient.instance;
-    final nameController = TextEditingController(text: existing?.name ?? '');
-    final baseUrlController =
-        TextEditingController(text: existing?.baseUrl ?? '');
-    final apiKeyController =
-        TextEditingController(text: existing?.apiKey ?? '');
-    final modelController = TextEditingController(text: existing?.model ?? '');
-    final saved = await showDialog<AiEndpoint>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(existing == null ? '添加接口' : '编辑接口'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: nameController,
-                decoration: const InputDecoration(labelText: '名称'),
-              ),
-              TextField(
-                controller: baseUrlController,
-                decoration: const InputDecoration(
-                  labelText: 'Base URL',
-                  hintText: 'https://api.example.com/v1',
-                ),
-              ),
-              TextField(
-                controller: apiKeyController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'API Key（可空）',
-                ),
-              ),
-              TextField(
-                controller: modelController,
-                decoration: const InputDecoration(labelText: '模型'),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () {
-              var baseUrl = baseUrlController.text.trim();
-              if (baseUrl.endsWith('/')) {
-                baseUrl = baseUrl.substring(0, baseUrl.length - 1);
-              }
-              if (nameController.text.trim().isEmpty ||
-                  baseUrl.isEmpty ||
-                  modelController.text.trim().isEmpty) {
-                return;
-              }
-              Navigator.of(context).pop(
-                (existing ??
-                        AiEndpoint(
-                          id: ai.newEndpointId(),
-                          name: '',
-                          baseUrl: '',
-                        ))
-                    .copyWith(
-                  name: nameController.text.trim(),
-                  baseUrl: baseUrl,
-                  apiKey: apiKeyController.text.trim(),
-                  model: modelController.text.trim(),
-                ),
-              );
-            },
-            child: const Text('保存'),
-          ),
-        ],
-      ),
-    );
-    if (saved == null) return;
-    await ai.upsertEndpoint(saved);
-    // 第一个远程接口自动设为默认
-    if (await ai.getDefaultEndpointId() == null) {
-      await ai.setDefaultEndpointId(saved.id);
-    }
-    await _load();
-  }
-
-  Future<void> _deleteEndpoint(AiEndpoint endpoint) async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('删除接口'),
-        content: Text('删除「${endpoint.name}」？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('删除'),
-          ),
-        ],
-      ),
-    );
-    if (confirm != true) return;
-    await AiClient.instance.deleteEndpoint(endpoint.id);
-    await _load();
-  }
-
-  // ---- 连接 ----
-
-  String get _maskedToken {
-    if (_token.isEmpty) return '未配对（首次处理时自动配对）';
-    final head = _token.length <= 6 ? _token : _token.substring(0, 6);
-    return '$head••••••';
-  }
-
-  Future<void> _resetPairing() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('重置配对'),
-        content: const Text('电脑端将重新签发 token，本机自动完成重新配对。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('重置'),
-          ),
-        ],
-      ),
-    );
-    if (confirm != true) return;
-    try {
-      final (_, deviceName) = await AiClient.instance.pairDesktop(reset: true);
-      _desktopDeviceName = deviceName;
-      _toast('已重新配对${deviceName.isNotEmpty ? '：$deviceName' : ''}');
-    } catch (e) {
-      _toast('重置配对失败：$e');
-    }
-    await _refreshDesktopStatus();
   }
 
   // ---- 采集过滤 ----
@@ -290,7 +116,8 @@ class _SettingsPageState extends State<SettingsPage> {
     return (name != null && name.isNotEmpty) ? name : packageName;
   }
 
-  Future<void> _addFilteredApps() async {
+  /// 打开应用选择页，返回用户勾选的包名集合；用户取消（返回键）时为 null。
+  Future<Set<String>?> _pickFilteredApps() async {
     // v2.4：应用选择页以 PackageManager 全量可启动应用为主，
     // 补充"已见但已卸载/无启动器入口"的历史应用
     final results = await Future.wait([
@@ -302,7 +129,7 @@ class _SettingsPageState extends State<SettingsPage> {
     final installedPkgs = {for (final a in installed) a.packageName};
     final extra = seen.where((a) => !installedPkgs.contains(a.packageName));
     final apps = [...installed, ...extra];
-    if (!mounted) return;
+    if (!mounted) return null;
     final selected = await Navigator.of(context).push<Set<String>>(
       MaterialPageRoute(
         builder: (_) => _AppPickerPage(
@@ -312,14 +139,136 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
       ),
     );
-    if (selected == null) return;
-    final packages = _filterConfig.packages.toSet()..addAll(selected);
+    if (selected == null || !mounted) return selected;
     final names = Map<String, String?>.of(_knownAppNames);
     for (final a in apps) {
       names[a.packageName] = a.appName;
     }
+    setState(() => _knownAppNames = names);
+    return selected;
+  }
+
+  Future<void> _addFilteredApps() async {
+    final selected = await _pickFilteredApps();
+    if (selected == null) return;
+    final packages = _filterConfig.packages.toSet()..addAll(selected);
     await _saveFilter(_filterConfig.copyWith(packages: packages.toList()));
-    if (mounted) setState(() => _knownAppNames = names);
+  }
+
+  /// B03：切模式时对「仅指定应用 + 空名单」防呆 —— 先让用户选应用；
+  /// 取消或一个都没勾则**保持原模式**，只给一条提示。
+  Future<void> _onFilterModeChanged(String v) async {
+    if (!filterNeedsAppSelection(v, _filterConfig.packages)) {
+      await _saveFilter(_filterConfig.copyWith(mode: v));
+      return;
+    }
+    final selected = await _pickFilteredApps();
+    if (!mounted) return;
+    final next = filterConfigAfterSelection(
+      currentPackages: _filterConfig.packages,
+      picked: selected,
+    );
+    if (next == null) {
+      _toast('未添加应用，仍收集全部应用的通知');
+      return;
+    }
+    await _saveFilter(next);
+  }
+
+  // ---- 数据（v3 存档导出/导入，design-v3-details §5）----
+
+  Future<void> _exportArchive() async {
+    if (_exporting) return;
+    setState(() => _exporting = true);
+    try {
+      final result = await ArchiveExportService.instance.exportArchive();
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('导出完成'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('任务 ${result.tasks} 条 · 消息 ${result.messages} 条 · '
+                  '笔记 ${result.notes} 篇 · 文件 ${result.files} 个 · '
+                  '锚点 ${result.anchors} 条'
+                  '${result.skippedFiles > 0 ? '\n${result.skippedFiles} 个附件文件已丢失，未打包' : ''}'),
+              const SizedBox(height: 12),
+              Text('存档位置：',
+                  style: TextStyle(fontSize: 12, color: Theme.of(ctx).colorScheme.onSurfaceVariant)),
+              SelectableText(result.path,
+                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+            ],
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      _toast('导出失败：$e');
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
+  /// 导入存档（design-v3-details §5.3）：选 zip → 格式校验 → 空库守卫 →
+  /// 单事务入库 → 展示统计与一致性警告。
+  Future<void> _importArchive() async {
+    if (_importing) return;
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['zip'],
+    );
+    final path = picked?.files.single.path;
+    if (path == null || !mounted) return;
+    setState(() => _importing = true);
+    try {
+      final result =
+          await ArchiveImportService.instance.importArchive(path);
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('导入完成'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('任务 ${result.tasks} 条 · 消息 ${result.messages} 条 · '
+                  '笔记 ${result.notes} 篇 · 文件 ${result.files} 个 · '
+                  '锚点 ${result.anchors} 条'),
+              if (result.warnings.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Text('警告（${result.warnings.length} 条，不阻断导入）：',
+                    style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(ctx).colorScheme.onSurfaceVariant)),
+                for (final w in result.warnings)
+                  Text('· $w', style: const TextStyle(fontSize: 12)),
+              ],
+            ],
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
+      );
+    } on ArchiveImportException catch (e) {
+      _toast(e.message);
+    } catch (e) {
+      _toast('导入失败：$e');
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
   }
 
   // ---- 后台保活（v2.6）----
@@ -333,6 +282,58 @@ class _SettingsPageState extends State<SettingsPage> {
     _load();
   }
 
+  /// 请求精确闹钟权限（Android 12+ 可能需要用户手动开启）。
+  Future<void> _requestExactAlarms() async {
+    final ok = await ReminderService.instance.requestExactAlarms();
+    if (!mounted) return;
+    setState(() => _exactAlarms = ok);
+    _toast(ok ? '已允许精确提醒' : '未获得精确闹钟权限：提醒仍会触发，但可能延迟数分钟');
+  }
+
+  /// 展示最近被记录的异常（P2-6）：把以前静默吞掉的失败变成可读列表。
+  Future<void> _showRecentErrors() async {
+    final entries = AppLog.instance.entries;
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('最近错误（${entries.length} 类）'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: entries.isEmpty
+              ? const Text('暂无记录。')
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: entries.length,
+                  itemBuilder: (_, i) {
+                    final e = entries[i];
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      child: SelectableText(e.oneLine,
+                          style: const TextStyle(
+                              fontSize: 12, fontFamily: 'monospace')),
+                    );
+                  },
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              AppLog.instance.clear();
+              Navigator.of(ctx).pop();
+              setState(() {});
+            },
+            child: const Text('清空'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _openAutoStartSettings() async {
     final opened = await NotificationBridge.instance.openAutoStartSettings();
     if (opened || !mounted) return;
@@ -344,10 +345,10 @@ class _SettingsPageState extends State<SettingsPage> {
         content: const SingleChildScrollView(
           child: Text('未能直接跳转自启动设置，请手动操作：\n\n'
               'vivo / iQOO：\n'
-              'i 管家 → 应用管理 → 权限管理 → 自启动 → 允许 MsgRepo；\n'
-              '设置 → 电池 → 后台耗电管理 → MsgRepo → 允许后台高耗电。\n\n'
+              'i 管家 → 应用管理 → 权限管理 → 自启动 → 允许 ManaList；\n'
+              '设置 → 电池 → 后台耗电管理 → ManaList → 允许后台高耗电。\n\n'
               '其他机型：\n'
-              '系统设置 → 应用管理 → MsgRepo → 允许自启动 / 后台运行 / '
+              '系统设置 → 应用管理 → ManaList → 允许自启动 / 后台运行 / '
               '电池不优化（名称因厂商而异）。'),
         ),
         actions: [
@@ -380,89 +381,9 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  Widget _buildEndpointTile(AiEndpoint endpoint) {
-    final cs = Theme.of(context).colorScheme;
-    final testing = _testing.contains(endpoint.id);
-    if (endpoint.isDesktop) {
-      final online = _desktopOnline == true;
-      return Row(
-        children: [
-          Icon(Icons.computer, color: cs.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('电脑端（自动）'),
-                Text(
-                  '${endpoint.baseUrl} · '
-                  '${_desktopOnline == null ? '探测中' : online ? '已连接' : '未连接'}'
-                  ' · 模型由电脑端管理',
-                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                ),
-              ],
-            ),
-          ),
-          TextButton(
-            onPressed: testing ? null : () => _testEndpoint(endpoint),
-            child: testing
-                ? const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2))
-                : const Text('测试'),
-          ),
-        ],
-      );
-    }
-    final isDefault = endpoint.id == _defaultEndpointId;
-    return Row(
-      children: [
-        SizedBox(
-          width: 32,
-          child: Radio<String>(value: endpoint.id),
-        ),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(isDefault ? '${endpoint.name}（默认）' : endpoint.name),
-              Text(
-                '${endpoint.baseUrl} · ${endpoint.model}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-              ),
-            ],
-          ),
-        ),
-        TextButton(
-          onPressed: testing ? null : () => _testEndpoint(endpoint),
-          child: testing
-              ? const SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2))
-              : const Text('测试'),
-        ),
-        IconButton(
-          tooltip: '编辑',
-          icon: const Icon(Icons.edit_outlined, size: 20),
-          onPressed: () => _editEndpoint(endpoint),
-        ),
-        IconButton(
-          tooltip: '删除',
-          icon: const Icon(Icons.delete_outline, size: 20),
-          onPressed: () => _deleteEndpoint(endpoint),
-        ),
-      ],
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final desktopOnline = _desktopOnline == true;
     return Scaffold(
       appBar: AppBar(title: const Text('设置')),
       body: ListView(
@@ -478,101 +399,38 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ]),
           const Divider(height: 32),
-          _section('自定义提示词', [
-            TextField(
-              controller: _promptController,
-              minLines: 2,
-              maxLines: 5,
-              decoration: const InputDecoration(
-                hintText: '例：把直播开播提醒都当作营销处理；工作消息优先级调高',
-                helperText: '随每次 AI 处理自动下发，保存即生效',
-                border: OutlineInputBorder(),
+          _section('数据', [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.archive_outlined, color: cs.onSurfaceVariant),
+              title: const Text('导出存档'),
+              subtitle: Text(
+                '把全部消息、任务、笔记与附件打包为一个 zip（v3 存档格式）',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
               ),
-              onChanged: _savePrompt,
+              trailing: _exporting
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.chevron_right),
+              onTap: _exporting ? null : _exportArchive,
             ),
-          ]),
-          const Divider(height: 32),
-          _section('AI 接口', [
-            _buildEndpointTile(_desktop),
-            const SizedBox(height: 4),
-            Text('电脑端在线时自动优先；电脑端不在线时使用默认远程接口',
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
-            const SizedBox(height: 8),
-            RadioGroup<String>(
-              groupValue: _defaultEndpointId,
-              onChanged: (v) async {
-                if (v == null) return;
-                await AiClient.instance.setDefaultEndpointId(v);
-                if (mounted) setState(() => _defaultEndpointId = v);
-              },
-              child: Column(
-                children: [for (final e in _remotes) _buildEndpointTile(e)],
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.unarchive_outlined, color: cs.onSurfaceVariant),
+              title: const Text('导入存档'),
+              subtitle: Text(
+                '从 zip 存档还原全部数据（仅空库可导入，不合并）',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
               ),
-            ),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton.icon(
-                onPressed: () => _editEndpoint(),
-                icon: const Icon(Icons.add),
-                label: const Text('添加远程接口'),
-              ),
-            ),
-          ]),
-          const Divider(height: 32),
-          _section('连接', [
-            Row(
-              children: [
-                Icon(
-                  desktopOnline ? Icons.usb : Icons.usb_off,
-                  color: desktopOnline ? cs.primary : cs.onSurfaceVariant,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(desktopOnline ? '电脑端通道已连接' : '电脑端通道未连接'),
-                      if (!desktopOnline)
-                        Text('USB 连接后执行 adb reverse tcp:8765 tcp:8765',
-                            style: TextStyle(
-                                fontSize: 12, color: cs.onSurfaceVariant)),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  tooltip: '刷新',
-                  icon: const Icon(Icons.refresh),
-                  onPressed: _refreshDesktopStatus,
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Icon(Icons.key_outlined, color: cs.onSurfaceVariant),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('配对 token'),
-                      Text(
-                        _desktopDeviceName != null
-                            ? '$_maskedToken（$_desktopDeviceName）'
-                            : _maskedToken,
-                        style: TextStyle(
-                            fontSize: 12,
-                            fontFamily: 'monospace',
-                            color: cs.onSurfaceVariant),
-                      ),
-                    ],
-                  ),
-                ),
-                TextButton(
-                  onPressed: desktopOnline ? _resetPairing : null,
-                  child: const Text('重置配对'),
-                ),
-              ],
+              trailing: _importing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.chevron_right),
+              onTap: _importing ? null : _importArchive,
             ),
           ]),
           const Divider(height: 32),
@@ -612,7 +470,9 @@ class _SettingsPageState extends State<SettingsPage> {
               labels: const ['全部应用', '仅指定应用', '屏蔽指定应用'],
               height: 40,
               selected: _filterConfig.mode,
-              onChanged: (v) => _saveFilter(_filterConfig.copyWith(mode: v)),
+              // B03：切到「仅指定应用」且名单为空时，先弹应用选择器，
+              // 没选就保持原模式（否则空 allowlist 会静默切断全部采集）
+              onChanged: _onFilterModeChanged,
             ),
             if (_filterConfig.isAllowlist || _filterConfig.isBlacklist) ...[
               const SizedBox(height: 12),
@@ -623,15 +483,36 @@ class _SettingsPageState extends State<SettingsPage> {
                     color: cs.errorContainer,
                     borderRadius: BorderRadius.circular(8),
                   ),
-                  child: Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(Icons.warning_amber_outlined,
-                          color: cs.onErrorContainer),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          '当前不会收集任何应用的通知，请添加应用或切换为全部应用',
-                          style: TextStyle(color: cs.onErrorContainer),
+                      Row(
+                        children: [
+                          Icon(Icons.warning_amber_outlined,
+                              color: cs.onErrorContainer),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              '当前不会收集任何应用的通知，请添加应用或切换为全部应用',
+                              style: TextStyle(color: cs.onErrorContainer),
+                            ),
+                          ),
+                        ],
+                      ),
+                      // B03：给一条一键退路，避免用户卡在「一条都收不到」里
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton(
+                          style: TextButton.styleFrom(
+                            foregroundColor: cs.onErrorContainer,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            minimumSize: const Size(0, 36),
+                            tapTargetSize:
+                                MaterialTapTargetSize.shrinkWrap,
+                          ),
+                          onPressed: () => _saveFilter(_filterConfig
+                              .copyWith(mode: AppFilterConfig.modeAll)),
+                          child: const Text('切换为全部应用'),
                         ),
                       ),
                     ],
@@ -702,6 +583,43 @@ class _SettingsPageState extends State<SettingsPage> {
             const SizedBox(height: 8),
             Row(
               children: [
+                Icon(
+                  _exactAlarms ? Icons.alarm_on_outlined : Icons.alarm_off_outlined,
+                  color: _exactAlarms ? cs.primary : cs.error,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(_exactAlarms
+                      ? '任务提醒：精确闹钟已允许'
+                      : '任务提醒：未允许精确闹钟，提醒可能延迟数分钟'),
+                ),
+                if (!_exactAlarms)
+                  TextButton(
+                    onPressed: _requestExactAlarms,
+                    child: const Text('去设置'),
+                  ),
+              ],
+            ),
+            // E06（2026-10-24）：提醒初始化/调度失败必须可见 —— 无错误时不显示，不增加干扰。
+            if (ReminderService.instance.lastError != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.error_outline, color: cs.error),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      '任务提醒异常：${ReminderService.instance.lastError}',
+                      style: TextStyle(fontSize: 12, color: cs.error),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 8),
+            Row(
+              children: [
                 Icon(Icons.rocket_launch_outlined, color: cs.onSurfaceVariant),
                 const SizedBox(width: 12),
                 const Expanded(child: Text('自启动 / 后台运行（国产 ROM 必开）')),
@@ -718,6 +636,40 @@ class _SettingsPageState extends State<SettingsPage> {
                 '允许自启动与后台运行（vivo：i 管家 → 自启动；电池 → 后台耗电'
                 '管理 → 允许后台高耗电）。',
                 style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+            ),
+            const SizedBox(height: 8),
+            // P2-6：异常不再被静默吞掉，这里给出统一查看入口
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(
+                AppLog.instance.count == 0
+                    ? Icons.check_circle_outline
+                    : Icons.bug_report_outlined,
+                color: AppLog.instance.count == 0 ? cs.primary : cs.error,
+              ),
+              title: const Text('最近错误'),
+              subtitle: Text(
+                AppLog.instance.count == 0 ? '暂无可显示的异常' : '${AppLog.instance.count} 类，点击查看',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: _showRecentErrors,
+            ),
+          ]),
+          const Divider(height: 32),
+          _section('关于', [
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.info_outline, color: cs.onSurfaceVariant),
+              title: const Text('关于 ${AboutPage.appName}'),
+              subtitle: Text(
+                '版本 ${ArchiveExportService.appVersion}',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => const AboutPage()),
               ),
             ),
           ]),

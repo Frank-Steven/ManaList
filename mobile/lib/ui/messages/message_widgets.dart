@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_slidable/flutter_slidable.dart';
 
 import '../../models/message.dart';
+import '../../services/fold_markers.dart';
 import '../../services/undo_service.dart';
-import '../shared/app_icon.dart';
 import '../shared/priority_dot.dart';
 
 /// 未处理分组键（设计 §5.1）。
@@ -32,13 +32,60 @@ String messageGroupKey(Message m) {
   return kGroupPending;
 }
 
+/// 未完成分组键（2026-11-01 状态四分组）：已处理、有关联任务、但未全部完成。
+const String kGroupUnfinished = 'unfinished';
+
+/// 消息列表的展示分组顺序（2026-11-01 状态新规，取代原「未处理/已处理/垃圾 +
+/// 已完成特殊筛选」）：未处理 → 未完成 → 完成 → 垃圾。
+/// 「完成」复用 [kFilterDone] 的键值（'done'），语义升级为正式分组。
+const List<String> kDisplayGroupOrder = [
+  kGroupPending,
+  kGroupUnfinished,
+  kFilterDone,
+  MessagePriority.junk,
+];
+
+/// 展示分组键（2026-11-01 状态新规，与关联任务联动）：
+/// - 显式标记垃圾（priority=junk）恒为垃圾；
+/// - 未标记已处理 → 未处理；
+/// - 已处理：无关联任务 → 垃圾；关联任务全部完成 → 完成；否则 → 未完成。
+String messageDisplayGroupKey(Message m,
+    {required int linkedTaskCount, required bool linkedAllDone}) {
+  if (m.priority == MessagePriority.junk) return MessagePriority.junk;
+  if (m.status != MessageStatus.processed) return kGroupPending;
+  if (linkedTaskCount == 0) return MessagePriority.junk;
+  if (linkedAllDone) return kFilterDone;
+  return kGroupUnfinished;
+}
+
 String messageGroupLabel(String key) => switch (key) {
       kGroupPending => '未处理',
       kGroupProcessed => '已处理',
+      kGroupUnfinished => '未完成',
       MessagePriority.junk => '垃圾',
-      kFilterDone => '已完成',
+      kFilterDone => '完成',
       _ => key,
     };
+
+/// 分组图标（2026-11-01 筛选 chip 图标化）。
+IconData messageGroupIcon(String key) => switch (key) {
+      kGroupPending => Icons.mark_email_unread_outlined,
+      kGroupProcessed => Icons.fact_check_outlined,
+      kGroupUnfinished => Icons.pending_actions_outlined,
+      MessagePriority.junk => Icons.delete_outline,
+      kFilterDone => Icons.task_alt,
+      _ => Icons.label_outline,
+    };
+
+/// 分组分页（2026-11-01）：每个最小分类单元（来源/会话）首屏
+/// [kGroupPageInitial] 条，点「显示更多」每次 +[kGroupPageStep]
+/// （取代原全局最近 500 条截断）。
+const int kGroupPageInitial = 10;
+const int kGroupPageStep = 5;
+
+/// 取一组消息当前应展示的前缀；shown 越界时收敛到全组。
+List<T> pagedPrefix<T>(List<T> all, int shown) =>
+    all.take(shown.clamp(0, all.length)).toList();
 
 /// AI 评估三色的圆点颜色（仅 AI 面板展示评估结果用；v2.6 起消息列表
 /// 不再按它染色）；未处理/垃圾返回 null（用空心圆点）。
@@ -301,10 +348,11 @@ class _SwipeActionRowState extends State<SwipeActionRow>
   }
 }
 
-/// 消息卡片（v2.4 卡片化；v2.6 去颜色化）：左侧标记 + 标题/摘要/来源
-/// （含应用图标）+ 右侧时间。点击卡片行内展开/收起全文（选择模式下点击 = 勾选）。
-/// 标记规则（v2.6）：绑定任务的消息显示其任务优先级色点（+ 任务角标）；
-/// 未绑定 = 空心圆点；垃圾 = 灰色消息块 + 标题划线。不再按 AI 红/黄/绿染色。
+/// 消息卡片（v2.4 卡片化；v2.6 去颜色化；2026-11-01 第三批重构版式）：
+/// 左侧标记 + 标题（群名/发送者）/正文（主视觉，最多 3 行）/来源脚注
+/// （应用图标在分组吸顶头，不逐卡重复）+ 右侧时间。圆角 14、多选选中
+/// 主色描边。标记规则（v2.6）：绑定任务的消息显示其任务优先级色点
+/// （+ 任务角标）；未绑定 = 空心圆点；垃圾 = 灰色消息块 + 标题划线。
 /// 关联任务已完成的消息标题划线变淡。
 class MessageTile extends StatefulWidget {
   final Message message;
@@ -313,15 +361,19 @@ class MessageTile extends StatefulWidget {
   final bool swipeEnabled;
   final List<SwipeAction> actions;
 
+  /// 嵌套模式（2026-11-01 嵌套卡片列表）：不作为独立卡片渲染
+  /// （无外边距/底色/圆角），由父级分组卡片提供容器；
+  /// 选中态改为整行底色高亮（原独立卡片的主色描边不适用）。
+  final bool embedded;
+
   /// 关联任务已完成（v2.4「已完成」筛选）：标题划线降色。
   final bool linkedTaskDone;
 
   /// 关联任务的优先级（v2.6：绑定任务的消息标记显示任务优先级色点）。
   final String? linkedTaskPriority;
+  /// 关联任务数量（N1 多对多）：>1 时标记处显示数量角标。
+  final int linkedTaskCount;
 
-  /// 正在被 AI 处理（v2.6.2，AiProcessingService 内存态）：标题行显示
-  /// 旋转标记；左滑由调用方一并禁用。
-  final bool processing;
   final VoidCallback? onTap;
   final VoidCallback? onLongPress;
 
@@ -332,9 +384,10 @@ class MessageTile extends StatefulWidget {
     this.selected = false,
     this.swipeEnabled = true,
     this.actions = const [],
+    this.embedded = false,
     this.linkedTaskDone = false,
     this.linkedTaskPriority,
-    this.processing = false,
+    this.linkedTaskCount = 0,
     this.onTap,
     this.onLongPress,
   });
@@ -344,22 +397,19 @@ class MessageTile extends StatefulWidget {
 }
 
 class _MessageTileState extends State<MessageTile> {
-  bool _expanded = false;
 
   void _handleTap() {
-    if (widget.selecting) {
-      widget.onTap?.call();
-    } else {
-      setState(() => _expanded = !_expanded);
-    }
+    // P3-2：非选中状态下点击 = 打开详情面板（正文 + 附件预览）。
+    // 原地展开仍由右侧箭头按钮负责，避免两种行为抢同一个手势。
+    widget.onTap?.call();
   }
 
   Widget _marker(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     // v2.6：只有绑定任务的消息才显示颜色（其任务优先级色点）；其余空心圆点。
-    final taskPriority = widget.message.linkedTaskId == null
-        ? null
-        : widget.linkedTaskPriority;
+    // N1：一条消息可能关联多个任务，>1 时右下角改成数量角标。
+    final taskPriority =
+        widget.linkedTaskCount == 0 ? null : widget.linkedTaskPriority;
     final Widget dot = taskPriority == null
         ? Container(
             width: 14,
@@ -376,20 +426,33 @@ class _MessageTileState extends State<MessageTile> {
                 shape: BoxShape.circle,
                 color: taskPriorityDotColor(taskPriority)),
           );
-    if (widget.message.linkedTaskId == null) return dot;
+    if (widget.linkedTaskCount == 0) return dot;
+    final Widget badge = widget.linkedTaskCount > 1
+        ? Container(
+            padding: const EdgeInsets.symmetric(horizontal: 3),
+            decoration: BoxDecoration(
+              color: cs.primary,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              '${widget.linkedTaskCount}',
+              style: TextStyle(
+                  fontSize: 9,
+                  height: 1.2,
+                  color: cs.onPrimary,
+                  fontWeight: FontWeight.w600),
+            ),
+          )
+        : Icon(Icons.task_alt,
+            size: 12,
+            color: widget.linkedTaskDone ? cs.outline : cs.primary);
     return SizedBox(
-      width: 20,
+      width: 22,
       height: 20,
       child: Stack(
         children: [
           Positioned(left: 0, top: 0, child: dot),
-          Positioned(
-            right: 0,
-            bottom: 0,
-            child: Icon(Icons.task_alt,
-                size: 12,
-                color: widget.linkedTaskDone ? cs.outline : cs.primary),
-          ),
+          Positioned(right: 0, bottom: 0, child: badge),
         ],
       ),
     );
@@ -400,124 +463,139 @@ class _MessageTileState extends State<MessageTile> {
     final cs = Theme.of(context).colorScheme;
     final message = widget.message;
     final isJunk = message.priority == MessagePriority.junk;
-    final titleStyle = TextStyle(
+    // U7（后半）：消息页「突出内容、弱化来源」。
+    // - 正文为主视觉（15、onSurface、最多 3 行）；
+    // - 标题（群名/发送者）降为次要信息（13、onSurfaceVariant）；
+    // - 来源应用降到脚注级（11、outline）。
+    // 若消息没有正文（纯标题通知），标题自动升级为主视觉，避免整卡变灰。
+    final hasBody = message.body.isNotEmpty;
+    final contentStyle = TextStyle(
       fontSize: 15,
-      fontWeight: FontWeight.w500,
+      height: 1.35,
       color: isJunk
           ? cs.outline
-          : (widget.linkedTaskDone ? cs.onSurfaceVariant : null),
+          : (widget.linkedTaskDone ? cs.onSurfaceVariant : cs.onSurface),
       decoration:
           (isJunk || widget.linkedTaskDone) ? TextDecoration.lineThrough : null,
     );
-    final subStyle = TextStyle(fontSize: 13, color: cs.onSurfaceVariant);
+    final titleStyle = hasBody
+        ? TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+            color: isJunk ? cs.outline : cs.onSurfaceVariant,
+            decoration: (isJunk || widget.linkedTaskDone)
+                ? TextDecoration.lineThrough
+                : null,
+          )
+        : contentStyle;
+    final timeStyle = TextStyle(fontSize: 12, color: cs.onSurfaceVariant);
+    final sourceStyle = TextStyle(fontSize: 11, color: cs.outline);
 
+    final body = SwipeActionRow(
+      actions: widget.actions,
+      swipeEnabled: widget.swipeEnabled && !widget.selecting,
+      onTap: _handleTap,
+      onLongPress: widget.onLongPress,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 多选勾选统一在行首（2026-11-01 与任务/文件区一致）
+            if (widget.selecting)
+              Padding(
+                padding: const EdgeInsets.only(right: 10, top: 1),
+                child: Icon(
+                  widget.selected
+                      ? Icons.check_circle
+                      : Icons.radio_button_unchecked,
+                  size: 20,
+                  color: widget.selected ? cs.primary : cs.outline,
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.only(top: 1),
+              child: _marker(context),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // 首行：标题（群名/发送者）+ 时间
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          message.title.isEmpty
+                              ? '(无标题)'
+                              : stripFoldMarkers(message.title),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: titleStyle,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(formatMessageTime(message.postedAt),
+                          style: timeStyle),
+                    ],
+                  ),
+                  // 正文为主视觉（最多 3 行）
+                  if (message.body.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      message.body,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: contentStyle,
+                    ),
+                  ],
+                  // 脚注：来源应用 · 会话（图标在分组吸顶头，不逐卡重复）
+                  if (message.appName?.isNotEmpty == true ||
+                      message.conversationTitle?.isNotEmpty == true) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      (message.appName?.isNotEmpty == true
+                              ? message.appName!
+                              : message.packageName) +
+                          (message.conversationTitle?.isNotEmpty == true
+                              ? ' · ${stripFoldMarkers(message.conversationTitle!)}'
+                              : ''),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: sourceStyle,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    // 嵌套模式：父级分组卡片提供容器，本行只做选中底色
+    if (widget.embedded) {
+      return Container(
+        color: widget.selected
+            ? cs.secondaryContainer.withValues(alpha: 0.5)
+            : null,
+        child: body,
+      );
+    }
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
       clipBehavior: Clip.antiAlias,
       elevation: 0,
       color: isJunk ? cs.surfaceContainerHighest : cs.surfaceContainerLow,
-      child: SwipeActionRow(
-        actions: widget.actions,
-        swipeEnabled: widget.swipeEnabled && !widget.selecting,
-        onTap: _handleTap,
-        onLongPress: widget.onLongPress,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: _marker(context),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            message.title.isEmpty ? '(无标题)' : message.title,
-                            maxLines: _expanded ? null : 1,
-                            overflow:
-                                _expanded ? null : TextOverflow.ellipsis,
-                            style: titleStyle,
-                          ),
-                        ),
-                        if (widget.processing) ...[
-                          const SizedBox(width: 6),
-                          SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 1.5, color: cs.primary),
-                          ),
-                          const SizedBox(width: 2),
-                          Text('处理中',
-                              style: TextStyle(
-                                  fontSize: 11, color: cs.primary)),
-                        ],
-                        const SizedBox(width: 8),
-                        Text(formatMessageTime(message.postedAt),
-                            style: subStyle),
-                      ],
-                    ),
-                    if (message.body.isNotEmpty) ...[
-                      const SizedBox(height: 2),
-                      Text(
-                        message.body,
-                        maxLines: _expanded ? null : 2,
-                        overflow: _expanded ? null : TextOverflow.ellipsis,
-                        style: subStyle,
-                      ),
-                    ],
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        AppIcon(
-                            packageName: message.packageName,
-                            appName: message.appName,
-                            size: 14),
-                        const SizedBox(width: 5),
-                        Expanded(
-                          child: Text(
-                            (message.appName?.isNotEmpty == true
-                                    ? message.appName!
-                                    : message.packageName) +
-                                (message.conversationTitle?.isNotEmpty == true
-                                    ? ' · ${message.conversationTitle}'
-                                    : ''),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                                fontSize: 12, color: cs.onSurfaceVariant),
-                          ),
-                        ),
-                        if (_expanded)
-                          Icon(Icons.expand_less,
-                              size: 16, color: cs.onSurfaceVariant),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              if (widget.selecting)
-                Padding(
-                  padding: const EdgeInsets.only(left: 8, top: 2),
-                  child: Icon(
-                    widget.selected
-                        ? Icons.check_circle
-                        : Icons.radio_button_unchecked,
-                    size: 20,
-                    color: widget.selected ? cs.primary : cs.outline,
-                  ),
-                ),
-            ],
-          ),
-        ),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        // 多选态选中 = 主色描边（与文件区卡片同一语言）
+        side: widget.selected
+            ? BorderSide(color: cs.primary, width: 1.5)
+            : BorderSide.none,
       ),
+      child: body,
     );
   }
 }

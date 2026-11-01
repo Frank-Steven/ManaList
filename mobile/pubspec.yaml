@@ -1,9 +1,9 @@
 name: msgrepo_mobile
 description: >-
-  MsgRepo 手机端：采集 Android 通知与手动消息，经 adb reverse 同步给电脑端 AI，
-  展示结构化结果并调度本地提醒。
+  MsgRepo 手机端：采集 Android 通知与手动消息，本地 SQLite 存日程/待办/笔记；
+  AI 处理优先走电脑端（adb 通道），电脑端不在线时走远程 OpenAI 兼容接口。
 publish_to: "none"
-version: 0.1.0+1
+version: 0.2.0+2
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -25,11 +25,18 @@ dependencies:
   image_picker: ^1.0.7
   shared_preferences: ^2.2.2
   flutter_slidable: ^4.0.3
+  flutter_secure_storage: ^9.2.2
+  archive: ^4.5.2
+  flutter_markdown: ^0.7.7+1
+  markdown: ^7.3.1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  sqflite_common_ffi: ^2.3.0
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/splash/

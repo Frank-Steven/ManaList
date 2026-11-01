@@ -2,59 +2,20 @@ import http from "node:http";
 import os from "node:os";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { isAuthorized, type PairingManager } from "./auth.js";
-import { loadRegistry, negotiateRegistry, readSharedJson } from "./registry.js";
-import { processStreaming, runPipeline } from "./pipeline.js";
-import type { Store } from "./store.js";
-import type { AIProvider } from "./ai/provider.js";
-import type {
-  ProcessInputMessage,
-  ProcessRequestBody,
-  SyncRequest,
-  SyncResponse,
-} from "./types.js";
+import { GateBusyError, GatePool } from "./limit.js";
+import { readSharedJson } from "./registry.js";
+import type { ModelManager } from "./models.js";
+import type { ProviderChatMessage } from "./ai/provider.js";
+import type { ChatEvent, ChatRequest } from "./types.js";
 
 export interface ServerOptions {
   host: string;
   port: number;
   pairing: PairingManager;
-  provider: AIProvider;
-  store: Store;
-  dataDir: string;
+  models: ModelManager;
 }
 
 const MAX_BODY = 20 * 1024 * 1024;
-
-/** /v1/process 请求体的最小校验：messages 非空数组，元素至少含 id/title。 */
-function parseProcessRequest(raw: unknown): ProcessRequestBody | null {
-  if (!raw || typeof raw !== "object") return null;
-  const o = raw as Record<string, unknown>;
-  if (!Array.isArray(o.messages) || o.messages.length === 0) return null;
-  const messages: ProcessInputMessage[] = [];
-  for (const m of o.messages) {
-    if (!m || typeof m !== "object") return null;
-    const r = m as Record<string, unknown>;
-    if (typeof r.id !== "string" || typeof r.title !== "string") return null;
-    messages.push({
-      id: r.id,
-      title: r.title,
-      body: typeof r.body === "string" ? r.body : "",
-      appName: typeof r.appName === "string" ? r.appName : undefined,
-      conversationTitle:
-        typeof r.conversationTitle === "string" ? r.conversationTitle : undefined,
-      sender: typeof r.sender === "string" ? r.sender : undefined,
-      postedAt:
-        typeof r.postedAt === "number" && Number.isFinite(r.postedAt)
-          ? r.postedAt
-          : Date.now(),
-    });
-  }
-  return {
-    messages,
-    customPrompt: typeof o.customPrompt === "string" ? o.customPrompt : undefined,
-    now: typeof o.now === "string" ? o.now : new Date().toISOString(),
-    timezone: typeof o.timezone === "string" ? o.timezone : undefined,
-  };
-}
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -79,121 +40,55 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(JSON.stringify(body));
 }
 
-const DASHBOARD_HTML = `<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MsgRepo 仪表盘</title>
-<style>
-  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0; background: #f5f6f8; color: #222; }
-  header { background: #1f2937; color: #fff; padding: 12px 20px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  header h1 { font-size: 16px; margin: 0; }
-  header input, header select { padding: 4px 8px; border-radius: 4px; border: 1px solid #ccc; }
-  header button { padding: 4px 12px; border: 0; border-radius: 4px; background: #2563eb; color: #fff; cursor: pointer; }
-  main { padding: 16px 20px; }
-  .card { background: #fff; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
-  .meta { font-size: 12px; color: #666; margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #e5e7eb; }
-  .P0 { background: #fecaca; } .P1 { background: #fed7aa; } .P2 { background: #dbeafe; } .P3 { background: #e5e7eb; }
-  pre { background: #f3f4f6; padding: 8px; border-radius: 4px; font-size: 12px; overflow: auto; }
-  #status { font-size: 13px; color: #666; }
-</style>
-</head>
-<body>
-<header>
-  <h1>MsgRepo 仪表盘</h1>
-  <input id="token" placeholder="配对 token" size="28">
-  <select id="category"><option value="">全部分类</option></select>
-  <select id="priority">
-    <option value="">全部优先级</option>
-    <option>P0</option><option>P1</option><option>P2</option><option>P3</option>
-  </select>
-  <button id="reload">刷新</button>
-  <span id="status"></span>
-</header>
-<main id="list"></main>
-<script>
-const tokenInput = document.getElementById("token");
-tokenInput.value = localStorage.getItem("msgrepo_token") || "";
-tokenInput.addEventListener("change", () => localStorage.setItem("msgrepo_token", tokenInput.value));
-
-function fmtTime(t) {
-  if (!t || t.kind === "none") return "无时间";
-  const f = (ms) => new Date(ms).toLocaleString("zh-CN", { hour12: false });
-  const parts = [t.kind];
-  if (t.startAt) parts.push("开始 " + f(t.startAt));
-  if (t.endAt) parts.push("结束 " + f(t.endAt));
-  if (t.deadline) parts.push("截止 " + f(t.deadline));
-  return parts.join(" · ");
-}
-
-async function load() {
-  const status = document.getElementById("status");
-  const list = document.getElementById("list");
-  const params = new URLSearchParams();
-  const cat = document.getElementById("category").value;
-  const pri = document.getElementById("priority").value;
-  if (cat) params.set("category", cat);
-  if (pri) params.set("priority", pri);
-  try {
-    const res = await fetch("/api/items?" + params, {
-      headers: { Authorization: "Bearer " + tokenInput.value },
-    });
-    if (res.status === 401) { status.textContent = "token 无效，请填入配对 token"; list.innerHTML = ""; return; }
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    status.textContent = "共 " + data.total + " 条";
-    const catSel = document.getElementById("category");
-    const known = new Set([...catSel.options].map((o) => o.value));
-    list.innerHTML = "";
-    for (const item of data.items.slice().reverse()) {
-      if (!known.has(item.category)) {
-        const opt = document.createElement("option");
-        opt.value = item.category; opt.textContent = item.category;
-        catSel.appendChild(opt); known.add(item.category);
-      }
-      const div = document.createElement("div");
-      div.className = "card";
-      const h = document.createElement("div");
-      const title = document.createElement("strong"); title.textContent = item.title;
-      h.appendChild(title);
-      const meta = document.createElement("div");
-      meta.className = "meta";
-      const badges = [[item.priority, "badge " + item.priority], [item.category, "badge"],
-        ["置信度 " + item.confidence, "badge"], [fmtTime(item.time), "badge"],
-        ["by " + item.processedBy.provider, "badge"]];
-      for (const [text, cls] of badges) {
-        const s = document.createElement("span"); s.className = cls; s.textContent = text; meta.appendChild(s);
-      }
-      const summary = document.createElement("div");
-      summary.className = "meta"; summary.textContent = item.summary;
-      const pre = document.createElement("pre");
-      pre.textContent = JSON.stringify(item.payload, null, 2);
-      div.append(h, meta, summary, pre);
-      list.appendChild(div);
+/**
+ * 把 /v1/chat 请求体组装为 provider 消息序列（design-v3 §6.3、details §2.4）：
+ * desktop 只透传不解析——工具说明书由手机端组装进消息；这里仅做两件事：
+ *  1. 顶层 attachments（手机端已展开正文、自带 [#note:标题] 引用头）拼成一条上下文消息——
+ *     图片附件（带 dataBase64）按 OpenAI content parts 内联（image_url，data URL）；
+ *  2. OpenAI 端点对 tool 角色要求 tool_calls 字段，本地小模型链路用不上——折叠为带前缀的 user 消息。
+ */
+function buildProviderMessages(body: ChatRequest): ProviderChatMessage[] {
+  const out: ProviderChatMessage[] = [];
+  if (body.attachments && body.attachments.length > 0) {
+    const blocks = body.attachments.map((a) => a.content).join("\n\n");
+    const images = body.attachments.filter(
+      (a) => typeof a.dataBase64 === "string" && a.dataBase64.length > 0,
+    );
+    const intro = `以下是与本次对话相关的库内容（供引用定位）：\n\n${blocks}`;
+    if (images.length === 0) {
+      out.push({ role: "user", content: intro });
+    } else {
+      // 多模态消息：文本上下文 + 逐张图片的 image_url 块
+      out.push({
+        role: "user",
+        content: [
+          { type: "text", text: intro },
+          ...images.map((a) => ({
+            type: "image_url" as const,
+            image_url: {
+              url: `data:${a.mimeType ?? "image/png"};base64,${a.dataBase64}`,
+            },
+          })),
+        ],
+      });
     }
-  } catch (e) {
-    status.textContent = "加载失败: " + e;
   }
+  for (const m of body.messages) {
+    if (m.role === "tool") {
+      out.push({ role: "user", content: `[工具执行结果]\n${m.content}` });
+    } else {
+      out.push({ role: m.role, content: m.content });
+    }
+  }
+  return out;
 }
-document.getElementById("reload").addEventListener("click", load);
-document.getElementById("category").addEventListener("change", load);
-document.getElementById("priority").addEventListener("change", load);
-load();
-</script>
-</body>
-</html>
-`;
 
 export function createServer(opts: ServerOptions): http.Server {
-  // 注册 shared schemas，使 sync-request 内的相对 $ref 可解析
-  const ajv = new Ajv2020({ allErrors: true, strict: false });
-  for (const name of ["raw-message", "category-registry", "structured-item", "sync-request"]) {
-    ajv.addSchema(readSharedJson(`schemas/${name}.schema.json`) as object);
-  }
-  const validateSyncRequest = ajv.getSchema("https://msgrepo.dev/schemas/sync-request.schema.json");
-  if (!validateSyncRequest) throw new Error("sync-request schema 加载失败");
+  // 请求体验证：shared/schemas/chat-request.schema.json（唯一事实源）
+  const ajv = new Ajv2020({ allErrors: true, strict: false, validateFormats: false });
+  const validateChat = ajv.compile(readSharedJson("schemas/chat-request.schema.json") as object);
+  // 并发闸（v3）：按模型 id 分闸——不同后端并行、同一后端串行，每闸最多排 8 个，再多 429
+  const gates = new GatePool(1, 8);
 
   return http.createServer(async (req, res) => {
     try {
@@ -204,7 +99,8 @@ export function createServer(opts: ServerOptions): http.Server {
       if (req.method === "GET" && pathname === "/v1/health") {
         return sendJson(res, 200, {
           status: "ok",
-          provider: opts.provider.name,
+          defaultModelId: opts.models.defaultModelId,
+          modelCount: opts.models.models.length,
           time: Date.now(),
         });
       }
@@ -220,30 +116,41 @@ export function createServer(opts: ServerOptions): http.Server {
             return sendJson(res, 400, { error: "invalid JSON body" });
           }
         }
-        if ((body as { reset?: unknown }).reset === true) opts.pairing.reset();
+        if ((body as { reset?: unknown }).reset === true) {
+          // P2-2：重置 token 必须证明持有当前 token。此前任何人都能在 loopback 上把
+          // 手机踢下线（或诱导手机重新配对到本机攻击者进程）。首次配对不走 reset，
+          // 因此「USB 即信任、不输入 token」的零配置体验不受影响。
+          if (!isAuthorized(req, opts.pairing.token)) {
+            return sendJson(res, 403, { error: "reset requires current token" });
+          }
+          opts.pairing.reset();
+        }
         return sendJson(res, 200, {
           token: opts.pairing.token,
           deviceName: os.hostname(),
         });
       }
-      if (req.method === "GET" && (pathname === "/dashboard" || pathname === "/")) {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        return res.end(DASHBOARD_HTML);
-      }
 
-      // 以下端点需要配对 token
-      if (req.method === "GET" && pathname === "/api/items") {
+      // 模型列表（design-v3 §6.2）：逐模型连通性探测结果（带缓存），供手机助理页拉取展示
+      if (req.method === "GET" && pathname === "/v1/models") {
         if (!isAuthorized(req, opts.pairing.token))
           return sendJson(res, 401, { error: "unauthorized" });
-        const items = opts.store.listItems({
-          category: url.searchParams.get("category") ?? undefined,
-          priority: url.searchParams.get("priority") ?? undefined,
-        });
-        return sendJson(res, 200, { total: items.length, items });
+        const models = await opts.models.probeAll();
+        return sendJson(res, 200, { defaultModelId: opts.models.defaultModelId, models });
       }
 
-      // v2 流式评估（设计 §8/§12）：NDJSON，每行一个 token/result/error 事件，done 收尾
-      if (req.method === "POST" && pathname === "/v1/process") {
+      // 重载模型配置（default.json ← local.json ← userData/config.json 重新合并）
+      if (req.method === "POST" && pathname === "/v1/models/reload") {
+        if (!isAuthorized(req, opts.pairing.token))
+          return sendJson(res, 401, { error: "unauthorized" });
+        opts.models.reload();
+        const models = await opts.models.probeAll();
+        console.log(`[models] 配置已重载：${models.length} 个模型，默认 ${opts.models.defaultModelId}`);
+        return sendJson(res, 200, { defaultModelId: opts.models.defaultModelId, models });
+      }
+
+      // v3 统一对话接口（design-v3 §6.3）：SSE 透传 token 流，不解析、不执行工具块
+      if (req.method === "POST" && pathname === "/v1/chat") {
         if (!isAuthorized(req, opts.pairing.token))
           return sendJson(res, 401, { error: "unauthorized" });
         let parsed: unknown;
@@ -252,117 +159,60 @@ export function createServer(opts: ServerOptions): http.Server {
         } catch {
           return sendJson(res, 400, { error: "invalid JSON body" });
         }
-        const body = parseProcessRequest(parsed);
-        if (!body) {
+        if (!validateChat(parsed)) {
           return sendJson(res, 400, {
-            error: "invalid process request: messages 必须是非空数组，元素至少含 id/title",
+            error: "invalid chat request",
+            details: ajv.errorsText(validateChat.errors),
           });
         }
-        const parsedNow = Date.parse(body.now.replace(" ", "T"));
-        const now = Number.isNaN(parsedNow) ? Date.now() : parsedNow;
+        const body = parsed as ChatRequest;
+        const modelId = body.modelConfigId ?? opts.models.defaultModelId;
+        const provider = opts.models.providerFor(modelId);
+        if (!provider) {
+          return sendJson(res, 400, { error: `未知模型配置: ${modelId}` });
+        }
+
+        // 同一模型后端串行（本地推理进程扛不住并发），不同后端并行
+        let releaseSlot: (() => void) | null = null;
+        try {
+          releaseSlot = await gates.acquireSlot(modelId);
+        } catch (e) {
+          if (e instanceof GateBusyError) {
+            res.setHeader("Retry-After", "5");
+            return sendJson(res, 429, { error: "busy", retryAfter: 5 });
+          }
+          throw e;
+        }
+        res.on("close", () => releaseSlot?.());
+
         const startedAt = Date.now();
-        console.log(`[process] 收到 ${body.messages.length} 条消息，开始流式评估…`);
+        console.log(`[chat] 对话 ${body.conversationId} → 模型 ${modelId}（${body.messages.length} 条消息）`);
         res.writeHead(200, {
-          "Content-Type": "application/x-ndjson; charset=utf-8",
+          "Content-Type": "text/event-stream; charset=utf-8",
           "Cache-Control": "no-cache",
           "X-Accel-Buffering": "no",
         });
-        // 立即冲刷响应头：处理可能耗时数十秒，客户端对建立连接有超时限制
+        // 立即冲刷响应头：首 token 可能耗时数秒，客户端对建立连接有超时限制
         res.flushHeaders();
-        const send = (obj: unknown) => {
+        const send = (event: ChatEvent) => {
           try {
-            res.write(JSON.stringify(obj) + "\n");
+            res.write(`data: ${JSON.stringify(event)}\n\n`);
           } catch {
-            // 客户端已断开：忽略写入错误，剩余消息继续处理
+            // 客户端已断开：忽略写入错误
           }
         };
-        const registry = loadRegistry(opts.dataDir);
-        const result = await processStreaming(body.messages, registry, opts.provider, {
-          customPrompt: body.customPrompt,
-          now,
-          onEvent: send,
-        });
-        send({ type: "done", total: result.total, failed: result.failed });
-        res.end();
-        console.log(
-          `[process] 完成：${result.total} 条 / 失败 ${result.failed}，` +
-            `耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
-        );
-        return;
-      }
-
-      // Deprecated：v1 同步协议，保留一个版本周期供旧手机端使用（设计 §12），新端点为 /v1/process
-      if (req.method === "POST" && pathname === "/v1/sync") {
-        res.setHeader("Deprecation", "true");
-        if (!isAuthorized(req, opts.pairing.token))
-          return sendJson(res, 401, { error: "unauthorized" });
-        let parsed: unknown;
         try {
-          parsed = JSON.parse(await readBody(req));
-        } catch {
-          return sendJson(res, 400, { error: "invalid JSON body" });
+          await provider.chat(buildProviderMessages(body), {
+            onToken: (delta) => send({ type: "token_delta", delta }),
+          });
+          send({ type: "done" });
+          console.log(`[chat] 完成：${modelId}，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+        } catch (err) {
+          send({ type: "error", error: String(err) });
+          console.log(`[chat] 失败：${modelId}：${String(err)}`);
         }
-        if (!validateSyncRequest(parsed)) {
-          return sendJson(res, 400, {
-            error: "request failed sync-request schema validation",
-            details: ajv.errorsText(validateSyncRequest.errors),
-          });
-        }
-        const syncReq = parsed as SyncRequest;
-        const startedAt = Date.now();
-        console.log(`[sync] 收到 ${syncReq.messages.length} 条消息（stream=${syncReq.stream === true}），开始处理…`);
-        const current = loadRegistry(opts.dataDir);
-        const { registry, warnings: regWarnings } = negotiateRegistry(syncReq, current, opts.dataDir);
-
-        // 流式模式：NDJSON 逐条下发进度，每条结果在管线内已即时落盘
-        if (syncReq.stream === true) {
-          res.writeHead(200, {
-            "Content-Type": "application/x-ndjson; charset=utf-8",
-            "Cache-Control": "no-cache",
-          });
-          const send = (obj: unknown) => {
-            try {
-              res.write(JSON.stringify(obj) + "\n");
-            } catch {
-              // 客户端已断开：忽略写入错误，管线继续落盘
-            }
-          };
-          for (const w of regWarnings) send({ type: "warning", message: w });
-          const result = await runPipeline(syncReq.messages, registry, opts.provider, opts.store, {
-            customPrompt: syncReq.customPrompt,
-            reprocessMessageIds: syncReq.reprocessMessageIds,
-            onProgress: (ev) => send({ type: "progress", ...ev }),
-          });
-          console.log(
-            `[sync] 完成：${result.processedMessageIds.length} 处理 / ${result.failedMessageIds.length} 失败 / ` +
-              `${result.results.length} 条结果，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
-          );
-          send({
-            type: "done",
-            registryVersion: registry.version,
-            failedMessageIds: result.failedMessageIds,
-            warnings: result.warnings,
-          });
-          res.end();
-          return;
-        }
-
-        const result = await runPipeline(syncReq.messages, registry, opts.provider, opts.store, {
-          customPrompt: syncReq.customPrompt,
-          reprocessMessageIds: syncReq.reprocessMessageIds,
-        });
-        console.log(
-          `[sync] 完成：${result.processedMessageIds.length} 处理 / ${result.failedMessageIds.length} 失败 / ` +
-            `${result.results.length} 条结果，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
-        );
-        const response: SyncResponse = {
-          registryVersion: registry.version,
-          results: result.results,
-          processedMessageIds: result.processedMessageIds,
-          failedMessageIds: result.failedMessageIds,
-          warnings: [...regWarnings, ...result.warnings],
-        };
-        return sendJson(res, 200, response);
+        res.end();
+        return;
       }
 
       sendJson(res, 404, { error: "not found" });

@@ -9,13 +9,13 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <!-- 引导用户把应用加入电池优化白名单（v2.6 保活） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
-    <!-- 短信导入：读系统短信库（运行时授权，v2.6） -->
-    <uses-permission android:name="android.permission.READ_SMS"/>
+    <!-- 短信导入的 READ_SMS 已随 v3 阶段 3 移除（design-v3 §3.2） -->
 
     <application
-        android:label="MsgRepo"
+        android:label="ManaList"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:usesCleartextTraffic="true">
         <activity
@@ -29,6 +29,11 @@
             <meta-data
                 android:name="io.flutter.embedding.android.NormalTheme"
                 android:resource="@style/NormalTheme"/>
+            <!-- F15：让 Flutter 在引擎初始化期间继续显示启动图，直到画出第一帧。
+                 没有它，FlutterActivity 会立刻换成 NormalTheme 的背景 → 表现为长时间白屏。 -->
+            <meta-data
+                android:name="io.flutter.embedding.android.SplashScreenDrawable"
+                android:resource="@drawable/launch_background"/>
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -44,6 +49,26 @@
                 <action android:name="android.service.notification.NotificationListenerService"/>
             </intent-filter>
         </service>
+
+        <!-- B04（2026-10-24）：flutter_local_notifications 从 16 版起不再在自己的
+             manifest 里声明接收器，必须由 App 声明（插件 17.2.4 README:252-263）。
+             漏声明的后果是「到点闹钟已触发、广播无处投递」→ 通知 0 条且应用侧
+             零日志、零错误，只在真机上暴露；回归守卫见 test/manifest_receivers_test.dart。
+             ScheduledNotificationReceiver：到点后真正发通知的接收器。
+             ScheduledNotificationBootReceiver：重启/应用更新后重排已缓存的提醒。 -->
+        <receiver
+            android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver"
+            android:exported="false"/>
+        <receiver
+            android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
 
         <meta-data
             android:name="flutterEmbedding"

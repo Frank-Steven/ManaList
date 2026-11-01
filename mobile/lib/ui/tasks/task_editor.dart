@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
@@ -82,11 +84,26 @@ class _TaskEditorSheet extends StatefulWidget {
   State<_TaskEditorSheet> createState() => _TaskEditorSheetState();
 }
 
-class _TaskEditorSheetState extends State<_TaskEditorSheet> {
+class _TaskEditorSheetState extends State<_TaskEditorSheet>
+    with TickerProviderStateMixin {
   static const _maxTitleWidth = 20;
 
   late final TextEditingController _titleCtrl;
   late final TextEditingController _descCtrl;
+
+  /// 表单流转链（填完一项自动进入下一项）：标题 → 描述 → 类型/时间 →
+  /// 优先级 → 保存。文本字段用 FocusNode 链；选择类字段不收键盘焦点，
+  /// 只用 GlobalKey + Scrollable.ensureVisible 滚动/高亮，避免弹起键盘。
+  final _titleFocus = FocusNode();
+  final _descFocus = FocusNode();
+  final _timeSectionKey = GlobalKey();
+  final _prioritySectionKey = GlobalKey();
+  final _saveButtonKey = GlobalKey();
+
+  /// 流转到位后的轻提示：目标区块底色呼吸一次、保存按钮缩放呼吸一次。
+  late final AnimationController _flashCtrl;
+  GlobalKey? _flashTarget;
+  late final AnimationController _savePulseCtrl;
   late String _kind;
   DateTime? _startAt;
   DateTime? _endAt;
@@ -120,6 +137,10 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
     _isAnnual = e?.isAnnual ?? false;
     _sourceMessageId = widget.sourceMessageId ?? e?.sourceMessageId;
     _parentId = e?.parentId;
+    _flashCtrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 700));
+    _savePulseCtrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 450));
     _titleCtrl.addListener(() => setState(() {}));
     _loadSourceMessage();
     _loadParentCandidates();
@@ -148,6 +169,10 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
   void dispose() {
     _titleCtrl.dispose();
     _descCtrl.dispose();
+    _titleFocus.dispose();
+    _descFocus.dispose();
+    _flashCtrl.dispose();
+    _savePulseCtrl.dispose();
     super.dispose();
   }
 
@@ -190,6 +215,7 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
       lastDate: DateTime(2100),
     );
     if (picked == null) return;
+    if (!mounted) return; // P3-5：await 之后页面可能已销毁
     setState(() {
       final merged = DateTime(picked.year, picked.month, picked.day,
           current?.hour ?? 9, current?.minute ?? 0);
@@ -199,6 +225,7 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
         _endAt = merged;
       }
     });
+    _onTimePicked();
   }
 
   Future<void> _pickTime(bool isStart) async {
@@ -209,6 +236,7 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
       initialTime: TimeOfDay.fromDateTime(current),
     );
     if (picked == null) return;
+    if (!mounted) return; // P3-5：await 之后页面可能已销毁
     setState(() {
       final merged = DateTime(current.year, current.month, current.day,
           picked.hour, picked.minute);
@@ -218,6 +246,7 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
         _endAt = merged;
       }
     });
+    _onTimePicked();
   }
 
   void _clearTime() {
@@ -225,6 +254,71 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
       _startAt = null;
       _endAt = null;
     });
+  }
+
+  /// 流转到下一字段：滚动到目标区块，可附带底色呼吸一次。
+  /// 选择类字段不请求键盘焦点，保证不打断用户的选择操作。
+  void _advanceTo(GlobalKey key, {bool flash = false}) {
+    final ctx = key.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(ctx,
+          duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+    }
+    if (flash) {
+      setState(() => _flashTarget = key);
+      _flashCtrl.forward(from: 0);
+    }
+  }
+
+  /// 标题回车/完成 → 焦点移到描述。
+  void _onTitleSubmitted() => _descFocus.requestFocus();
+
+  /// 描述完成 → 收起键盘，滚动并高亮类型/时间选择区。
+  void _onDescSubmitted() {
+    FocusScope.of(context).unfocus();
+    _advanceTo(_timeSectionKey, flash: true);
+  }
+
+  /// 时间选完（点确定后）→ 滚动并高亮优先级选择区。
+  void _onTimePicked() => _advanceTo(_prioritySectionKey, flash: true);
+
+  /// 优先级选完 → 滚动到底部保存按钮并呼吸一次（不打扰式提示）。
+  void _onPriorityChanged(int i) {
+    setState(() {
+      _priority = switch (i) {
+        0 => TaskPriority.important,
+        2 => TaskPriority.minor,
+        _ => TaskPriority.normal,
+      };
+    });
+    _advanceTo(_saveButtonKey);
+    _savePulseCtrl.forward(from: 0);
+  }
+
+  /// 区块高亮包裹：流转到位后底色呼吸一次（sin 半周期 0→1→0）。
+  Widget _flashWrap(GlobalKey key, Widget child) {
+    return AnimatedBuilder(
+      animation: _flashCtrl,
+      builder: (context, child) {
+        final t = _flashTarget == key
+            ? math.sin(math.pi * _flashCtrl.value)
+            : 0.0;
+        return Container(
+          key: key,
+          decoration: BoxDecoration(
+            color: t <= 0
+                ? null
+                : Theme.of(context)
+                    .colorScheme
+                    .primaryContainer
+                    .withValues(alpha: 0.45 * t),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: child,
+        );
+      },
+      child: child,
+    );
   }
 
   Future<void> _confirmDelete() async {
@@ -272,7 +366,8 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
         deriveTimeScale(_startAt, _kind == TaskKind.range ? _endAt : null));
     final eligible = _parentCandidates
         .where((t) =>
-            timeScaleRank(deriveTaskScale(t.startAt, t.endAt)) >= childRank)
+            timeScaleRank(deriveTaskScale(t.startAt, t.endAt, kind: t.kind)) >=
+                  childRank)
         .toList();
     final value =
         eligible.any((t) => t.id == _parentId) ? _parentId : null;
@@ -286,7 +381,7 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
           DropdownMenuItem(
             value: t.id,
             child: Text(
-              '${t.title}（${timeScaleLabel(deriveTaskScale(t.startAt, t.endAt))}）',
+              '${t.title}（${timeScaleLabel(deriveTaskScale(t.startAt, t.endAt, kind: t.kind))}）',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
@@ -319,6 +414,7 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
   }
 
   void _snack(String text) {
+    if (!mounted) return; // P3-5：await 之后调用时页面可能已销毁
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(
@@ -354,7 +450,8 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
       } else {
         final parent = candidates.first;
         final parentRank =
-            timeScaleRank(deriveTaskScale(parent.startAt, parent.endAt));
+            timeScaleRank(
+                  deriveTaskScale(parent.startAt, parent.endAt, kind: parent.kind));
         final childRank = timeScaleRank(
             deriveTimeScale(start, kind == TaskKind.range ? end : null));
         if (childRank > parentRank) {
@@ -454,7 +551,10 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
             ),
             TextField(
               controller: _titleCtrl,
+              focusNode: _titleFocus,
               autofocus: !_isEditing,
+              textInputAction: TextInputAction.next,
+              onSubmitted: (_) => _onTitleSubmitted(),
               decoration: const InputDecoration(
                 labelText: '名称',
                 hintText: '必填',
@@ -483,8 +583,11 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
             const SizedBox(height: 8),
             TextField(
               controller: _descCtrl,
+              focusNode: _descFocus,
               minLines: 2,
               maxLines: 5,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _onDescSubmitted(),
               decoration: const InputDecoration(
                 labelText: '描述',
                 hintText: '可选',
@@ -492,50 +595,61 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
               ),
             ),
             const SizedBox(height: 12),
-            Text('类型', style: Theme.of(context).textTheme.labelLarge),
-            const SizedBox(height: 6),
-            SegmentedSelector<int>(
-              values: const [0, 1],
-              labels: const ['时间点', '时间段'],
-              height: 36,
-              selected: _kind == TaskKind.point ? 0 : 1,
-              onChanged: _switchKind,
-            ),
-            const SizedBox(height: 12),
-            _TimeRow(
-              label: '开始',
-              value: _startAt,
-              onPickDate: () => _pickDate(true),
-              onPickTime: () => _pickTime(true),
-              onClear: _clearTime,
-            ),
-            if (_kind == TaskKind.range)
-              _TimeRow(
-                label: '结束',
-                value: _endAt,
-                onPickDate: () => _pickDate(false),
-                onPickTime: () => _pickTime(false),
+            _flashWrap(
+              _timeSectionKey,
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('类型', style: Theme.of(context).textTheme.labelLarge),
+                  const SizedBox(height: 6),
+                  SegmentedSelector<int>(
+                    values: const [0, 1],
+                    labels: const ['时间点', '时间段'],
+                    height: 36,
+                    selected: _kind == TaskKind.point ? 0 : 1,
+                    onChanged: _switchKind,
+                  ),
+                  const SizedBox(height: 12),
+                  _TimeRow(
+                    label: '开始',
+                    value: _startAt,
+                    onPickDate: () => _pickDate(true),
+                    onPickTime: () => _pickTime(true),
+                    onClear: _clearTime,
+                  ),
+                  if (_kind == TaskKind.range)
+                    _TimeRow(
+                      label: '结束',
+                      value: _endAt,
+                      onPickDate: () => _pickDate(false),
+                      onPickTime: () => _pickTime(false),
+                    ),
+                ],
               ),
+            ),
             const SizedBox(height: 12),
-            Text('优先级', style: Theme.of(context).textTheme.labelLarge),
-            const SizedBox(height: 6),
-            SegmentedSelector<int>(
-              values: const [0, 1, 2],
-              labels: const ['重要', '一般', '不重要'],
-              dots: const [Colors.red, Colors.amber, Colors.green],
-              height: 36,
-              selected: switch (_priority) {
-                TaskPriority.important => 0,
-                TaskPriority.minor => 2,
-                _ => 1,
-              },
-              onChanged: (i) => setState(() {
-                _priority = switch (i) {
-                  0 => TaskPriority.important,
-                  2 => TaskPriority.minor,
-                  _ => TaskPriority.normal,
-                };
-              }),
+            _flashWrap(
+              _prioritySectionKey,
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('优先级',
+                      style: Theme.of(context).textTheme.labelLarge),
+                  const SizedBox(height: 6),
+                  SegmentedSelector<int>(
+                    values: const [0, 1, 2],
+                    labels: const ['重要', '一般', '不重要'],
+                    dots: const [Colors.red, Colors.amber, Colors.green],
+                    height: 36,
+                    selected: switch (_priority) {
+                      TaskPriority.important => 0,
+                      TaskPriority.minor => 2,
+                      _ => 1,
+                    },
+                    onChanged: _onPriorityChanged,
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 12),
             // 尺度（设计 §7，v2.1）：只读展示当前派生时间尺度，随时间选择实时变化
@@ -596,9 +710,19 @@ class _TaskEditorSheetState extends State<_TaskEditorSheet> {
                   child: const Text('取消'),
                 ),
                 const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: _canSave ? _save : null,
-                  child: const Text('保存'),
+                // 优先级选完后呼吸一次（轻提示，不弹 SnackBar 打扰）
+                AnimatedBuilder(
+                  animation: _savePulseCtrl,
+                  builder: (context, child) => Transform.scale(
+                    scale:
+                        1 + 0.07 * math.sin(math.pi * _savePulseCtrl.value),
+                    child: child,
+                  ),
+                  child: FilledButton(
+                    key: _saveButtonKey,
+                    onPressed: _canSave ? _save : null,
+                    child: const Text('保存'),
+                  ),
                 ),
               ],
             ),

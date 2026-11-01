@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 2026-10-28：启动底色跟随深浅模式。深色档 #121212，
+         浅色档在 values/colors.xml，改一处必须同步另一处。 -->
+    <color name="splash_bg">#121212</color>
+</resources>

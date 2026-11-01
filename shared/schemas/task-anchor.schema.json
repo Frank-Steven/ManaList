@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://msgrepo.dev/schemas/task-anchor.schema.json",
+  "title": "TaskAnchor",
+  "description": "任务锚点（design-v3 §1.1）：连接一个任务与库中一条消息/一篇笔记/一个文件。锚点以行内 marker 形式直接插入笔记或消息正文，语法为 ⟦task:<anchorId>⟧（<anchorId> 即本实体 id，全项目统一正则 ⟦task:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})⟧，小写写入、读取大小写容忍；marker 不内嵌标题，渲染时按 id 联查任务标题，见 design-v3-details §1.1）。文件锚点不插入内容，仅落表。",
+  "type": "object",
+  "required": ["id", "taskId", "targetType", "targetId", "createdBy", "createdAt"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID v4，与正文行内 marker ⟦task:<id>⟧ 中的 id 一致"
+    },
+    "taskId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "被连接的任务 id（tasks.id）。一个锚点恰好连接一个任务；一个任务可被多个锚点连接"
+    },
+    "targetType": {
+      "type": "string",
+      "enum": ["message", "note", "file"],
+      "description": "锚点所在目标类型"
+    },
+    "targetId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "目标实体 id：messages.id / notes.id / files.id"
+    },
+    "label": {
+      "type": ["string", "null"],
+      "description": "锚点显示名；缺省（null）取任务标题快照。删除任务残迹化时作为 marker 的替代文本"
+    },
+    "createdBy": {
+      "type": "string",
+      "enum": ["user", "ai"],
+      "description": "创建者：user=用户手动添加；ai=AI 工具提案经审批后创建"
+    },
+    "createdAt": {
+      "type": "integer",
+      "description": "创建时间的 Unix 毫秒时间戳"
+    }
+  }
+}

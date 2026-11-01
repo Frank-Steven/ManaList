@@ -81,15 +81,14 @@ async function tick(): Promise<void> {
   if (lastState !== "ok") {
     const { pairing } = loadOrCreatePairing(DATA_DIR);
     log("连接就绪：手机 → adb reverse → 电脑服务");
-    log(`  服务: http://127.0.0.1:${PORT}（provider=${cfg.provider}）`);
-    log(`  仪表盘: http://127.0.0.1:${PORT}/dashboard`);
+    log(`  服务: http://127.0.0.1:${PORT}（默认模型 ${cfg.defaultModelId}）`);
     log(`  配对 token: ${pairing.token}`);
   }
   lastState = "ok";
 }
 
 async function main(): Promise<void> {
-  log(`MsgRepo 连接看护启动（端口 ${PORT}，Ctrl+C 退出）`);
+  log(`LinkModel 连接看护启动（端口 ${PORT}，Ctrl+C 退出）`);
   const timer = setInterval(() => {
     tick().catch((e) => log(`看护异常：${String(e)}`));
   }, 5000);

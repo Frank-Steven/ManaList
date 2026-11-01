@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://msgrepo.dev/schemas/sync-response.schema.json",
   "title": "SyncResponse",
-  "description": "POST /v1/sync 响应体。电脑返回结构化结果与被成功处理的消息 ID。",
+  "description": "[superseded] v3 起废弃：/v1/sync 与 /v1/process 批处理协议随批处理评估管线废弃，由 /v1/chat 统一助理接口取代（design-v3 §2、§6.3）。POST /v1/sync 响应体。电脑返回结构化结果与被成功处理的消息 ID。",
   "type": "object",
   "required": ["registryVersion", "results", "processedMessageIds"],
   "properties": {

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v3.0（2026-10-25）：合作者新版图标。
+     直接使用交付包里的 mipmap 位图：background 为品牌渐变，foreground 为透明主体。
+     不使用 drawable/ic_launcher_*.xml（那是 Android Studio 模板占位，不是本设计）。
+     monochrome 暂不声明：交付包没有单独的单色剪影，拿彩色前景当 monochrome 会糊。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@mipmap/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

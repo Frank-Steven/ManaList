@@ -1,5 +1,7 @@
 # MsgRepo v2 重构操作文档
 
+> v3 手册见 [refactor-v3.md](refactor-v3.md)（v3 起应用改名 Manalist）。本文档保留作历史参考。
+
 配套 `docs/design-v2.md` 执行。每阶段独立可构建、真机验证、单独 git 提交；任一阶段出问题只回滚该阶段（`git revert` 对应提交）。
 
 ## 总则

@@ -2,9 +2,13 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
+import '../services/app_log.dart';
 
 /// 应用图标加载（v2.4）：平台通道从 PackageManager 取 PNG（96px），
-/// 内存 + 磁盘（<cacheDir>/app_icons/<包名>.png）双层缓存；
+/// 内存 + 磁盘双层缓存。磁盘缓存放持久目录
+/// （<supportDir>/app_icons/<包名>.png）——早期放在临时目录，
+/// 系统随时清理导致每次启动都重新走通道，2026-11-01 起迁移，
+/// 旧临时目录缓存仍作回退读取一次。
 /// 应用已卸载/查询失败返回 null，调用方显示占位。
 class AppIconService {
   AppIconService._();
@@ -31,12 +35,23 @@ class AppIconService {
 
   Future<Uint8List?> _load(String packageName) async {
     try {
-      final dir = await getTemporaryDirectory();
-      final file = File('${dir.path}/app_icons/$packageName.png');
-      if (await file.exists()) {
-        final bytes = await file.readAsBytes();
-        if (bytes.isNotEmpty) {
-          return _mem[packageName] = bytes;
+      final support = await getApplicationSupportDirectory();
+      final file = File('${support.path}/app_icons/$packageName.png');
+      for (final candidate in [
+        file,
+        // 旧临时目录缓存回退（迁移期兼容，命中后写入持久目录）
+        File('${(await getTemporaryDirectory()).path}/app_icons/'
+            '$packageName.png'),
+      ]) {
+        if (await candidate.exists()) {
+          final bytes = await candidate.readAsBytes();
+          if (bytes.isNotEmpty) {
+            if (candidate.path != file.path) {
+              await file.create(recursive: true);
+              await file.writeAsBytes(bytes, flush: true);
+            }
+            return _mem[packageName] = bytes;
+          }
         }
       }
       final bytes = await _channel.invokeMethod<Uint8List>(
@@ -46,7 +61,8 @@ class AppIconService {
         await file.writeAsBytes(bytes, flush: true);
         return _mem[packageName] = bytes;
       }
-    } catch (_) {
+    } catch (e, st) {
+      AppLog.instance.warn('icon.cache-write', e, st);
       // 图标是锦上添花，失败静默
     }
     return _mem[packageName] = null;

@@ -4,6 +4,7 @@ import 'package:uuid/uuid.dart';
 import '../../models/note.dart';
 import '../../services/database.dart';
 import '../../services/undo_service.dart';
+import '../assistant/attachment_pick_controller.dart';
 import 'chapters_page.dart';
 
 /// 撤销统一入口（设计 §6，v2.1）：逆操作入队 + SnackBar 提示（「{label}」+ 撤销按钮，
@@ -57,8 +58,18 @@ Future<String?> promptNameDialog(BuildContext context,
 
 /// 笔记模块第一层：笔记本列表（设计 §4）。
 /// 长按拖动排序；行尾菜单重命名/删除（删除为级联 + 复合撤销）。
+/// pick 模式（2026-11-01，附件选择）：下钻章节/笔记列表复用多选，
+/// 选择状态写入 [pickController]（跨页面导航不丢）。
 class NotesPage extends StatefulWidget {
-  const NotesPage({super.key});
+  const NotesPage({
+    super.key,
+    this.pickMode = false,
+    this.pickController,
+  });
+
+  /// 附件选择模式：仅下钻传参，本层（笔记本列表）无可选条目。
+  final bool pickMode;
+  final AttachmentPickController? pickController;
 
   @override
   State<NotesPage> createState() => NotesPageState();
@@ -77,6 +88,9 @@ class NotesPageState extends State<NotesPage> {
 
   /// 供外部（如底部导航切页）触发的公开刷新入口。
   Future<void> reload() => _reload();
+
+  /// 库页 FAB「新建笔记本」入口（ui-structure §4：领域主创建统一 FAB）。
+  Future<void> createNotebook() => _addNotebook();
 
   Future<void> _reload() async {
     final db = AppDatabase.instance;
@@ -107,7 +121,12 @@ class NotesPageState extends State<NotesPage> {
 
   Future<void> _openChapters(Notebook notebook) async {
     await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => ChaptersPage(notebook: notebook)),
+      MaterialPageRoute(
+          builder: (_) => ChaptersPage(
+                notebook: notebook,
+                pickMode: widget.pickMode,
+                pickController: widget.pickController,
+              )),
     );
     await _reload();
   }
@@ -199,15 +218,10 @@ class NotesPageState extends State<NotesPage> {
 
   @override
   Widget build(BuildContext context) {
+    // ui-structure §3：分区页不持有 AppBar（由库页容器统一持有）。
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('笔记'),
-        actions: [
-          IconButton(icon: const Icon(Icons.add), onPressed: _addNotebook),
-        ],
-      ),
       body: _notebooks.isEmpty
-          ? const Center(child: Text('暂无笔记本，点右上角 + 新建'))
+          ? const Center(child: Text('暂无笔记本，点右下角 + 新建'))
           : ReorderableListView.builder(
               itemCount: _notebooks.length,
               onReorderItem: _onReorder,

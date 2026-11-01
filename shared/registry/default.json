@@ -7,7 +7,7 @@
       "description": "有明确开始时间的事件：会议、约会、航班、火车、演出、预约等。典型措辞：『明天下午3点开会』『G123次列车 08:30 发车』。",
       "baseKind": "specialized",
       "defaultPriority": "P1",
-      "priorityHints": "开始时间在24小时内且不可错过（航班/会议）则 P0；一般 P1；例行提醒 P2",
+      "priorityHints": "开始时间在24小时内且不可错过（航班/会议）→ red；一般 → yellow；例行提醒 → green",
       "timeHints": "time.kind=range（有结束时间）或 point；reminderOffsets 默认 [60, 10]",
       "payloadSchema": {
         "type": "object",
@@ -27,7 +27,7 @@
       "description": "需要本人执行的动作：缴费、回复、提交材料、取快递、抢票等。典型措辞：『请在周五前完成』『记得取件』『账单待支付』。",
       "baseKind": "specialized",
       "defaultPriority": "P2",
-      "priorityHints": "有截止时间且临近则 P0/P1；无明确时间 P2；可做可不做 P3",
+      "priorityHints": "有截止时间且临近 → red / yellow；无明确时间 → green；可做可不做 → green",
       "timeHints": "有开始和截止时间用 time.kind=range（startAt=开始，endAt=截止）；只有截止用 deadline；只有单一时刻（如『明早8点交』）用 point；无时间用 none；reminderOffsets 默认 [120]",
       "payloadSchema": {
         "type": "object",
@@ -46,7 +46,7 @@
       "description": "值得留存但无需行动的信息：地址、账号、推荐、知识点、他人发的有用内容等。",
       "baseKind": "specialized",
       "defaultPriority": "P3",
-      "priorityHints": "通常 P3；用户手动添加的笔记可为 P2",
+      "priorityHints": "通常 green；用户手动添加的笔记可为 yellow",
       "timeHints": "通常 time.kind=none",
       "payloadSchema": {
         "type": "object",
@@ -63,7 +63,7 @@
       "description": "快递收发、物流状态：『您的包裹已到达菜鸟驿站，取件码 6-1-2345』『顺丰已揽收』。",
       "baseKind": "generic",
       "defaultPriority": "P2",
-      "priorityHints": "到达待取 P1；在途 P3",
+      "priorityHints": "到达待取 → yellow；在途 → green",
       "timeHints": "在途通常 time.kind=none；要求限时取件用 deadline",
       "payloadSchema": {
         "type": "object",
@@ -82,7 +82,7 @@
       "description": "水电煤、话费、信用卡还款等账单通知。典型措辞：『本期账单 ¥128.50，最后还款日 10月25日』。",
       "baseKind": "generic",
       "defaultPriority": "P1",
-      "priorityHints": "临近最后期限 P0；常规出账 P1",
+      "priorityHints": "临近最后期限 → red；常规出账 → yellow",
       "timeHints": "time.kind=deadline，deadline=最后缴费/还款日；reminderOffsets 默认 [1440, 120]",
       "payloadSchema": {
         "type": "object",
@@ -101,7 +101,7 @@
       "description": "优惠券、促销、活动推送、直播开播提醒等营销类通知。多为低价值信息，但限时大额优惠可能值得保留。典型措辞：『你关注的主播正在直播』『全场满300减50』。",
       "baseKind": "generic",
       "defaultPriority": "P3",
-      "priorityHints": "几乎总是 P3；用户常关注的品牌且有明确截止时间可 P2",
+      "priorityHints": "几乎总是 green；明显营销推送（含退订/秒杀等模板）→ junk；用户常关注的品牌且有明确截止时间可 yellow",
       "timeHints": "有有效期用 time.kind=deadline，通常不提醒 reminderOffsets=[]",
       "payloadSchema": {
         "type": "object",
@@ -120,7 +120,7 @@
       "description": "一次性验证码、动态口令。典型措辞：『验证码 483920，5 分钟内有效』。",
       "baseKind": "generic",
       "defaultPriority": "P0",
-      "priorityHints": "收到时总是 P0（即时使用），过期后无价值",
+      "priorityHints": "收到时总是 red（即时使用），过期后无价值",
       "timeHints": "time.kind=deadline，deadline=过期时刻；reminderOffsets=[]",
       "payloadSchema": {
         "type": "object",
@@ -139,7 +139,7 @@
       "description": "兜底分类：无法归入其他任何分类时使用。fields 中尽量保留关键信息以便日后人工整理。",
       "baseKind": "generic",
       "defaultPriority": "P2",
-      "priorityHints": "默认 P2",
+      "priorityHints": "默认 green",
       "timeHints": "AI 若能识别出时间信息仍应填入 time",
       "payloadSchema": {
         "type": "object",

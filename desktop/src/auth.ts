@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 
 export interface Pairing {
@@ -27,9 +27,29 @@ export function loadOrCreatePairing(dataDir: string): { pairing: Pairing; create
   return { pairing, created: true };
 }
 
+/**
+ * 常量时间比较两段字符串（P2-3）。长度不同直接返回 false —— 长度本身不是秘密，
+ * 但可以避免 timingSafeEqual 抛错。
+ */
+export function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/**
+ * 校验 Authorization 头的值是否为 `Bearer <token>`（常量时间比较，防计时攻击）。
+ * 抽成纯函数是为了可单测：不必伪造 IncomingMessage。
+ */
+export function isBearerTokenMatch(headerValue: string | undefined, token: string): boolean {
+  if (!headerValue || token.length === 0) return false;
+  return safeEqual(headerValue, `Bearer ${token}`);
+}
+
 /** 校验 Authorization: Bearer <token>。 */
 export function isAuthorized(req: IncomingMessage, token: string): boolean {
-  return req.headers.authorization === `Bearer ${token}`;
+  return isBearerTokenMatch(req.headers.authorization, token);
 }
 
 /** 配对 token 的运行期持有者：支持 /v1/pair 的 reset 重新签发并落盘。 */

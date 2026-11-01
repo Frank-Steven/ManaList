@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://msgrepo.dev/schemas/chat-request.schema.json",
+  "title": "ChatRequest",
+  "description": "POST /v1/chat 请求体（design-v3 §2、§6.3）。手机端助理组装对话历史 + 附件展开内容 + 工具说明书（进 system prompt，由 mobile 组装），desktop 只做路由与透传，不解析、不执行工具。",
+  "type": "object",
+  "required": ["conversationId", "messages", "stream"],
+  "properties": {
+    "conversationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "对话 id（conversations.id），手机端生成"
+    },
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": ["user", "assistant", "tool"],
+            "description": "tool=工具/提案执行结果回注的消息"
+          },
+          "content": {
+            "type": "string",
+            "description": "消息正文。assistant 消息中可含 ```tool 围栏的工具调用块（design-v3-details §2.1）"
+          },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["type", "id"],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": ["note", "message", "file"]
+                },
+                "id": { "type": "string", "format": "uuid" }
+              }
+            },
+            "description": "该消息引用的库实体（仅引用）；正文在顶层 attachments 中展开。可选"
+          }
+        }
+      },
+      "description": "完整对话历史，按时间升序"
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "id", "content"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["note", "message", "file"],
+            "description": "附件类型：笔记 / 消息 / 文件"
+          },
+          "id": { "type": "string", "format": "uuid" },
+          "content": {
+            "type": "string",
+            "description": "展开后的正文内容（笔记/消息正文、文件文本抽取），带 [#note:标题] 类引用头，供 AI 引用定位；图片附件为图片说明头"
+          },
+          "mimeType": {
+            "type": "string",
+            "description": "文件附件的 MIME 类型（图片附件必有，如 image/png）。可选"
+          },
+          "dataBase64": {
+            "type": "string",
+            "description": "图片附件的内联图像数据（base64，PNG，手机端已按多模态输入缩放）。仅当目标模型声明 vision=true 时附带。可选"
+          }
+        }
+      },
+      "description": "本轮请求的附件，请求前由手机端展开为上下文块。可选"
+    },
+    "modelConfigId": {
+      "type": "string",
+      "description": "对话绑定的模型配置 id（model-config.schema.json），缺省用 desktop 配置的 defaultModelId。可选"
+    },
+    "stream": {
+      "type": "boolean",
+      "description": "为 true 时以 SSE/NDJSON 流式返回 chat-response 事件；首版恒为 true"
+    }
+  }
+}

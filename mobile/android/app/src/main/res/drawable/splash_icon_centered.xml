@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 启动图标（2026-11-01：Flutter 启动页已移除，启动画面完全由原生构成）。
+
+     版式：可见 64dp（用户两次反馈太大：116 → 88 → 64；
+     1080px 屏 / 2.75 密度 ≈ 176px，屏宽 16.3%），水平垂直居中。
+     位图为 mipmap 密度桶（64/96/128/192/256px），自然尺寸即 64dp，
+     无需在此显式约束尺寸。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:drawable="@mipmap/splash_icon"
+        android:gravity="center" />
+</layer-list>

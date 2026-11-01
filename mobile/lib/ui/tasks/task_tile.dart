@@ -59,9 +59,10 @@ String taskTimeSummary(Task task) {
   return _fmtMs(s);
 }
 
-/// 任务行（设计 §3；待办页/日程页底部板块共用）：勾选圆框 + 优先级点 +
-/// 标题 + 尺度徽标 + 时间摘要 + 来源/归档按钮。子任务用 [indent] 缩进；
-/// 有子任务的父行显示折叠箭头（[onToggleCollapse]）。
+/// 任务行（设计 §3；待办页/日程页底部板块共用）：行首 = 多选勾选（选择态）+
+/// 折叠箭头 + 优先级点；行尾 = 来源/归档按钮 + 完成勾选圆框（2026-11-01
+/// 打勾统一移到右边、多选统一移到左边）。中间 = 标题 + 尺度徽标 + 时间摘要。
+/// 子任务用 [indent] 缩进；有子任务的父行显示折叠箭头（[onToggleCollapse]）。
 class TaskTile extends StatelessWidget {
   final Task task;
   final bool archived;
@@ -121,7 +122,7 @@ class TaskTile extends StatelessWidget {
   /// 行内尺度徽标（设计 §3）：派生尺度小字 chip。
   Widget _scaleChip(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final scale = deriveTaskScale(task.startAt, task.endAt);
+    final scale = deriveTaskScale(task.startAt, task.endAt, kind: task.kind);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
       decoration: BoxDecoration(
@@ -152,6 +153,18 @@ class TaskTile extends StatelessWidget {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
+              // 多选勾选统一在行首（2026-11-01 与消息/文件区一致）
+              if (selecting)
+                Padding(
+                  padding: const EdgeInsets.only(right: 10),
+                  child: Icon(
+                    multiSelected
+                        ? Icons.check_circle
+                        : Icons.radio_button_unchecked,
+                    size: 20,
+                    color: multiSelected ? scheme.primary : scheme.outline,
+                  ),
+                ),
               if (hasChildren)
                 GestureDetector(
                   onTap: onToggleCollapse,
@@ -164,26 +177,6 @@ class TaskTile extends StatelessWidget {
                     ),
                   ),
                 ),
-              if (!archived)
-                GestureDetector(
-                  onTap: onToggleDone,
-                  child: Container(
-                    width: 22,
-                    height: 22,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: done ? scheme.primary : Colors.transparent,
-                      border: Border.all(
-                        width: 2,
-                        color: done ? scheme.primary : scheme.outline,
-                      ),
-                    ),
-                    child: done
-                        ? Icon(Icons.check, size: 14, color: scheme.onPrimary)
-                        : null,
-                  ),
-                ),
-              if (!archived) const SizedBox(width: 10),
               Container(
                 width: 8,
                 height: 8,
@@ -271,17 +264,28 @@ class TaskTile extends StatelessWidget {
                   icon: Icon(Icons.archive_outlined,
                       size: 20, color: scheme.onSurfaceVariant),
                 ),
-              if (selecting)
-                Padding(
-                  padding: const EdgeInsets.only(left: 4),
-                  child: Icon(
-                    multiSelected
-                        ? Icons.check_circle
-                        : Icons.radio_button_unchecked,
-                    size: 20,
-                    color: multiSelected ? scheme.primary : scheme.outline,
+              // 完成勾选统一在行尾（2026-11-01：原在行首，与多选勾选挤在一起）
+              if (!archived) ...[
+                const SizedBox(width: 4),
+                GestureDetector(
+                  onTap: onToggleDone,
+                  child: Container(
+                    width: 22,
+                    height: 22,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: done ? scheme.primary : Colors.transparent,
+                      border: Border.all(
+                        width: 2,
+                        color: done ? scheme.primary : scheme.outline,
+                      ),
+                    ),
+                    child: done
+                        ? Icon(Icons.check, size: 14, color: scheme.onPrimary)
+                        : null,
                   ),
                 ),
+              ],
             ],
           ),
         ),

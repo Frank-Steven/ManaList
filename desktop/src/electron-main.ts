@@ -4,9 +4,8 @@ import path from "node:path";
 import { loadConfig } from "./config.js";
 import { DESKTOP_ROOT } from "./registry.js";
 import { PairingManager } from "./auth.js";
-import { Store } from "./store.js";
 import { createServer } from "./server.js";
-import { createProvider } from "./ai/factory.js";
+import { ModelManager, type ModelListEntry } from "./models.js";
 import {
   adbPath,
   deviceState,
@@ -17,32 +16,30 @@ import {
 } from "./adb.js";
 
 /**
- * macOS 状态栏托盘主进程（设计 §11）：无 Dock 图标、无主窗口、无控制台依赖。
+ * macOS 状态栏托盘主进程（design-v3 §6）：无 Dock 图标、无主窗口、无控制台依赖。
  * 启动即完成全部连接工作：内嵌 HTTP 服务（:8765）→ 探测 adb → 自动 adb reverse →
- * 5 秒看护（断线重连 / 设备插拔识别 / 服务掉线重拉）。
+ * 5 秒看护（断线重连 / 设备插拔识别 / 服务掉线重拉 / 逐模型连通性探测）。
  * 用户可见的状态全部在托盘菜单与系统通知里呈现。
  */
 
-// 固定应用名，保证 userData 目录稳定为 ~/Library/Application Support/MsgRepo
-app.setName("MsgRepo");
+// 固定应用名，userData 目录为 ~/Library/Application Support/LinkModel
+// （v3 干净迁移：不做旧目录迁移，全新安装、重新配对）
+app.setName("LinkModel");
 
 // 配置：包内 default.json → 包内 local.json（仅开发）→ userData/config.json（用户覆盖）
 const USER_CONFIG = path.join(app.getPath("userData"), "config.json");
-const cfg = loadConfig([USER_CONFIG]);
-const PORT = cfg.port;
-const HOST = cfg.host;
+const modelManager = new ModelManager(() => loadConfig([USER_CONFIG]));
+const PORT = loadConfig([USER_CONFIG]).port;
+const HOST = loadConfig([USER_CONFIG]).host;
 const BASE_URL = `http://${HOST}:${PORT}`;
 const ADB_INSTALL_CMD = "brew install android-platform-tools";
 const ADB_DOWNLOAD_URL = "https://developer.android.com/tools/releases/platform-tools";
 
 type ServerStatus = "starting" | "running" | "reused" | "error";
-type AiStatus = "ok" | "down" | "na"; // na = 内置规则引擎，无需后端
 
 let server: Server | null = null;
 let tray: Tray | null = null;
 let pairing: PairingManager;
-let providerName = "";
-let providerModel = "";
 
 let serverStatus: ServerStatus = "starting";
 let serverError = "";
@@ -50,7 +47,8 @@ let adbMissing = false;
 let devState: DeviceState | "" = "";
 let device: DeviceInfo | null = null;
 let adbReady = false;
-let aiStatus: AiStatus = "na";
+/** 最近一次逐模型探测结果（复用 ModelManager 的缓存）；空数组 = 尚未探测 */
+let modelStatuses: ModelListEntry[] = [];
 const events: string[] = [];
 
 function log(msg: string): void {
@@ -66,7 +64,7 @@ function event(msg: string): void {
 
 function notify(body: string): void {
   try {
-    if (Notification.isSupported()) new Notification({ title: "MsgRepo", body }).show();
+    if (Notification.isSupported()) new Notification({ title: "LinkModel", body }).show();
   } catch {
     // 未签名应用通知可能不可用，状态仍以菜单为准
   }
@@ -87,15 +85,9 @@ async function ensureServer(): Promise<void> {
   try {
     const res = await fetch(`${BASE_URL}/v1/health`, { signal: AbortSignal.timeout(3000) });
     if (res.ok) {
-      const health = (await res.json()) as { provider?: string };
-      providerName = health.provider ?? "";
-      // 复用外部服务时模型名未知，若 provider 与本地配置一致则沿用配置里的模型名
-      if (providerName === cfg.provider) {
-        providerModel = cfg.provider === "ollama" ? cfg.ollama.model : cfg.openai.model;
-      }
       if (serverStatus !== "reused") {
         serverStatus = "reused";
-        event(`检测到服务已在运行：${BASE_URL}（provider=${providerName}，复用，不再拉起）`);
+        event(`检测到服务已在运行：${BASE_URL}（复用，不再拉起）`);
       }
       return;
     }
@@ -103,17 +95,11 @@ async function ensureServer(): Promise<void> {
     // 服务未运行，往下走进程内启动
   }
   if (server) return; // 本进程的服务已在跑，只是 health 暂时没响应
-  const provider = createProvider(cfg);
-  providerName = provider.name;
-  providerModel = provider.model ?? "";
-  const store = new Store(app.getPath("userData"));
   server = createServer({
     host: HOST,
     port: PORT,
     pairing,
-    provider,
-    store,
-    dataDir: app.getPath("userData"),
+    models: modelManager,
   });
   try {
     await new Promise<void>((resolve, reject) => {
@@ -121,7 +107,9 @@ async function ensureServer(): Promise<void> {
       server!.listen(PORT, HOST, resolve);
     });
     serverStatus = "running";
-    event(`服务已启动: ${BASE_URL}（provider=${providerName}${providerModel ? ` (${providerModel})` : ""}）`);
+    event(
+      `服务已启动: ${BASE_URL}（${modelManager.models.length} 个模型，默认 ${modelManager.defaultModelId}）`,
+    );
   } catch (err) {
     server = null;
     serverStatus = "error";
@@ -129,40 +117,6 @@ async function ensureServer(): Promise<void> {
       ? `端口 ${PORT} 被其他程序占用`
       : String(err);
     notify(`服务启动失败：${serverError}`);
-  }
-}
-
-/** AI 后端连通性：llama.cpp 试 {origin}/health，OpenAI 兼容试 {baseUrl}/models，Ollama 试 /api/tags。 */
-async function checkAiBackend(): Promise<boolean> {
-  const base = cfg.provider === "ollama" ? cfg.ollama.baseUrl : cfg.openai.baseUrl;
-  let origin: string;
-  try {
-    origin = new URL(base).origin;
-  } catch {
-    return false;
-  }
-  const candidates = [
-    `${origin}/health`,
-    `${base.replace(/\/$/, "")}/models`,
-    `${origin}/api/tags`,
-  ];
-  for (const url of candidates) {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
-      if (res.ok) return true;
-    } catch {
-      // 试下一个
-    }
-  }
-  return false;
-}
-
-function aiBackendEndpoint(): string {
-  const base = cfg.provider === "ollama" ? cfg.ollama.baseUrl : cfg.openai.baseUrl;
-  try {
-    return new URL(base).host;
-  } catch {
-    return base;
   }
 }
 
@@ -186,16 +140,13 @@ function serverLabel(): string {
 }
 
 function aiLabel(): string {
-  if (cfg.provider === "mock" && serverStatus !== "reused") return "内置规则引擎（无需模型服务）";
-  const model = providerModel ? `（${providerModel}）` : "";
-  switch (aiStatus) {
-    case "ok":
-      return `已连接 · ${aiBackendEndpoint()}${model}`;
-    case "down":
-      return `不可达 · ${aiBackendEndpoint()}（手机端将走远程 API）`;
-    default:
-      return "检测中…";
-  }
+  if (modelStatuses.length === 0) return "检测中…";
+  const reachable = modelStatuses.filter((m) => m.reachable).length;
+  const def = modelStatuses.find((m) => m.id === modelManager.defaultModelId);
+  const defLabel = def
+    ? `，默认 ${def.name} ${def.reachable ? "已连接" : "不可达"}`
+    : "";
+  return `${reachable}/${modelStatuses.length} 个模型可达${defLabel}`;
 }
 
 function deviceLabel(): string {
@@ -218,12 +169,23 @@ function rebuildMenu(): void {
   if (!tray) return;
   const token = pairing.token;
   const template: Electron.MenuItemConstructorOptions[] = [
-    { label: "MsgRepo（电脑端 AI 服务）", enabled: false },
+    { label: "LinkModel（电脑端 AI 网关）", enabled: false },
     { type: "separator" },
     { label: `服务：${serverLabel()}`, enabled: false },
-    { label: `AI 后端：${aiLabel()}`, enabled: false },
+    { label: `模型：${aiLabel()}`, enabled: false },
     { label: `手机：${deviceLabel()}`, enabled: false },
   ];
+  if (modelStatuses.length > 0) {
+    template.push({
+      label: "模型列表",
+      submenu: modelStatuses.map((m) => ({
+        label:
+          `${m.reachable ? "●" : "○"} ${m.name}（${m.provider} · ${m.model}）` +
+          (m.id === modelManager.defaultModelId ? " · 默认" : ""),
+        enabled: false,
+      })),
+    });
+  }
   if (adbMissing) {
     template.push(
       {
@@ -261,7 +223,15 @@ function rebuildMenu(): void {
         event("配对码已重置，手机端会在 401 时自动重配");
       },
     },
-    { label: "打开仪表盘", click: () => void shell.openExternal(`${BASE_URL}/dashboard`) },
+    {
+      label: "重载模型配置",
+      click: () => {
+        modelManager.reload();
+        modelStatuses = [];
+        event(`模型配置已重载（${modelManager.models.length} 个模型）`);
+        rebuildMenu();
+      },
+    },
     { type: "separator" },
     {
       label: "开机自启",
@@ -276,10 +246,10 @@ function rebuildMenu(): void {
     { label: "退出", click: () => app.quit() },
   );
   tray.setContextMenu(Menu.buildFromTemplate(template));
-  tray.setToolTip(`MsgRepo · 手机${deviceLabel()}`);
+  tray.setToolTip(`LinkModel · 手机${deviceLabel()}`);
 }
 
-/** 5 秒看护：adb 探测 → 设备识别 → reverse 通道 → AI 后端连通性 → 服务掉线重拉。
+/** 5 秒看护：adb 探测 → 设备识别 → reverse 通道 → 逐模型连通性 → 服务掉线重拉。
  *  状态只在变化时记事件/发通知，无设备静默重试。 */
 async function tick(): Promise<void> {
   let changed = false;
@@ -336,19 +306,17 @@ async function tick(): Promise<void> {
     }
   }
 
-  if (cfg.provider === "mock" && serverStatus !== "reused") {
-    aiStatus = "na";
-  } else {
-    const up = await checkAiBackend();
-    const next: AiStatus = up ? "ok" : "down";
-    if (next !== aiStatus) {
-      changed = true;
-      if (next === "down") {
-        notify(`AI 后端不可达（${aiBackendEndpoint()}）——手机端将自动改走设置的远程 API。`);
-      } else if (aiStatus !== "na" || serverStatus === "reused") {
-        event(`AI 后端已连接：${aiBackendEndpoint()}`);
-      }
-      aiStatus = next;
+  // 逐模型连通性（复用 ModelManager 30s 探测缓存，与 GET /v1/models 同源）
+  const prev = new Map(modelStatuses.map((m) => [m.id, m.reachable] as const));
+  modelStatuses = await modelManager.probeAll();
+  for (const m of modelStatuses) {
+    const before = prev.get(m.id);
+    if (before === m.reachable) continue;
+    changed = true;
+    if (m.reachable === false) {
+      notify(`模型不可达：${m.name}（${m.baseUrl}）——手机端将自动改走其他可用模型。`);
+    } else if (m.reachable === true && before === false) {
+      event(`模型已恢复：${m.name}`);
     }
   }
 
@@ -362,7 +330,7 @@ async function main(): Promise<void> {
 
   // 数据目录独立于 CLI 的 desktop/data，避免打包后往只读位置写入
   pairing = new PairingManager(app.getPath("userData"));
-  event(`MsgRepo 托盘启动（数据目录 ${app.getPath("userData")}）`);
+  event(`LinkModel 托盘启动（数据目录 ${app.getPath("userData")}）`);
 
   tray = new Tray(trayIcon());
   rebuildMenu();

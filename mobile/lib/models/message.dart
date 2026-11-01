@@ -2,11 +2,19 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 
+import '../services/assistant/models.dart';
+
 /// SHA-256(packageName|title|body|postedAt)，消息入库去重的统一算法。
+///
+/// v3（design-v3-details §1.4）：参与哈希的正文必须先剥离锚点 marker。
+/// strip 内建在本函数里，所有调用点（通知采集入库、导入、手动添加、
+/// 编辑保存/锚点插入移除时的重算）天然统一，逐个调用点 strip 反而可能漏。
+/// strip 不做空白折叠：追加式 marker 留下的空格差异同样参与哈希。
 String computeContentHash(
     String packageName, String title, String body, int postedAt) {
   return sha256
-      .convert(utf8.encode('$packageName|$title|$body|$postedAt'))
+      .convert(
+          utf8.encode('$packageName|$title|${stripAnchorMarkers(body)}|$postedAt'))
       .toString();
 }
 
@@ -51,17 +59,22 @@ class Attachment {
   final String? label;
   final AttachmentAccess access;
 
+  /// 文件大小（字节）；旧数据可能为 null。
+  final int? bytes;
+
   const Attachment({
     required this.id,
     required this.kind,
     this.label,
     required this.access,
+    this.bytes,
   });
 
   factory Attachment.fromJson(Map<String, dynamic> json) => Attachment(
         id: json['id'] as String,
         kind: json['kind'] as String,
         label: json['label'] as String?,
+        bytes: (json['bytes'] as num?)?.toInt(),
         access:
             AttachmentAccess.fromJson(json['access'] as Map<String, dynamic>),
       );
@@ -70,6 +83,7 @@ class Attachment {
         'id': id,
         'kind': kind,
         if (label != null) 'label': label,
+        if (bytes != null) 'bytes': bytes,
         'access': access.toJson(),
       };
 }
@@ -107,6 +121,9 @@ class Message {
   final String contentHash;
   final String status;
   final String priority;
+
+  /// v2 遗留的 1:1 关联列。v8 起关联落 task_anchors，本列只读保留
+  /// （历史数据展示），不再写入新值。
   final String? linkedTaskId;
   final int createdAt;
 

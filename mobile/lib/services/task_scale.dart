@@ -8,13 +8,19 @@
 /// 5. 否则同一/相邻自然季度 → 月度；
 /// 6. 否则同一年或相邻两年 → 季度；
 /// 7. 否则 → 年度。
+///
+/// ※ kind 为 point 的任务只表示单个时刻：即使数据里带了 endAt，也一律按
+///   start 处理（P1-1 修复；此前仅注释约定、实现里从未归一化）。
 library;
+
+import '../models/task.dart' show TaskKind;
 
 /// 七级派生尺度（从大到小）：yearly / quarterly / monthly / weekly / daily /
 /// timed / untimed。
-String deriveTimeScale(DateTime? start, DateTime? end) {
+String deriveTimeScale(DateTime? start, DateTime? end, {String? kind}) {
   if (start == null) return 'untimed';
-  final e = end ?? start; // kind=point 时 end 视为 = start
+  // point 任务只有单个时刻；kind 缺省时保持旧行为（仅 end 为空才按点处理）
+  final e = (kind == TaskKind.point || end == null) ? start : end;
   final sd = _dayNumber(start);
   final ed = _dayNumber(e);
   if ((ed - sd).abs() <= 1) return 'timed';
@@ -60,10 +66,13 @@ int _monthNumber(DateTime d) => d.year * 12 + d.month;
 
 int _quarterNumber(DateTime d) => d.year * 4 + (d.month - 1) ~/ 3;
 
-/// 毫秒时间戳包装（Task.startAt/endAt 直接传入）。
-String deriveTaskScale(int? startAt, int? endAt) => deriveTimeScale(
-    startAt == null ? null : DateTime.fromMillisecondsSinceEpoch(startAt),
-    endAt == null ? null : DateTime.fromMillisecondsSinceEpoch(endAt));
+/// 毫秒时间戳包装（Task.startAt/endAt/kind 直接传入）。
+/// [kind] 参与归一化：point 任务即使带了 endAt 也只按点计算（P1-1）。
+String deriveTaskScale(int? startAt, int? endAt, {String? kind}) =>
+    deriveTimeScale(
+        startAt == null ? null : DateTime.fromMillisecondsSinceEpoch(startAt),
+        endAt == null ? null : DateTime.fromMillisecondsSinceEpoch(endAt),
+        kind: kind);
 
 /// 尺度大小序号：yearly 最大、untimed 最小（不定时不参与包含判断时为 -1）。
 int timeScaleRank(String scale) => switch (scale) {

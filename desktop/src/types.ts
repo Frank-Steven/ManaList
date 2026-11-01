@@ -1,80 +1,21 @@
 // 与 shared/schemas/*.schema.json 对齐的 TS 类型。字段名以 schema 为唯一事实源。
 
-export type Priority = "P0" | "P1" | "P2" | "P3";
 
-export const SCHEMA_VERSION = "1.0.0";
-export const PIPELINE_VERSION = "1.0.0";
 
 // ---- raw-message.schema.json ----
 
-export interface RawMessageSource {
-  packageName: string;
-  appName?: string;
-  channelId?: string;
-  conversationTitle?: string;
-  sender?: string;
-}
 
-export interface RawMessageAttachment {
-  id: string;
-  kind: "image" | "file" | "miniprogram" | "link" | "other";
-  label?: string;
-  access: {
-    type: "local_path" | "content_uri" | "url" | "app_deeplink" | "miniprogram_path";
-    value: string;
-    mimeType?: string;
-  };
-}
 
-export interface RawMessage {
-  id: string;
-  source: RawMessageSource;
-  title: string;
-  body: string;
-  postedAt: number;
-  captureType: "notification" | "manual";
-  attachments?: RawMessageAttachment[];
-  contentHash: string;
-  status: "pending" | "processed" | "archived";
-}
 
 // ---- structured-item.schema.json ----
 
-export interface TimeInfo {
-  kind: "none" | "point" | "range" | "deadline" | "recurring";
-  startAt?: number;
-  endAt?: number;
-  deadline?: number;
-  rrule?: string;
-  reminderOffsets?: number[];
-}
 
-export interface StructuredItem {
-  id: string;
-  rawMessageIds: string[];
-  category: string;
-  schemaVersion: string;
-  title: string;
-  summary: string;
-  priority: Priority;
-  confidence: number;
-  time: TimeInfo;
-  payload: Record<string, unknown>;
-  tags?: string[];
-  processedBy: {
-    provider: string;
-    model?: string;
-    pipelineVersion: string;
-  };
-}
 
 // ---- category-registry.schema.json ----
 
-export interface GenericField {
-  key: string;
-  value: string | number | boolean | unknown[];
-  valueType?: "string" | "number" | "boolean" | "datetime" | "list";
-}
+
+/** 分类的默认优先级（v1 沿用，注册表与 AI 输出仍用 P0-P3 表示分类倾向）。 */
+export type Priority = "P0" | "P1" | "P2" | "P3";
 
 export interface CategoryDef {
   key: string;
@@ -95,80 +36,84 @@ export interface CategoryRegistry {
 
 // ---- sync-request / sync-response ----
 
-export interface SyncRequest {
-  deviceId: string;
-  registryVersion: string;
-  registry?: CategoryRegistry;
-  customPrompt?: string;
-  reprocessMessageIds?: string[];
-  /** true 时以 application/x-ndjson 流式返回逐条进度 */
-  stream?: boolean;
-  messages: RawMessage[];
-}
 
-/** 流式同步的 NDJSON 事件：progress 每条消息一个（可多个，item 可选），done 收尾。 */
-export interface SyncStreamEvent {
-  type: "progress" | "warning" | "done";
-  item?: StructuredItem;
-  processedMessageIds?: string[];
-  failedMessageIds?: string[];
-  warnings?: string[];
-  message?: string;
-  registryVersion?: string;
-}
+// ---- task-anchor.schema.json（design-v3 §1.1）----
 
-export interface SyncResponse {
-  registryVersion: string;
-  results: StructuredItem[];
-  processedMessageIds: string[];
-  failedMessageIds?: string[];
-  warnings?: string[];
-}
-
-// ---- v2 /v1/process（设计 §8、§12） ----
-
-/** /v1/process 请求中的单条消息：手机端是数据权威，电脑端只做评估不回写。 */
-export interface ProcessInputMessage {
+/** 任务锚点：连接一个任务与库中消息/笔记/文件；正文行内 marker 为 ⟦task:<id>⟧。 */
+export interface TaskAnchor {
   id: string;
-  title: string;
-  body: string;
-  appName?: string;
-  conversationTitle?: string;
-  sender?: string;
-  postedAt: number;
+  taskId: string;
+  targetType: "message" | "note" | "file";
+  targetId: string;
+  label?: string | null;
+  createdBy: "user" | "ai";
+  /** Unix 毫秒时间戳 */
+  createdAt: number;
 }
 
-export interface ProcessRequestBody {
-  messages: ProcessInputMessage[];
-  customPrompt?: string;
-  /** 手机端本地时间 ISO 字符串，作为日期对照表与"已过去顺延"的基准 */
-  now: string;
-  timezone?: string;
+// ---- chat-request.schema.json（design-v3 §2、§6.3）----
+
+export interface ChatMessageRef {
+  type: "note" | "message" | "file";
+  id: string;
 }
 
-/** 消息优先级（设计 §1.1）：红=重要、黄=值得关注、绿=一般、junk=垃圾。 */
-export type EvalPriority = "red" | "yellow" | "green" | "junk";
-
-/** AI 评估产出的任务草稿（设计 §8.2）；时间字段为本地时间字符串 "YYYY-MM-DDTHH:mm"。 */
-export interface TaskDraft {
-  title: string;
-  description?: string;
-  kind: "point" | "range";
-  startAt?: string;
-  endAt?: string;
-  priority: "important" | "normal" | "minor";
+export interface ChatRequestMessage {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  /** 该消息引用的库实体（仅引用）；正文在顶层 attachments 中展开 */
+  attachments?: ChatMessageRef[];
 }
 
-/** 单条消息的最终评估结果。 */
-export interface EvalResult {
-  priority: EvalPriority;
-  reason: string;
-  taskDraft: TaskDraft | null;
+/** 附件正文展开块：带 [#note:标题] 类引用头，供 AI 引用定位。 */
+export interface ChatAttachment {
+  type: "note" | "message" | "file";
+  id: string;
+  content: string;
+  /** 文件附件的 MIME 类型（图片附件必有，如 image/png） */
+  mimeType?: string;
+  /** 图片附件的内联图像数据（base64，PNG）；仅 vision 模型附带 */
+  dataBase64?: string;
 }
 
-/** /v1/process 的 NDJSON 流式事件：token 为模型原始输出透传，result/error 每消息一条，done 收尾。 */
-export type ProcessEvent =
-  | { type: "token"; messageId: string; delta: string }
-  | { type: "result"; messageId: string; priority: EvalPriority; reason: string; taskDraft: TaskDraft | null }
-  | { type: "error"; messageId: string; error: string }
-  | { type: "done"; total: number; failed: number };
+export interface ChatRequest {
+  conversationId: string;
+  messages: ChatRequestMessage[];
+  attachments?: ChatAttachment[];
+  /** 对话绑定的模型配置 id，缺省用 defaultModelId */
+  modelConfigId?: string;
+  stream: boolean;
+}
+
+// ---- chat-response.schema.json（design-v3 §2、§5.4）----
+
+/**
+ * /v1/chat 流式事件。desktop 只透传 token 流、不解析不执行工具；
+ * proposal 事件的 proposalId 由客户端（手机端解析层）生成。
+ */
+export type ChatEvent =
+  | { type: "token_delta"; delta: string }
+  | {
+      type: "proposal";
+      proposalId: string;
+      /** 原子工具名，如 task.create（清单见 design-v3 §5.2） */
+      tool: string;
+      args: Record<string, unknown>;
+    }
+  | { type: "done" }
+  | { type: "error"; error: string };
+
+// ---- model-config.schema.json（design-v3 §6.2）----
+
+/** 模型配置；Ollama 暂缓，provider 暂只列 openai-compat / mock。 */
+export interface ModelConfig {
+  id: string;
+  name: string;
+  provider: "openai-compat" | "mock";
+  baseUrl: string;
+  model: string;
+  /** API key 所在环境变量名，不直接存密钥 */
+  apiKeyEnv?: string;
+  /** 模型是否支持图像输入（多模态）；缺省 false */
+  vision?: boolean;
+}

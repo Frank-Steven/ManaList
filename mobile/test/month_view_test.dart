@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/task.dart';
-import 'package:msgrepo_mobile/ui/schedule/month_view.dart';
+import 'package:msgrepo_mobile/ui/tasks/views/month_view.dart';
 
 /// v2.5 回归：月视图 index↔月份换算全链路，永不出负数年份。
 /// 根因：v2.4 可变行高改造混用了两套坐标系——itemBuilder 按索引空间
@@ -71,6 +71,31 @@ void main() {
     for (final y in renderedYears(tester)) {
       expect(y, greaterThanOrEqualTo(1900));
     }
+    expect(tester.takeException(), isNull);
+  });
+
+  /// 2026-10-28：月视图初始位置 = 今天所在周（不再停在月开始位置），
+  /// 首帧即与「现在」定位同一偏移。
+  testWidgets('初始定位：今天所在周行垂直居中（不点「现在」）', (tester) async {
+    final key = GlobalKey<MonthViewState>();
+    await tester.pumpWidget(app(key));
+    await tester.pump();
+
+    // 与 month_view 同一套公式复核偏移（同 scrollToNow 用例）
+    const itemExtent = 24.0 + 20.0 + 6 * 56.0;
+    const infiniteScrollOffset = 1 << 20;
+    final now = DateTime.now();
+    final monthIndex = (now.year - 2000) * 12 + now.month - 1;
+    final itemTop = (monthIndex + infiniteScrollOffset) * itemExtent;
+    final startD = DateTime(now.year, now.month, 1).weekday % 7;
+    final row = (startD + now.day - 1) ~/ 7;
+    final cellCenter = 24.0 + 20.0 + row * 56.0 + 28.0;
+    final dim = tester.getSize(find.byType(ListView)).height;
+    final expected = itemTop + cellCenter - dim / 2;
+
+    final controller = tester.widget<ListView>(find.byType(ListView)).controller!;
+    expect(controller.offset, moreOrLessEquals(expected, epsilon: 1.0),
+        reason: '首帧即应定位到今天所在周');
     expect(tester.takeException(), isNull);
   });
 

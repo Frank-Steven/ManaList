@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="LaunchTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@drawable/launch_background</item>
+        <item name="android:windowSplashScreenBackground">@color/splash_bg</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/splash_icon_padded</item>
+        <!-- 2026-11-01（取代 Q13-A）：原生启动窗即完整启动画面。
+             注意：Android 12+ 会把 animatedIcon 强制缩放到系统固定图标框
+             （实测 ≈288px @2.75 密度），layer-list 里写尺寸不生效——
+             唯一可控手段是 PNG 自带透明留白（splash_icon_padded，
+             可见/画布 = 176/288 ≈ 0.611），可见部分 ≈64dp。
+             该属性必须显式给出：缺失时 Android 12+ 会回退去画
+             @mipmap/ic_launcher（adaptive icon，与启动页卡片不一致）。 -->
+    </style>
+    <style name="NormalTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/splash_bg</item>
+    </style>
+</resources>

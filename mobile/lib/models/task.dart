@@ -68,7 +68,8 @@ class Task {
   bool overlaps(int startMs, int endMs) {
     final s = startAt;
     if (s == null) return false;
-    final e = endAt;
+    // point 任务只有单个时刻：即使数据里残留 end_at 也按点处理（P1-1）
+    final e = kind == TaskKind.point ? null : endAt;
     if (e == null) return s >= startMs && s < endMs;
     return s < endMs && e > startMs;
   }

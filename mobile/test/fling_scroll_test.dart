@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:msgrepo_mobile/ui/schedule/yearly_view.dart';
-import 'package:msgrepo_mobile/ui/schedule/day_view.dart';
+import 'package:msgrepo_mobile/ui/tasks/views/yearly_view.dart';
+import 'package:msgrepo_mobile/ui/tasks/views/day_view.dart';
 
 /// v2.5 回归：fling 惯性滚动在第一次甩动后必须持续有效。
 /// 根因：fling 动画用 SingleTickerProviderStateMixin 反复新建

@@ -1,9 +1,7 @@
 package dev.msgrepo.mobile
 
-import android.Manifest
 import android.content.ComponentName
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -11,7 +9,6 @@ import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
-import android.provider.Telephony
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -19,35 +16,25 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import android.content.ContentValues
+import android.os.Environment
+import android.provider.MediaStore
 
 class MainActivity : FlutterActivity() {
 
     companion object {
         const val CHANNEL = "dev.msgrepo.mobile/bridge"
-        const val REQ_SMS_PERMISSION = 4101
-    }
 
-    /** 进行中的运行时权限请求回调（短信导入，v2.6）。 */
-    private var pendingPermissionResult: MethodChannel.Result? = null
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_SMS_PERMISSION) {
-            val granted = grantResults.isNotEmpty() &&
-                grantResults[0] == PackageManager.PERMISSION_GRANTED
-            pendingPermissionResult?.success(granted)
-            pendingPermissionResult = null
-        }
+        /** 采集服务（独立组件）通过它把「队列有新数据」推给 Dart 侧（P3-3）。 */
+        @Volatile
+        var bridgeChannel: MethodChannel? = null
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-            .setMethodCallHandler { call, result ->
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        bridgeChannel = channel
+        channel.setMethodCallHandler { call, result ->
                 when (call.method) {
                     "isNotificationListenerEnabled" ->
                         result.success(isNotificationListenerEnabled())
@@ -58,8 +45,46 @@ class MainActivity : FlutterActivity() {
                     }
 
                     // Dart 侧用 dart:io 直接读写该目录（同一应用沙箱）
-                    "getQueueDir" ->
+                    // F09：用系统浏览器/其它应用打开链接（不引入 url_launcher 依赖）
+          "openUrl" -> {
+            val url = call.argument<String>("url")
+            result.success(openUrl(url))
+          }
+          // F10：把附件导出到系统「下载」目录（MediaStore，无需 FileProvider），返回可见路径
+          "exportToDownloads" -> {
+            val path = call.argument<String>("path")
+            val name = call.argument<String>("name") ?: "attachment"
+            val mime = call.argument<String>("mime") ?: "application/octet-stream"
+            try {
+              result.success(exportToDownloads(path, name, mime))
+            } catch (e: Exception) {
+              result.error("export_failed", e.message, null)
+            }
+          }
+          "getQueueDir" ->
                         result.success(File(filesDir, "queue").absolutePath)
+
+                    // 视频首帧缩略图（MediaMetadataRetriever，框架 API 无需依赖）；
+                    // 返回 JPEG 字节（≤192px），失败/文件不存在返回 null
+                    "getVideoThumbnail" -> {
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrBlank()) {
+                            result.success(null)
+                        } else {
+                            Thread { result.success(videoThumbnailJpeg(path)) }.start()
+                        }
+                    }
+
+                    // PDF 首页渲染（android.graphics.pdf.PdfRenderer，框架 API）；
+                    // 返回 PNG 字节（宽 ≤192px），失败返回 null
+                    "getPdfThumbnail" -> {
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrBlank()) {
+                            result.success(null)
+                        } else {
+                            Thread { result.success(pdfThumbnailPng(path)) }.start()
+                        }
+                    }
 
                     // 已见应用列表（NotificationCaptureService 维护），返回文件内容
                     "getSeenApps" -> {
@@ -163,46 +188,57 @@ class MainActivity : FlutterActivity() {
                         result.success(opened)
                     }
 
-                    // ---- 短信导入（v2.6）：READ_SMS 运行时权限 + 系统短信库读取 ----
-
-                    "hasSmsPermission" -> result.success(hasSmsPermission())
-
-                    "requestSmsPermission" -> {
-                        if (hasSmsPermission()) {
-                            result.success(true)
-                        } else if (pendingPermissionResult != null) {
-                            result.success(false) // 已有进行中的授权请求
-                        } else {
-                            pendingPermissionResult = result
-                            requestPermissions(
-                                arrayOf(Manifest.permission.READ_SMS),
-                                REQ_SMS_PERMISSION,
-                            )
-                        }
-                    }
-
-                    // 系统短信库全部短信（收件箱+已发），按时间升序；
-                    // 上限 20000 条防 OOM。后台线程执行，Result 可跨线程回调。
-                    "readSmsMessages" -> {
-                        if (!hasSmsPermission()) {
-                            result.success("[]")
-                        } else {
-                            Thread {
-                                try {
-                                    result.success(readSmsJson())
-                                } catch (t: Throwable) {
-                                    result.success("[]")
-                                }
-                            }.start()
-                        }
-                    }
+                    // ---- 短信导入已随 v3 阶段 3 整体移除（design-v3 §3.2）----
 
                     else -> result.notImplemented()
                 }
             }
     }
 
-    private fun installedAppsJson(): String {
+    /// F09：打开链接。成功返回 true；没有可用应用返回 false（不抛异常给 Dart）。
+  private fun openUrl(url: String?): Boolean {
+    if (url.isNullOrBlank()) return false
+    return try {
+      val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      startActivity(intent)
+      true
+    } catch (e: Exception) {
+      false
+    }
+  }
+
+  /// F10：把应用私有目录里的附件导出到系统「下载」目录。
+  /// 走 MediaStore（Android 10+ 不需要存储权限），返回「下载/<name>」这样的可见描述。
+  private fun exportToDownloads(path: String?, displayName: String, mime: String): String {
+    if (path.isNullOrBlank()) throw IllegalArgumentException("path 为空")
+    val src = java.io.File(path)
+    if (!src.exists()) throw IllegalStateException("文件不存在")
+    // 2026-10-21 验收发现：源文件读不到时会静默导出 0 字节文件。先挡掉空文件/目录。
+    if (!src.isFile) throw IllegalStateException("不是普通文件")
+    if (src.length() <= 0L) throw IllegalStateException("源文件为空（0 字节）")
+    if (!src.canRead()) throw IllegalStateException("源文件不可读")
+    val values = ContentValues().apply {
+      put(MediaStore.Downloads.DISPLAY_NAME, displayName)
+      put(MediaStore.Downloads.MIME_TYPE, mime)
+      put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+    }
+    val resolver = contentResolver
+    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+      ?: throw IllegalStateException("无法创建下载条目")
+    val written = resolver.openOutputStream(uri)?.use { out ->
+      src.inputStream().use { input -> input.copyTo(out) }
+    } ?: throw IllegalStateException("无法写入下载目录")
+    if (written != src.length()) {
+      // 写出来的字节数和源文件不一致 → 删掉半截文件并如实报错
+      try { resolver.delete(uri, null, null) } catch (_: Exception) {}
+      throw IllegalStateException("写入不完整（$written/${src.length()} 字节）")
+    }
+    return "下载/$displayName"
+  }
+
+  private fun installedAppsJson(): String {
         val pm = packageManager
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val seen = HashSet<String>()
@@ -235,6 +271,64 @@ class MainActivity : FlutterActivity() {
         } catch (t: Throwable) {
             null
         }
+    }
+
+    /// 视频首帧缩略图：取 0 秒帧缩到 ≤192px 后 JPEG 编码（缩略图场景质量足够）。
+    private fun videoThumbnailJpeg(path: String): ByteArray? {
+        return try {
+            val file = File(path)
+            if (!file.isFile) return null
+            val retriever = android.media.MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(path)
+                val frame = retriever.getFrameAtTime(0) ?: return null
+                val scaled = scaleToMax(frame, 192)
+                val out = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                out.toByteArray()
+            } finally {
+                retriever.release()
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /// PDF 首页缩略图：PdfRenderer 渲染第 0 页（白底），宽 ≤192px，PNG 编码。
+    private fun pdfThumbnailPng(path: String): ByteArray? {
+        return try {
+            val file = File(path)
+            if (!file.isFile) return null
+            val pfd = android.os.ParcelFileDescriptor.open(
+                file, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+            pfd.use {
+                android.graphics.pdf.PdfRenderer(pfd).use { renderer ->
+                    if (renderer.pageCount <= 0) return null
+                    renderer.openPage(0).use { page ->
+                        val w = 192
+                        val h = (page.height.toFloat() / page.width * w).toInt()
+                            .coerceAtLeast(1)
+                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        bmp.eraseColor(android.graphics.Color.WHITE)
+                        page.render(bmp, null, null,
+                            android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        val out = ByteArrayOutputStream()
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                        out.toByteArray()
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    private fun scaleToMax(src: Bitmap, max: Int): Bitmap {
+        if (src.width <= max && src.height <= max) return src
+        val ratio = max.toFloat() / maxOf(src.width, src.height)
+        val w = (src.width * ratio).toInt().coerceAtLeast(1)
+        val h = (src.height * ratio).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(src, w, h, true)
     }
 
     private fun drawableToBitmap(d: Drawable): Bitmap {
@@ -324,45 +418,5 @@ class MainActivity : FlutterActivity() {
             }
         }
         return false
-    }
-
-    private fun hasSmsPermission(): Boolean {
-        return checkSelfPermission(Manifest.permission.READ_SMS) ==
-            PackageManager.PERMISSION_GRANTED
-    }
-
-    /**
-     * 读取系统短信库（content://sms）：收件箱 + 已发，按时间升序。
-     * 输出 [{address, body, date, type}]，type=1 收件 / 2 已发；上限 20000 条。
-     */
-    private fun readSmsJson(): String {
-        val arr = JSONArray()
-        val cursor = contentResolver.query(
-            Telephony.Sms.CONTENT_URI,
-            arrayOf(
-                Telephony.Sms.ADDRESS,
-                Telephony.Sms.BODY,
-                Telephony.Sms.DATE,
-                Telephony.Sms.TYPE,
-            ),
-            null,
-            null,
-            "${Telephony.Sms.DATE} ASC",
-        ) ?: return "[]"
-        cursor.use {
-            var count = 0
-            while (it.moveToNext() && count < 20000) {
-                val body = it.getString(1)?.trim().orEmpty()
-                if (body.isEmpty()) continue
-                val obj = JSONObject()
-                obj.put("address", it.getString(0) ?: "")
-                obj.put("body", body)
-                obj.put("date", it.getLong(2))
-                obj.put("type", it.getInt(3))
-                arr.put(obj)
-                count++
-            }
-        }
-        return arr.toString()
     }
 }

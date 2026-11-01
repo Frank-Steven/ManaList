@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://msgrepo.dev/schemas/sync-request.schema.json",
   "title": "SyncRequest",
-  "description": "POST /v1/sync 请求体。手机把待处理原始消息 + 当前注册表（仅结构，无内容）发给电脑。",
+  "description": "[superseded] v3 起废弃：/v1/sync 与 /v1/process 批处理协议随批处理评估管线废弃，由 /v1/chat 统一助理接口取代（design-v3 §2、§6.3）。POST /v1/sync 请求体。手机把待处理原始消息 + 当前注册表（仅结构，无内容）发给电脑。",
   "type": "object",
   "required": [
     "deviceId",

@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../services/app_log.dart';
 
 /// 应用采集过滤配置（手机端本地配置，不属于 shared/schemas）。
 ///
@@ -81,7 +82,8 @@ class AppFilterService {
     try {
       return AppFilterConfig.fromJson(
           (jsonDecode(json) as Map).cast<String, dynamic>());
-    } catch (_) {
+    } catch (e, st) {
+      AppLog.instance.warn('filter.parse-config', e, st);
       return const AppFilterConfig();
     }
   }
@@ -109,7 +111,8 @@ class AppFilterService {
       }
       apps.sort((a, b) => b.lastSeenAt.compareTo(a.lastSeenAt));
       return apps;
-    } catch (_) {
+    } catch (e, st) {
+      AppLog.instance.warn('filter.read-seen', e, st);
       return [];
     }
   }
@@ -132,7 +135,8 @@ class AppFilterService {
       ]..sort((a, b) => a.displayName
           .toLowerCase()
           .compareTo(b.displayName.toLowerCase()));
-    } catch (_) {
+    } catch (e, st) {
+      AppLog.instance.warn('filter.read-installed', e, st);
       return [];
     }
   }
