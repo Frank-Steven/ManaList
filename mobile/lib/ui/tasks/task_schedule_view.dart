@@ -86,6 +86,12 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// _cache 内容版本：任何写入（清空/合并）都递增，用于失效派生列表。
   int _cacheRevision = 0;
 
+  /// 图形 settle 动画的触发版本：**只在用户改动任务**（新建/编辑/删除/
+  /// 拖拽/勾选/撤销）时递增，传给 [_GanttSettleTransition]。
+  /// 不能用 _cacheRevision——被动加载（切页 reload、滚动增量加载）也会
+  /// 递增它，导致每次切回任务页图表都做一次「下沉 6px 再弹回」的动画。
+  int _settleRevision = 0;
+
   /// 甘特区任务列表缓存（键 = _cache 版本 + 当前粒度）。
   ///
   /// 注意：读取端 [_ganttTasks] 必须 lazy memo —— 未命中就**现算并回填**，
@@ -102,14 +108,21 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   // ---- 甘特 / 底部任务列表分栏：展开/收起双模态（2026-11-01 改为跟随拖拽）----
   //
   // 交互（2026-11-01 改版，替代期导航工具条上的展开/收起按钮）：
-  //  · 展开态：列表内容滚动到顶部后继续向下拖拽，面板高度跟随手指，
-  //    松手按位置/速度决定收起还是回弹展开（标题行本身也可直接拖拽）；
-  //  · 收起态：点击标题行展开，或向上拖拽，松手按位置/速度决定；
+  //  · 只有展开/收起两个稳定态；拖拽只是中间态——
+  //    状态1（起始+过程）：面板标题栏中心跟随手指移动；
+  //    状态2（松手）：按松手位置决定展开/收起，然后动画吸附到对应位置，
+  //    所有位置切换都走动画，不做瞬间跳变；
+  //  · 标题行整行点击 = 展开/收起切换（与松手吸附同一动画路径）；
+  //  · 展开态：列表内容滚动到顶部后继续向下拖拽，面板跟随手指变矮；
+  //    收起态：点击展开，或向上拖拽跟随；
   //  · 展开态高度 = 分栏视口的 [_barExpandedRatio]（约屏高 35%），
-  //    收起态 = 只留列表标题行（[_barCollapsedH]，含该期任务数）；
+  //    收起态 = 只留列表标题行（[_barCollapsedH]，含该期任务数与时间范围）；
   //  · 状态按粒度记忆在 State 内（[_barExpandedByGranularity]），不持久化。
   static const _barCollapsedH = 40.0;
   static const _barExpandedRatio = 0.35;
+
+  /// 分栏容器 key：拖拽时把手指全局坐标换算成面板高度（标题栏中心跟手）。
+  final _splitKey = GlobalKey();
 
   /// 各粒度下底部任务列表是否展开（缺省 = 展开）。
   final Map<int, bool> _barExpandedByGranularity = {};
@@ -123,6 +136,10 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 拖拽中的面板高度（null = 未拖拽，高度由 [_barExpanded] 推导）。
   double? _dragBarH;
 
+  /// 起手时「标题栏中心 − 手指」的纵向差（全局坐标）：
+  /// 拖拽中中心点与手指保持同一相对位置，起手瞬间不跳。
+  double _dragGrabDelta = 0;
+
   /// 松手后的吸附动画。
   AnimationController? _barAnim;
 
@@ -134,16 +151,41 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     return _barExpanded ? expandedH : _barCollapsedH;
   }
 
-  void _barDragStart(double vp) {
+  void _barDragStart(double vp, double globalY) {
     _barAnim?.stop();
-    _dragBarH = _barHeight(vp);
+    final h = _barHeight(vp);
+    _dragBarH = h;
+    final box = _splitBox();
+    if (box == null) {
+      _dragGrabDelta = 0;
+      return;
+    }
+    final bottom = box.localToGlobal(Offset(0, box.size.height)).dy;
+    _dragGrabDelta = (bottom - h + _barCollapsedH / 2) - globalY;
   }
 
+  RenderBox? _splitBox() {
+    final obj = _splitKey.currentContext?.findRenderObject();
+    return obj is RenderBox && obj.hasSize ? obj : null;
+  }
+
+  /// 增量拖拽（列表滚到顶部继续下拉的 Overscroll 路径，无全局坐标）：
   /// [dy] 为手指纵向位移（正 = 向下，面板变矮）。
   void _barDragUpdate(double dy, double vp) {
     final expandedH = vp * _barExpandedRatio;
     setState(() =>
         _dragBarH = (_dragBarH! - dy).clamp(_barCollapsedH, expandedH));
+  }
+
+  /// 标题栏拖拽（有全局坐标）：面板标题栏中心跟随手指移动。
+  /// 面板底边固定在视口底部，高度 = 底边 − 手指 + 半标题高（含起手偏差补偿）。
+  void _barDragUpdateGlobal(double globalY, double vp) {
+    final box = _splitBox();
+    if (box == null) return;
+    final bottom = box.localToGlobal(Offset(0, box.size.height)).dy;
+    final expandedH = vp * _barExpandedRatio;
+    final h = bottom - (globalY + _dragGrabDelta) + _barCollapsedH / 2;
+    setState(() => _dragBarH = h.clamp(_barCollapsedH, expandedH));
   }
 
   /// 松手：只看松手位置——面板顶边落在展开区域的上半（高度超过展开
@@ -228,7 +270,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
         ]);
       }
       final barH = _barHeight(vp);
-      return Column(children: [
+      return KeyedSubtree(
+        key: _splitKey,
+        child: Column(children: [
         // 粒度切换：淡出淡入 + 轻微横移过渡。时长与任务页 TabBar 指示器
         // 动画（kTabScrollDuration 300ms）一致，两者同步起跑同步结束。
         Expanded(
@@ -250,7 +294,7 @@ class TaskScheduleViewState extends State<TaskScheduleView>
               // 任务数据变化（拖放/新建/编辑/删除落库后 reload）时，
               // 图形层做一次快速 settle 过渡，替代生硬跳变
               child: _GanttSettleTransition(
-                revision: _cacheRevision,
+                revision: _settleRevision,
                 child: _ganttView(),
               ),
             ),
@@ -276,7 +320,8 @@ class TaskScheduleViewState extends State<TaskScheduleView>
           },
           child: SizedBox(height: barH, child: _bottomSection(context, vp)),
         ),
-      ]);
+      ]),
+      );
     });
   }
 
@@ -391,7 +436,11 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   }
 
   void _showUndoSnack(String label) {
-    showUndoSnackBar(context, label, onUndone: () async => reload());
+    showUndoSnackBar(context, label, onUndone: () async {
+      // 撤销本身也是用户改动，同样走 settle 过渡
+      _settleRevision++;
+      await reload();
+    });
   }
 
   Future<void> _editTask(Task task) async {
@@ -421,6 +470,7 @@ class TaskScheduleViewState extends State<TaskScheduleView>
       if (!mounted) return; // P3-5：删除后可能已离开页面
       setState(() => _selectedTask = null);
       _detailMode = false;
+      _settleRevision++; // 用户改动 → 图形 settle 过渡
       await reload();
       if (mounted) _showUndoSnack('已删除');
     } else if (result.task != null) {
@@ -436,6 +486,7 @@ class TaskScheduleViewState extends State<TaskScheduleView>
           if (parentBefore != null) await db.updateTask(parentBefore);
         },
       );
+      _settleRevision++;
       await reload();
       if (mounted) _showUndoSnack('已保存');
     }
@@ -459,6 +510,7 @@ class TaskScheduleViewState extends State<TaskScheduleView>
         if (parentBefore != null) await db.updateTask(parentBefore);
       },
     );
+    _settleRevision++;
     await reload();
     if (mounted) _showUndoSnack('已新建');
   }
@@ -475,13 +527,17 @@ class TaskScheduleViewState extends State<TaskScheduleView>
       label: '已调整时间',
       undo: () => db.updateTask(task),
     );
+    _settleRevision++;
     await reload();
     if (mounted) _showUndoSnack('已调整时间');
   }
 
   /// 勾选完成/取消完成（底部板块，设计 §2 行 UI 照搬待办列表）。
   Future<void> _toggleDone(Task task) =>
-      toggleTaskDoneWithUndo(context, task, onChanged: reload);
+      toggleTaskDoneWithUndo(context, task, onChanged: () {
+        _settleRevision++;
+        return reload();
+      });
 
   /// 详情面板中点父/子任务：按目标任务的尺度切换到能展示它的粒度并定位，
   /// 选中并展示其详情。跨粒度时经 [TaskScheduleView.onSwitchGranularity]
@@ -827,17 +883,47 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     );
   }
 
-  /// 列表标题行：整行点击 = 展开/收起切换；纵向拖拽跟随手指调面板高度，
-  /// 松手按位置吸附（展开区域上半 → 展开，否则收起）。
+  /// 标题栏显示的时间范围（2026-11-01：要求较具体）——面板覆盖的是
+  /// 当前可视窗口 ∩ 尺度集合的任务，范围即各视图上报的精确可视窗口：
+  /// 日 = 「08:00 – 20:00」、月 = 「9月28日 – 11月1日」、
+  /// 年 = 「2025年11月 – 2027年1月」、年度 = 「2006 – 2046」。
+  String get _panelRangeLabel {
+    final vs = _visStartMs, ve = _visEndMs;
+    if (vs == null || ve == null || ve <= vs) return '';
+    final s = DateTime.fromMillisecondsSinceEpoch(vs);
+    String two(int v) => v.toString().padLeft(2, '0');
+    switch (widget.granularity) {
+      case 3: // 日：窗口右端是排他的整点边界，直接取 ve 更像「到 20:00」
+        final e = DateTime.fromMillisecondsSinceEpoch(ve);
+        return '${two(s.hour)}:${two(s.minute)} – ${two(e.hour)}:${two(e.minute)}';
+      case 2: // 月：右端减 1ms 落到最后一格
+        final e = DateTime.fromMillisecondsSinceEpoch(ve - 1);
+        return '${s.month}月${s.day}日 – ${e.month}月${e.day}日';
+      case 1:
+        final e = DateTime.fromMillisecondsSinceEpoch(ve - 1);
+        return '${s.year}年${s.month}月 – ${e.year}年${e.month}月';
+      default:
+        final e = DateTime.fromMillisecondsSinceEpoch(ve - 1);
+        return '${s.year} – ${e.year}';
+    }
+  }
+
+  /// 列表标题行：整行点击 = 展开/收起切换（与松手吸附同一动画路径）；
+  /// 纵向拖拽时标题栏中心跟随手指（中间态），松手按位置吸附
+  /// （展开区域上半 → 展开，否则收起）。
   Widget _dragHandleHeader(BuildContext context, double vp, int count) {
     final draggable = vp.isFinite && vp > 0;
+    final cs = Theme.of(context).colorScheme;
+    final range = _panelRangeLabel;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       // 两态都响应点击：收起态展开、展开态收起（吸附动画与拖拽松手同路径）
       onTap: () => _snapBarTo(vp, !_barExpanded),
-      onVerticalDragStart: draggable ? (_) => _barDragStart(vp) : null,
-      onVerticalDragUpdate:
-          draggable ? (d) => _barDragUpdate(d.delta.dy, vp) : null,
+      onVerticalDragStart:
+          draggable ? (d) => _barDragStart(vp, d.globalPosition.dy) : null,
+      onVerticalDragUpdate: draggable
+          ? (d) => _barDragUpdateGlobal(d.globalPosition.dy, vp)
+          : null,
       onVerticalDragEnd: draggable ? (d) => _barDragEnd(vp) : null,
       // 手势被抢走（系统手势/多指）也要吸附回稳定态，不留中间高度
       onVerticalDragCancel:
@@ -852,14 +938,20 @@ class TaskScheduleViewState extends State<TaskScheduleView>
               const SizedBox(width: 8),
               Text('$count',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color:
-                          Theme.of(context).colorScheme.onSurfaceVariant)),
+                      color: cs.onSurfaceVariant)),
               const Spacer(),
-              Icon(
-                _barExpanded ? Icons.expand_more : Icons.expand_less,
-                size: 18,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+              if (range.isNotEmpty)
+                Flexible(
+                  child: Text(
+                    range,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: cs.onSurfaceVariant),
+                  ),
+                ),
             ],
           ),
         ),
@@ -935,6 +1027,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
 /// 任务条会跳到新位置——视图是 CustomPainter 渲染，逐条任务插值成本
 /// 高，这里对整层做一次快速「淡入 + 轻微上移」settle 动画，让图形
 /// 变化读起来是连续过渡而不是生硬跳变。[revision] 变化时重放一次。
+/// 传入的是「用户改动版本」（被动加载不递增）：切页 reload / 滚动增量
+/// 加载不会触发本动画（修复：原先接缓存版本，每次切回任务页图表都会
+/// 下沉 6px 再弹回）。
 class _GanttSettleTransition extends StatefulWidget {
   final int revision;
   final Widget child;
