@@ -119,7 +119,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   //    收起态 = 只留列表标题行（[_barCollapsedH]，含该期任务数与时间范围）；
   //  · 状态按粒度记忆在 State 内（[_barExpandedByGranularity]），不持久化。
   static const _barCollapsedH = 40.0;
-  static const _barExpandedRatio = 0.35;
+
+  /// 展开高度占分栏视口比例（2026-11-01：0.35 → 0.45，加高任务面板）。
+  static const _barExpandedRatio = 0.45;
 
   /// 分栏容器 key：拖拽时把手指全局坐标换算成面板高度（标题栏中心跟手）。
   final _splitKey = GlobalKey();
@@ -148,6 +150,12 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 拖拽中中心点与手指保持同一相对位置，起手瞬间不跳。
   double _dragGrabDelta = 0;
 
+  /// 标题栏拖拽的计时与累计位移：短促拖拽（< 300ms 且 < 48px）视为点击
+  /// （用户意图是点标题栏切换，手指只是略有滑动）。
+  final _dragWatch = Stopwatch();
+  double _dragAccum = 0;
+  double _dragLastGlobalY = 0;
+
   /// 当前面板高度（由展开度插值，永不停留在中间稳定态）。
   double _barHeight(double vp) {
     final expandedH = vp * _barExpandedRatio;
@@ -157,6 +165,11 @@ class TaskScheduleViewState extends State<TaskScheduleView>
 
   void _barDragStart(double vp, double globalY) {
     _barCtrl.stop();
+    _dragWatch
+      ..reset()
+      ..start();
+    _dragAccum = 0;
+    _dragLastGlobalY = globalY;
     final box = _splitBox();
     if (box == null) {
       _dragGrabDelta = 0;
@@ -191,6 +204,8 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 标题栏拖拽（有全局坐标）：面板标题栏中心跟随手指移动。
   /// 面板底边固定在视口底部，高度 = 底边 − 手指 + 半标题高（含起手偏差补偿）。
   void _barDragUpdateGlobal(double globalY, double vp) {
+    _dragAccum += (globalY - _dragLastGlobalY).abs();
+    _dragLastGlobalY = globalY;
     final box = _splitBox();
     if (box == null) return;
     final bottom = box.localToGlobal(Offset(0, box.size.height)).dy;
@@ -198,9 +213,21 @@ class TaskScheduleViewState extends State<TaskScheduleView>
         bottom - (globalY + _dragGrabDelta) + _barCollapsedH / 2, vp);
   }
 
-  /// 松手：只看松手位置——展开度 ≥ 0.5 吸附展开，否则收起。
+  /// 标题栏拖拽松手：短促拖拽（< 300ms 且累计位移 < 48px）视为点击，
+  /// 直接切换展开/收起；否则按松手位置吸附（见 [_barDragEnd]）。
+  void _barHeaderDragEnd(double vp) {
+    if (_dragWatch.elapsedMilliseconds < 300 && _dragAccum < 48) {
+      _snapBarTo(!_barExpanded);
+      return;
+    }
+    _barDragEnd(vp);
+  }
+
+  /// 松手：只看松手位置——展开度 ≥ 1/3 吸附展开，否则收起。
+  /// 收起检测区域定为下 1/3（2026-11-01：原来是下半，收起过于容易，
+  /// 下拉收手势稍过一点就回不来了）。
   void _barDragEnd(double vp) {
-    _snapBarTo(_barCtrl.value >= 0.5);
+    _snapBarTo(_barCtrl.value >= 1 / 3);
   }
 
   /// 动画吸附到展开/收起稳定态（松手吸附、取消吸附与点击切换共用同一条
@@ -822,7 +849,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
         const Divider(height: 1),
         Expanded(
           child: SingleChildScrollView(
-            // Clamping：顶部继续下拉时发 OverscrollNotification（收起手势）
+            // Clamping：顶部继续下拉时发 OverscrollNotification（收起手势）；
+            // 底部 88px 空白给悬浮「+」按钮让位
+            padding: const EdgeInsets.only(bottom: 88),
             physics: const AlwaysScrollableScrollPhysics(
                 parent: ClampingScrollPhysics()),
             child: TaskDetailPanel(
@@ -852,7 +881,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
                 )
               : ListView.builder(
                   // AlwaysScrollable + Clamping：短列表滚到顶部继续下拉时
-                  // 也能发 OverscrollNotification（面板跟随手指收起）
+                  // 也能发 OverscrollNotification（面板跟随手指收起）；
+                  // 底部 88px 空白给悬浮「+」按钮让位，内容可继续上滚
+                  padding: const EdgeInsets.only(bottom: 88),
                   physics: const AlwaysScrollableScrollPhysics(
                       parent: ClampingScrollPhysics()),
                   itemCount: tasks.length,
@@ -924,13 +955,14 @@ class TaskScheduleViewState extends State<TaskScheduleView>
       onVerticalDragUpdate: draggable
           ? (d) => _barDragUpdateGlobal(d.globalPosition.dy, vp)
           : null,
-      onVerticalDragEnd: draggable ? (d) => _barDragEnd(vp) : null,
+      onVerticalDragEnd: draggable ? (d) => _barHeaderDragEnd(vp) : null,
       // 手势被抢走（系统手势/多指）也要吸附回稳定态，不留中间高度。
-      // 无条件挂回调：旧实现按「拖拽中」在 build 时求值，拖拽起手没
-      // setState，回调压根挂不上——手势被取消后面板就停在中间高度
+      // 取消不是用户主动松手，按位置吸附（不做短拖拽=点击判定）
       onVerticalDragCancel: draggable ? () => _barDragEnd(vp) : null,
       child: SizedBox(
-        height: _barCollapsedH,
+        // 上方恒有 Divider(height:1)：标题行让出 1px，否则收起态
+        // 1 + 40 > 面板高 40，底部报 Bottom overflowed by 1.00 pixels
+        height: _barCollapsedH - 1,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(12, 6, 12, 2),
           child: Row(

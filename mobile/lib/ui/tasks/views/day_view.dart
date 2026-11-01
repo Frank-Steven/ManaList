@@ -551,8 +551,11 @@ class _DayLayout {
   /// 刻度带高度：容纳斜 45° 向上的时间标注 + 跨日日期标注。
   static const headerH = 44.0;
   static const laneH = 34.0; // 行高（顶部名称带另算）
-  // 标签恢复原设计（2026-10-20 用户要求）：顶部 160px 名称带 + 45° 斜排 + 竖虚线连到节点。
-  static const nameLayerH = 160.0;
+  // 名称带（45° 斜排 + 竖虚线连到节点）高度：160 → 100（2026-11-01）。
+  // 任务名不超过 10 个汉字 / 20 个西文字母（11px 字 ≈ 110~124px 宽），
+  // 45° 斜排的纵向占用 ≈ 宽 × sin45° ≈ 78~88px，100px 带内足够；
+  // 超长的名字顶部被 ClipRect 裁掉，不再为它们保留整段空白。
+  static const nameLayerH = 100.0;
   static const labelGapPx = 6.0; // 标签之间留白
 
   final double viewW;
