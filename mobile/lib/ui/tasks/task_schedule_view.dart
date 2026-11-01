@@ -469,6 +469,8 @@ class TaskScheduleViewState extends State<TaskScheduleView>
 
   /// 底部任务列表板块（v2.4 §13 修订）：当前**可视时间范围**内、且尺度在
   /// 当前视图放行集合（scalesForView）内的全部任务，不再限定单一尺度。
+  /// 2026-11-01：已完成任务也显示（原先 active-only 过滤，面板里看不到
+  /// 已完成项）；未完成的排前面、已完成的沉底，各自按开始时间排序。
   List<Task> get _bottomTasks {
     final viewName =
         const ['yearly', 'year', 'month', 'day'][widget.granularity];
@@ -477,12 +479,17 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     if (vs == null || ve == null) return const [];
     return _cache.values
         .where((t) =>
-            t.status == TaskStatus.active &&
             t.startAt != null &&
             scales.contains(deriveTaskScale(t.startAt, t.endAt, kind: t.kind)) &&
             occurrenceOverlapping(t, vs, ve) != null)
         .toList()
-      ..sort((a, b) => a.startAt!.compareTo(b.startAt!));
+      ..sort((a, b) {
+        // 未完成在前、已完成沉底（TaskStatus 只有 active/done 两态）
+        final ad = a.status == TaskStatus.done ? 1 : 0;
+        final bd = b.status == TaskStatus.done ? 1 : 0;
+        if (ad != bd) return ad - bd;
+        return a.startAt!.compareTo(b.startAt!);
+      });
   }
 
   void _showUndoSnack(String label) {
