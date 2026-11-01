@@ -46,6 +46,7 @@ npm run dist       # 打包 macOS dmg（electron-builder）
 
 | 文档 | 内容 |
 |---|---|
+| [docs/assistant.md](docs/assistant.md) | **助理统领性设计**（定位、硬约束、能力边界、执行链路） |
 | [docs/design-v3.md](docs/design-v3.md) | **现行设计**（v3：库/任务/助理、锚点、工具协议、待确认区、存档） |
 | [docs/design-v3-details.md](docs/design-v3-details.md) | v3 机制定稿（marker 语法、工具协议细化、inbox.triage、存档格式） |
 | [docs/refactor-v3.md](docs/refactor-v3.md) | v2 → v3 重构操作记录（分阶段 commit） |
