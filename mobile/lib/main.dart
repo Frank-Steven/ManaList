@@ -139,23 +139,53 @@ AppBarTheme appBarThemeFor(ColorScheme cs) => AppBarTheme(
           cs.surface, cs.surfaceTint, 3.0),
     );
 
+/// 全局等宽数字（2026-11-01，tnum 字体特性）：日期/时间/计数等数字
+/// 逐位等宽，值变化时整串不左右抖动（倒计时、时间戳、进度数字尤其明显）。
+/// 作用在 TextTheme 层，各页面无需逐处设置；默认字体（Roboto）支持 tnum。
+TextTheme _tabularTextTheme(TextTheme base) {
+  const features = [FontFeature.tabularFigures()];
+  TextStyle? t(TextStyle? s) => s?.copyWith(fontFeatures: features);
+  return TextTheme(
+    displayLarge: t(base.displayLarge),
+    displayMedium: t(base.displayMedium),
+    displaySmall: t(base.displaySmall),
+    headlineLarge: t(base.headlineLarge),
+    headlineMedium: t(base.headlineMedium),
+    headlineSmall: t(base.headlineSmall),
+    titleLarge: t(base.titleLarge),
+    titleMedium: t(base.titleMedium),
+    titleSmall: t(base.titleSmall),
+    bodyLarge: t(base.bodyLarge),
+    bodyMedium: t(base.bodyMedium),
+    bodySmall: t(base.bodySmall),
+    labelLarge: t(base.labelLarge),
+    labelMedium: t(base.labelMedium),
+    labelSmall: t(base.labelSmall),
+  );
+}
+
+ThemeData _withTabularFigures(ThemeData theme) => theme.copyWith(
+      textTheme: _tabularTextTheme(theme.textTheme),
+      primaryTextTheme: _tabularTextTheme(theme.primaryTextTheme),
+    );
+
 // 主题只算一次（O10）：`ColorScheme.fromSeed` 每次构建都跑一遍 HCT 换算，
 // 切换深浅色时它被重复执行两遍，是主题切换卡顿的固定开销之一。
 final ColorScheme _lightScheme = ColorScheme.fromSeed(seedColor: Colors.indigo);
 final ColorScheme _darkScheme =
     ColorScheme.fromSeed(seedColor: Colors.indigo, brightness: Brightness.dark);
-final ThemeData _lightTheme = ThemeData(
+final ThemeData _lightTheme = _withTabularFigures(ThemeData(
   useMaterial3: true,
   colorScheme: _lightScheme,
   snackBarTheme: snackBarThemeFor(_lightScheme),
   appBarTheme: appBarThemeFor(_lightScheme),
-);
-final ThemeData _darkTheme = ThemeData(
+));
+final ThemeData _darkTheme = _withTabularFigures(ThemeData(
   useMaterial3: true,
   colorScheme: _darkScheme,
   snackBarTheme: snackBarThemeFor(_darkScheme),
   appBarTheme: appBarThemeFor(_darkScheme),
-);
+));
 
 class MsgRepoApp extends StatelessWidget {
   const MsgRepoApp({super.key});
@@ -275,9 +305,12 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
           // 主题过渡时不必带着整屏一起重绘。
           Expanded(
             child: RepaintBoundary(
-                child: IndexedStack(
-                  index: _index,
-                  children: [for (var i = 0; i < AppUiState.tabCount; i++) _pageAt(i)],
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    for (var i = 0; i < AppUiState.tabCount; i++)
+                      _TabVisibility(visible: i == _index, child: _pageAt(i)),
+                  ],
                 ),
             ),
           ),
@@ -290,7 +323,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     );
   }
 
-  /// 切到某个 tab 后按需刷新该页（IndexedStack 保活，不会重跑 initState）。
+  /// 切到某个 tab 后按需刷新该页（页面常驻保活，不会重跑 initState）。
   void _reloadTab(int i) {
     switch (i) {
       case AppUiState.libraryTabIndex:
@@ -335,6 +368,74 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         const NavigationDestination(
             icon: Icon(Icons.settings_outlined), label: '设置'),
       ],
+    );
+  }
+}
+
+/// 主 Tab 切换过渡（2026-11-01）：切入页淡入 + 轻微右→左滑入，
+/// 切出页同步淡出（交叉淡化）；所有已构建页面常驻（与 IndexedStack
+/// 同等的保活语义），隐藏页移出绘制/命中/语义。
+class _TabVisibility extends StatefulWidget {
+  const _TabVisibility({required this.visible, required this.child});
+
+  final bool visible;
+  final Widget child;
+
+  @override
+  State<_TabVisibility> createState() => _TabVisibilityState();
+}
+
+class _TabVisibilityState extends State<_TabVisibility>
+    with SingleTickerProviderStateMixin {
+  static const _duration = Duration(milliseconds: 250);
+
+  late final AnimationController _ctrl = AnimationController(
+    vsync: this,
+    duration: _duration,
+    value: widget.visible ? 1 : 0,
+  );
+
+  @override
+  void didUpdateWidget(_TabVisibility oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.visible == oldWidget.visible) return;
+    // 不带 from：快速连点 Tab 时从当前值继续，不跳变
+    if (widget.visible) {
+      _ctrl.forward();
+    } else {
+      _ctrl.reverse();
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _ctrl,
+      child: widget.child,
+      builder: (context, child) {
+        final v = Curves.easeOut.transform(_ctrl.value);
+        return Visibility(
+          visible: v > 0,
+          maintainState: true,
+          maintainSize: true,
+          child: IgnorePointer(
+            ignoring: !widget.visible,
+            child: Opacity(
+              opacity: v,
+              child: Transform.translate(
+                offset: Offset((1 - v) * 12, 0),
+                child: child,
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
