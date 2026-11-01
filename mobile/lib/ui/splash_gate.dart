@@ -14,10 +14,13 @@ Color splashBackgroundFor(Brightness brightness) => brightness == Brightness.dar
     : splashBackgroundLight;
 
 /// 图标边长（dp）。1080px 屏 / 2.75 密度 ≈ 320px，屏宽 29.6%（设计稿口径）。
+/// 与原生 `res/drawable/splash_icon_centered.xml` 的 116dp 严格一致。
 const double splashIconSize = 116;
 
-/// 图标中心相对屏高的位置 —— 46.5%，视觉中心略高于几何中心（设计稿口径）。
-const double splashIconCenterRatio = 0.465;
+/// 图标中心相对屏高的位置 —— 50%（2026-11-01：原生启动窗直显图标，
+/// 系统启动窗只支持垂直居中，Flutter 接力必须同位，原 46.5% 设计稿口径
+/// 随之统一到几何中心，否则交接瞬间图标会向上跳 ~3.5% 屏高）。
+const double splashIconCenterRatio = 0.5;
 
 /// 图标底 → 名称顶的距离（dp）。设计稿 96px @2.75。
 const double splashIconToNameGap = 35;
@@ -28,14 +31,15 @@ const double splashIconRadiusRatio = 0.21875;
 /// 名称字号（sp）。设计稿 56px @2.75 ≈ 21sp。
 const double splashNameFontSize = 21;
 
-/// F15（2026-10-22 用户）+ Q13②（2026-10-24 用户拍板）启动动画。
+/// F15（2026-10-22 用户）启动动画，2026-11-01 起**原生直显图标**（取代 Q13-A）：
+/// 用户要求「一点开应用就有开屏」——Flutter 引擎就绪前的几百毫秒由系统启动窗
+/// 直接画出底色 + 居中 116dp 图标（`res/drawable/launch_background.xml` 与
+/// `windowSplashScreenAnimatedIcon`，版式与本页严格一致），Flutter 首帧无缝接力。
+/// 代价：图标不再有 0 → 1 淡入（原生阶段已经全显，再淡入会闪）；
+/// 保留的动画 = 名称延后淡入 + 整体退场淡出。
 ///
-/// 设计（版式取自图标方案稿的启动页，按原稿比例重算；2026-10-28 起背景改为跟随深浅模式）：
-/// 1. 图标从**完全透明**渐变到**完全不透明**（600ms，easeOut）。B05 要求「交接处不缩放」，
-///    所以这里**不做**原来的 0.96 → 1.0 轻微放大，只保留透明度淡入。
-///    Q13-A（2026-10-24 用户选 A）后，**原生阶段只铺背景色、不画任何图标**
-///    （`windowSplashScreenAnimatedIcon` 显式指向透明占位），因此这次 0 → 1 淡入
-///    是图标的**首次出现**，不存在「原生图标消失再重现」的交接闪烁；
+/// 设计（2026-10-28 起背景跟随深浅模式）：
+/// 1. 图标全程不透明，位置/尺寸与原生启动窗逐像素一致（中心 = 屏高 50%）；
 /// 2. 名称延后 150ms 淡入（500ms），避免两块同时跳到脸上（2026-10-28 用户：标语小字移除）；
 /// 3. 底层先在**第一帧**画启动页，下一帧才构建 [child]（主界面），这样数据库/页面初始化的
 ///    重活发生在启动页盖着的时候，而不是让用户盯着白屏；
@@ -62,14 +66,9 @@ class SplashGate extends StatefulWidget {
 }
 
 class _SplashGateState extends State<SplashGate> with TickerProviderStateMixin {
-  static const Duration _iconFade = Duration(milliseconds: 600);
   static const Duration _textFade = Duration(milliseconds: 500);
   static const Duration _exitFade = Duration(milliseconds: 300);
 
-  late final AnimationController _icon = AnimationController(
-    vsync: this,
-    duration: _iconFade,
-  );
   late final AnimationController _text = AnimationController(
     vsync: this,
     duration: _textFade,
@@ -90,7 +89,6 @@ class _SplashGateState extends State<SplashGate> with TickerProviderStateMixin {
       if (!mounted) return;
       setState(() => _mountChild = true);
     });
-    _icon.forward();
     Future<void>.delayed(const Duration(milliseconds: 150), () {
       if (mounted) _text.forward();
     });
@@ -114,7 +112,6 @@ class _SplashGateState extends State<SplashGate> with TickerProviderStateMixin {
 
   @override
   void dispose() {
-    _icon.dispose();
     _text.dispose();
     _exit.dispose();
     super.dispose();
@@ -127,9 +124,8 @@ class _SplashGateState extends State<SplashGate> with TickerProviderStateMixin {
         final height = constraints.maxHeight.isFinite
             ? constraints.maxHeight
             : MediaQuery.sizeOf(context).height;
-        // 关键版式：图标中心落在屏高 46.5%（不是整块内容居中）
+        // 关键版式：图标中心落在屏高 50%，与原生启动窗逐像素对齐
         final iconTop = height * splashIconCenterRatio - splashIconSize / 2;
-        final iconFade = CurvedAnimation(parent: _icon, curve: Curves.easeOut);
         final textFade = CurvedAnimation(parent: _text, curve: Curves.easeOut);
         final brightness = Theme.of(context).colorScheme.brightness;
         return ColoredBox(
@@ -140,11 +136,10 @@ class _SplashGateState extends State<SplashGate> with TickerProviderStateMixin {
                 top: iconTop,
                 left: 0,
                 right: 0,
-                child: Center(
-                  child: FadeTransition(
-                    opacity: iconFade,
-                    child: const _SplashIcon(key: ValueKey('splash-icon')),
-                  ),
+                // 图标不做淡入：原生启动窗阶段已经全显（2026-11-01），
+                // 再从 0 淡入等于「图标消失再出现」的交接闪烁
+                child: const Center(
+                  child: _SplashIcon(key: ValueKey('splash-icon')),
                 ),
               ),
               Positioned(

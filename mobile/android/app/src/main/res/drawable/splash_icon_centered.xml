@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 2026-11-01：启动图标原生直显（取代 Q13-A 的「原生透明、Flutter 淡入」）。
+     一点开应用系统就先画这张启动窗，Flutter 引擎就绪前用户看到的就是
+     完整启动画面；Flutter 首帧接力同一位置/同一尺寸的图标，无交接闪烁。
+
+     版式与 Flutter 侧 lib/ui/splash_gate.dart 严格一致：
+     - 图标 116dp（1080px 屏 / 2.75 密度 ≈ 320px 设计稿口径）；
+     - 水平居中、垂直屏中心（屏高 50%，随 Q13-A 废止由 46.5% 统一到
+     系统启动窗只能居中的约束）。
+     位图放 drawable-nodpi（1024×1024 自带圆角与柔和阴影），
+     由本层列表显式约束到 116dp，避免密度换算误差。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:width="116dp"
+        android:height="116dp"
+        android:gravity="center">
+        <bitmap
+            android:src="@drawable/splash_icon"
+            android:gravity="center" />
+    </item>
+</layer-list>

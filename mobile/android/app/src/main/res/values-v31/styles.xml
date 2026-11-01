@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="LaunchTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:windowBackground">@color/splash_bg</item>
+        <item name="android:windowBackground">@drawable/launch_background</item>
         <item name="android:windowSplashScreenBackground">@color/splash_bg</item>
-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_transparent</item>
-        <!-- Q13-A（2026-10-24 用户选 A）：原生阶段**只有品牌蓝**，不画任何图标。
-             注意：这个属性**必须显式指向透明占位**，不能删 —— Android 12+ 在该属性缺失时
-             会回退去画应用的 launcher icon（@mipmap/ic_launcher），反而在原生阶段冒出图标，
-             正是要消除的「原生图标 → Flutter 图标」交接闪烁。
-             图标统一由 Flutter 侧（lib/ui/splash_gate.dart）从 opacity 0 → 1 淡入。 -->
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_centered</item>
+        <!-- 2026-11-01（取代 Q13-A）：原生阶段即显示完整启动画面——
+             用户要求一点开应用就看到开屏。系统启动窗的图标只能垂直居中，
+             故 Flutter 侧图标位置同步统一到屏高 50%（splash_gate.dart）。
+             该属性必须显式给出：缺失时 Android 12+ 会回退去画
+             @mipmap/ic_launcher（adaptive icon，与启动页卡片不一致）。 -->
     </style>
     <style name="NormalTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@color/splash_bg</item>

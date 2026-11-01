@@ -1,12 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- F15 / Q13-A（2026-10-24 用户选 A）：启动第一屏**只有品牌蓝**，不再画图标。
-     图标一律交给 Flutter 侧从 opacity 0 淡入（lib/ui/splash_gate.dart），
-     这样原生阶段没有任何图形，就不会出现「原生图标消失 → Flutter 图标再出现」
-     的交接闪烁，也不会出现方角白图 / 尺寸位移。
-
-     保留成 layer-list（而不是让 windowBackground 直接指 @color/splash_bg）：
-     Manifest 的 io.flutter.embedding.android.SplashScreenDrawable 也指向本文件，
-     引擎初始化期间由它继续铺底色。 -->
+<!-- 与 drawable/launch_background.xml 保持一致（v21 分桶历史遗留，
+     内容相同，改一处必须同步另一处）。 -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/splash_bg" />
+    <item android:drawable="@drawable/splash_icon_centered" />
 </layer-list>
