@@ -1,7 +1,28 @@
-/** 传给 provider 的对话消息（已按 OpenAI 角色规整，tool 角色已折叠为 user）。 */
+/** OpenAI 多模态内容块（content parts）：文本或内联图像（data URL）。 */
+export type ProviderContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
+/** 传给 provider 的对话消息（已按 OpenAI 角色规整，tool 角色已折叠为 user）。
+ *  content 为字符串（纯文本消息）或 content parts（含图像的多模态消息）。 */
 export interface ProviderChatMessage {
   role: "system" | "user" | "assistant";
-  content: string;
+  content: string | ProviderContentPart[];
+}
+
+/** 提取消息纯文本（mock/ollama 等非多模态 provider 用，图像块计数返回）。 */
+export function contentText(content: string | ProviderContentPart[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((p): p is { type: "text"; text: string } => p.type === "text")
+    .map((p) => p.text)
+    .join("\n");
+}
+
+/** 消息中的图像块数。 */
+export function contentImageCount(content: string | ProviderContentPart[]): number {
+  if (typeof content === "string") return 0;
+  return content.filter((p) => p.type === "image_url").length;
 }
 
 /** v3 统一对话选项（design-v3 §6.3）。 */

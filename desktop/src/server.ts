@@ -43,14 +43,35 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 /**
  * 把 /v1/chat 请求体组装为 provider 消息序列（design-v3 §6.3、details §2.4）：
  * desktop 只透传不解析——工具说明书由手机端组装进消息；这里仅做两件事：
- *  1. 顶层 attachments（手机端已展开正文、自带 [#note:标题] 引用头）拼成一条上下文消息；
+ *  1. 顶层 attachments（手机端已展开正文、自带 [#note:标题] 引用头）拼成一条上下文消息——
+ *     图片附件（带 dataBase64）按 OpenAI content parts 内联（image_url，data URL）；
  *  2. OpenAI 端点对 tool 角色要求 tool_calls 字段，本地小模型链路用不上——折叠为带前缀的 user 消息。
  */
 function buildProviderMessages(body: ChatRequest): ProviderChatMessage[] {
   const out: ProviderChatMessage[] = [];
   if (body.attachments && body.attachments.length > 0) {
     const blocks = body.attachments.map((a) => a.content).join("\n\n");
-    out.push({ role: "user", content: `以下是与本次对话相关的库内容（供引用定位）：\n\n${blocks}` });
+    const images = body.attachments.filter(
+      (a) => typeof a.dataBase64 === "string" && a.dataBase64.length > 0,
+    );
+    const intro = `以下是与本次对话相关的库内容（供引用定位）：\n\n${blocks}`;
+    if (images.length === 0) {
+      out.push({ role: "user", content: intro });
+    } else {
+      // 多模态消息：文本上下文 + 逐张图片的 image_url 块
+      out.push({
+        role: "user",
+        content: [
+          { type: "text", text: intro },
+          ...images.map((a) => ({
+            type: "image_url" as const,
+            image_url: {
+              url: `data:${a.mimeType ?? "image/png"};base64,${a.dataBase64}`,
+            },
+          })),
+        ],
+      });
+    }
   }
   for (const m of body.messages) {
     if (m.role === "tool") {

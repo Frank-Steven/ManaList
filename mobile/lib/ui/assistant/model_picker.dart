@@ -103,72 +103,84 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
     final apiKeyController =
         TextEditingController(text: existing?.apiKey ?? '');
     final modelController = TextEditingController(text: existing?.model ?? '');
+    var vision = existing?.vision ?? false;
     final saved = await showDialog<AiEndpoint>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text(existing == null ? '添加接口' : '编辑接口'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: nameController,
-                decoration: const InputDecoration(labelText: '名称'),
-              ),
-              TextField(
-                controller: baseUrlController,
-                decoration: const InputDecoration(
-                  labelText: 'Base URL',
-                  hintText: 'https://api.example.com/v1',
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(existing == null ? '添加接口' : '编辑接口'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameController,
+                  decoration: const InputDecoration(labelText: '名称'),
                 ),
-              ),
-              TextField(
-                controller: apiKeyController,
-                obscureText: true,
-                decoration:
-                    const InputDecoration(labelText: 'API Key（可空）'),
-              ),
-              TextField(
-                controller: modelController,
-                decoration: const InputDecoration(labelText: '模型'),
-              ),
-            ],
+                TextField(
+                  controller: baseUrlController,
+                  decoration: const InputDecoration(
+                    labelText: 'Base URL',
+                    hintText: 'https://api.example.com/v1',
+                  ),
+                ),
+                TextField(
+                  controller: apiKeyController,
+                  obscureText: true,
+                  decoration:
+                      const InputDecoration(labelText: 'API Key（可空）'),
+                ),
+                TextField(
+                  controller: modelController,
+                  decoration: const InputDecoration(labelText: '模型'),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('支持图像输入'),
+                  subtitle: const Text('多模态模型；开启后图片附件随对话发送',
+                      style: TextStyle(fontSize: 12)),
+                  value: vision,
+                  onChanged: (v) => setDialogState(() => vision = v),
+                ),
+              ],
+            ),
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                var baseUrl = baseUrlController.text.trim();
+                if (baseUrl.endsWith('/')) {
+                  baseUrl = baseUrl.substring(0, baseUrl.length - 1);
+                }
+                if (nameController.text.trim().isEmpty ||
+                    baseUrl.isEmpty ||
+                    modelController.text.trim().isEmpty) {
+                  return;
+                }
+                Navigator.of(context).pop(
+                  (existing ??
+                          AiEndpoint(
+                            id: ai.newEndpointId(),
+                            name: '',
+                            baseUrl: '',
+                          ))
+                      .copyWith(
+                    name: nameController.text.trim(),
+                    baseUrl: baseUrl,
+                    apiKey: apiKeyController.text.trim(),
+                    model: modelController.text.trim(),
+                    vision: vision,
+                  ),
+                );
+              },
+              child: const Text('保存'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () {
-              var baseUrl = baseUrlController.text.trim();
-              if (baseUrl.endsWith('/')) {
-                baseUrl = baseUrl.substring(0, baseUrl.length - 1);
-              }
-              if (nameController.text.trim().isEmpty ||
-                  baseUrl.isEmpty ||
-                  modelController.text.trim().isEmpty) {
-                return;
-              }
-              Navigator.of(context).pop(
-                (existing ??
-                        AiEndpoint(
-                          id: ai.newEndpointId(),
-                          name: '',
-                          baseUrl: '',
-                        ))
-                    .copyWith(
-                  name: nameController.text.trim(),
-                  baseUrl: baseUrl,
-                  apiKey: apiKeyController.text.trim(),
-                  model: modelController.text.trim(),
-                ),
-              );
-            },
-            child: const Text('保存'),
-          ),
-        ],
       ),
     );
     if (saved == null) return;
@@ -352,7 +364,7 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
       title: Text(
           '${m.name}${m.id == _desktopDefaultModelId ? '（默认）' : ''}${selected && widget.selectionMode ? ' ✓' : ''}'),
       subtitle: Text(
-        '${m.model} · ${reachable == null ? '未探测' : reachable ? '可达' : '不可达'}',
+        '${m.model} · ${reachable == null ? '未探测' : reachable ? '可达' : '不可达'}${m.vision ? ' · 视觉' : ''}',
         style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
       ),
       onTap: widget.selectionMode ? () => _select(m.id) : null,
@@ -370,7 +382,7 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
               size: 20)
           : Icon(Icons.cloud_outlined, color: cs.onSurfaceVariant),
       title: Text('${e.name}${selected && widget.selectionMode ? ' ✓' : ''}'),
-      subtitle: Text('${e.baseUrl} · ${e.model}',
+      subtitle: Text('${e.baseUrl} · ${e.model}${e.vision ? ' · 视觉' : ''}',
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),

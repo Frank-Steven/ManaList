@@ -6,10 +6,13 @@ import '../../services/database.dart';
 import 'approvals_page.dart';
 import 'chat_page.dart';
 import 'model_picker.dart';
+import 'widgets/streaming_blocks.dart';
 
 /// 助理主 Tab（design-v3 §5.1）：对话列表（新建/改名/删除），
 /// AppBar 一级入口：待确认区、模型配置。设置已改回底部第 4 个 tab，
 /// 本页不再持有设置入口。
+/// 2026-11-01 多 Agent 并行：在途回合的对话在列表里指示工作状态
+/// （思考中/回复中/工具执行中 + 呼吸圆点），回合由服务自持、跨页面存活。
 class ConversationsPage extends StatefulWidget {
   const ConversationsPage({super.key});
 
@@ -23,7 +26,19 @@ class ConversationsPageState extends State<ConversationsPage> {
   @override
   void initState() {
     super.initState();
+    // 在途回合的开始/阶段变化/结束都会 bump turnsVersion
+    AssistantService.instance.turnsVersion.addListener(_onTurnsChange);
     reload();
+  }
+
+  @override
+  void dispose() {
+    AssistantService.instance.turnsVersion.removeListener(_onTurnsChange);
+    super.dispose();
+  }
+
+  void _onTurnsChange() {
+    if (mounted) setState(() {});
   }
 
   Future<void> reload() async {
@@ -130,13 +145,24 @@ class ConversationsPageState extends State<ConversationsPage> {
               itemCount: _conversations.length,
               itemBuilder: (_, i) {
                 final c = _conversations[i];
+                final turn = AssistantService.instance.turnOf(c.id);
                 return ListTile(
                   leading: const Icon(Icons.chat_bubble_outline),
                   title: Text(c.title,
                       maxLines: 1, overflow: TextOverflow.ellipsis),
-                  subtitle: Text(_fmtTime(c.updatedAt),
-                      style:
-                          TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                  subtitle: turn != null
+                      ? Row(
+                          children: [
+                            const BreathingDot(size: 6),
+                            const SizedBox(width: 6),
+                            Text('${turnPhaseLabel(turn.phase.value)}…',
+                                style: TextStyle(
+                                    fontSize: 12, color: cs.primary)),
+                          ],
+                        )
+                      : Text(_fmtTime(c.updatedAt),
+                          style: TextStyle(
+                              fontSize: 12, color: cs.onSurfaceVariant)),
                   trailing: PopupMenuButton<String>(
                     onSelected: (v) {
                       if (v == 'rename') _rename(c);

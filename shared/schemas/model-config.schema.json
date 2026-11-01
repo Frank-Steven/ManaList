@@ -30,6 +30,10 @@
     "apiKeyEnv": {
       "type": "string",
       "description": "API key 所在环境变量名（desktop 侧远程端点用），不直接存密钥。可选"
+    },
+    "vision": {
+      "type": "boolean",
+      "description": "模型是否支持图像输入（多模态）。true 时手机端会把图片附件内联进请求（OpenAI image_url 内容块）；缺省 false。可选"
     }
   }
 }

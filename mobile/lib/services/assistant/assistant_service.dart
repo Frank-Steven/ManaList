@@ -7,9 +7,11 @@ import 'package:uuid/uuid.dart';
 import '../../models/conversation.dart';
 import '../database.dart';
 import 'assistant_client.dart';
+import 'image_encoder.dart';
 import 'models.dart';
 import 'proposal_executor.dart';
 import 'proposal_service.dart';
+import 'think_parser.dart';
 import 'tool_parser.dart';
 import 'tool_spec.dart';
 
@@ -35,8 +37,36 @@ class AssistantProposalCreated extends AssistantEvent {
 
 /// 工具块校验失败 / 只读工具结果：已回注对话为 tool 消息。
 class AssistantToolMessage extends AssistantEvent {
+  /// 对应的工具块序号（本条 assistant 消息内，0 起；用于落定占位块状态）。
+  final int blockIndex;
   final String content;
-  const AssistantToolMessage(this.content);
+  const AssistantToolMessage(this.blockIndex, this.content);
+}
+
+/// 回合开始（用户消息与 assistant 占位已落库）——对话页立即刷新，
+/// 用户消息马上上屏（2026-11-01：原先要等首个 token 才看得到自己的消息）。
+class AssistantTurnStarted extends AssistantEvent {
+  const AssistantTurnStarted();
+}
+
+/// 思考块增量（<think> 标签内容，不上屏、不落库，仅流式展示）。
+class AssistantThinkingDelta extends AssistantEvent {
+  /// 本回合第几个思考段（0 起；思考 → 正文 → 再思考时分段递增）。
+  final int section;
+
+  /// 该段截至目前的完整思考文本。
+  final String text;
+
+  /// true = 仍在思考块内（思考中）；false = 本段思考已闭合。
+  final bool active;
+  const AssistantThinkingDelta(this.section, this.text, this.active);
+}
+
+/// 一个工具块开始流入（模型开始输出 ```tool 围栏块，UI 先出占位块）。
+class AssistantToolBlockStarted extends AssistantEvent {
+  /// 本条 assistant 消息内的块序号（0 起）。
+  final int index;
+  const AssistantToolBlockStarted(this.index);
 }
 
 /// 回合正常结束。
@@ -50,9 +80,85 @@ class AssistantTurnError extends AssistantEvent {
   const AssistantTurnError(this.message);
 }
 
+/// 回合阶段（2026-11-01 多 Agent 并行）：对话列表与对话页的状态指示。
+enum TurnPhase { starting, thinking, generating, tooling, done, error }
+
+/// 阶段的人类可读标签（对话列表副标题）。
+String turnPhaseLabel(TurnPhase p) => switch (p) {
+      TurnPhase.starting => '启动中',
+      TurnPhase.thinking => '思考中',
+      TurnPhase.generating => '回复中',
+      TurnPhase.tooling => '工具执行中',
+      TurnPhase.done => '已完成',
+      TurnPhase.error => '出错',
+    };
+
+/// 一个在途回合（2026-11-01）：pump 由 [AssistantService] 驱动、独立于页面
+/// 存活——离开对话页回合继续跑，多个对话的回合可并行（通道各自独立，
+/// 并发上限由 desktop 分模型闸调度）。页面经 [events] 订阅增量事件，
+/// 经 [phase] 观察阶段。
+class AssistantTurnHandle {
+  AssistantTurnHandle._({
+    required this.conversation,
+    required this.text,
+    required this.attachments,
+  });
+
+  /// 启动时的对话快照（modelConfigId 取自它）。
+  final Conversation conversation;
+  final String text;
+  final List<ChatAttachment> attachments;
+
+  String get conversationId => conversation.id;
+
+  final _controller = StreamController<AssistantEvent>.broadcast();
+
+  /// 流式事件（broadcast：页面开关随意订阅/退订，不影响 pump）。
+  Stream<AssistantEvent> get events => _controller.stream;
+
+  /// 当前阶段（对话列表指示用）。
+  final ValueNotifier<TurnPhase> phase = ValueNotifier(TurnPhase.starting);
+
+  /// 本回合的独立通道（取消时中断其 SSE）。
+  late final AssistantClient channel;
+
+  bool _closed = false;
+
+  void _emit(AssistantEvent ev) {
+    switch (ev) {
+      case AssistantThinkingDelta():
+        // 思考闭合后通常回到正文生成
+        phase.value = ev.active ? TurnPhase.thinking : TurnPhase.generating;
+      case AssistantTextDelta():
+        phase.value = TurnPhase.generating;
+      case AssistantToolBlockStarted():
+        phase.value = TurnPhase.tooling;
+      case AssistantProposalCreated() || AssistantToolMessage():
+        phase.value = TurnPhase.generating;
+      case AssistantTurnDone():
+        phase.value = TurnPhase.done;
+      case AssistantTurnError():
+        phase.value = TurnPhase.error;
+      default:
+        break;
+    }
+    if (!_closed) _controller.add(ev);
+  }
+
+  void _close() {
+    _closed = true;
+    _controller.close();
+    phase.dispose();
+  }
+}
+
 /// 助理编排服务（design-v3 §5.4）：
 /// 组装请求（对话历史 + 附件正文内联展开 + tool_spec 说明书）→
 /// AssistantClient 通道 → tool_parser 流式解析 → proposal_service 落提案。
+///
+/// 2026-11-01 多 Agent 并行：回合 pump 由服务自持（[AssistantTurnHandle]），
+/// 不再依赖页面消费流——多对话可同时各跑一个回合；同对话新回合自动
+/// 取消旧回合。编辑/撤回/重试 = 截断后续消息（pending 提案一并撤销）后重跑。
 class AssistantService {
   AssistantService._();
 
@@ -60,8 +166,24 @@ class AssistantService {
 
   static const _uuid = Uuid();
 
-  /// 通道（测试可替换为指向 mock server 的实例配置）。
-  AssistantClient client = AssistantClient.instance;
+  /// 通道覆盖（测试注入用）；null = 每回合创建独立通道（并行互不干扰）。
+  AssistantClient? _clientOverride;
+
+  /// 测试兼容：读取默认通道 / 注入 mock。
+  AssistantClient get client => _clientOverride ?? AssistantClient.instance;
+  set client(AssistantClient c) => _clientOverride = c;
+
+  AssistantClient _newChannel() =>
+      _clientOverride ?? AssistantClient.independent();
+
+  /// 在途回合表（conversationId → handle）。
+  final Map<String, AssistantTurnHandle> activeTurns = {};
+
+  /// 回合表/阶段任何变化都 +1（对话列表一个 Listenable 就够）。
+  final ValueNotifier<int> turnsVersion = ValueNotifier(0);
+
+  AssistantTurnHandle? turnOf(String conversationId) =>
+      activeTurns[conversationId];
 
   // ---- 对话管理 ----
 
@@ -83,9 +205,11 @@ class AssistantService {
   static const _attachmentMaxChars = 8000;
 
   /// 把消息级附件引用展开为带引用头的正文块（[#note:标题] 等）。
-  /// 文件仅对文本类做正文抽取（截断），二进制只给名称与 mime。
-  Future<List<ChatAttachment>> expandAttachments(
-      List<ChatAttachment> refs) async {
+  /// 文本类文件做正文抽取（截断）；图片文件在 [visionCapable] 时内联
+  /// 缩放后的 PNG（[ChatAttachment.dataBase64]），否则只在头部声明
+  /// 「未附带图像内容」——避免非多模态模型误以为能看图。
+  Future<List<ChatAttachment>> expandAttachments(List<ChatAttachment> refs,
+      {bool visionCapable = false}) async {
     final db = AppDatabase.instance;
     final out = <ChatAttachment>[];
     for (final ref in refs) {
@@ -111,7 +235,21 @@ class AssistantService {
           if (file == null) break;
           var header = '[#file:${file.name}]（${file.mimeType ?? '未知类型'}）';
           final mime = file.mimeType ?? '';
-          if ((mime.startsWith('text/') || mime.endsWith('json')) &&
+          String? dataBase64;
+          if (mime.startsWith('image/')) {
+            if (visionCapable) {
+              final inline = await encodeInlineImage(file.localPath);
+              if (inline != null) {
+                dataBase64 = inline.dataBase64;
+                header =
+                    '$header\n[图像已内联：${inline.width}×${inline.height} PNG]';
+              } else {
+                header = '$header\n（图像读取失败，未附带图像内容）';
+              }
+            } else {
+              header = '$header\n（当前模型不支持图像输入，未附带图像内容）';
+            }
+          } else if ((mime.startsWith('text/') || mime.endsWith('json')) &&
               (file.size ?? 0) < 256 * 1024) {
             try {
               final text = await File(file.localPath).readAsString();
@@ -121,7 +259,13 @@ class AssistantService {
             }
           }
           out.add(ChatAttachment(
-              type: ref.type, id: ref.id, content: _cap(header)));
+            type: ref.type,
+            id: ref.id,
+            content: _cap(header),
+            // dataBase64 固定是 PNG 重编码产物，mimeType 描述的是它而非原文件
+            mimeType: dataBase64 != null ? 'image/png' : null,
+            dataBase64: dataBase64,
+          ));
       }
     }
     return out;
@@ -131,20 +275,137 @@ class AssistantService {
       ? '${text.substring(0, _attachmentMaxChars)}…（已截断）'
       : text;
 
-  // ---- 一轮对话 ----
+  // ---- 回合发起 / 取消 ----
 
-  /// 发送用户消息并跑一轮助理回复。
-  ///
-  /// 流程：落用户消息（首条消息生成对话标题）→ 建 streaming 状态的
-  /// assistant 占位消息 → 组装请求 → 流式消费 → 文本增量上屏、
-  /// 工具块落提案/回注 → 结束时把可见文本与状态写回 assistant 消息。
-  ///
-  /// [conversation] 以调用时刻的快照为准（modelConfigId 取自它）。
+  /// 兼容旧调用（测试与 chat_page 之外的消费方）：
+  /// 启动回合并以流形式返回事件。
   Stream<AssistantEvent> sendTurn({
     required Conversation conversation,
     required String text,
     List<ChatAttachment> attachments = const [],
-  }) async* {
+  }) =>
+      startTurn(
+              conversation: conversation,
+              text: text,
+              attachments: attachments)
+          .events;
+
+  /// 发起一个回合（立即返回 handle，pump 后台自持）。
+  /// 同对话已有在途回合时先取消（重试/编辑/连点发送的兜底）。
+  AssistantTurnHandle startTurn({
+    required Conversation conversation,
+    required String text,
+    List<ChatAttachment> attachments = const [],
+  }) {
+    cancelTurn(conversation.id);
+    final handle = AssistantTurnHandle._(
+        conversation: conversation, text: text, attachments: attachments)
+      ..channel = _newChannel();
+    // 阶段变化同步通知（对话列表指示：思考中 → 回复中 → 工具执行中）
+    handle.phase.addListener(() => turnsVersion.value++);
+    activeTurns[conversation.id] = handle;
+    turnsVersion.value++;
+    unawaited(_runTurn(handle));
+    return handle;
+  }
+
+  /// 取消指定对话的在途回合（无则静默）。
+  void cancelTurn(String conversationId) {
+    final handle = activeTurns[conversationId];
+    if (handle == null) return;
+    handle.channel.cancelActive();
+  }
+
+  /// 中断全部在途回合（旧 API；未闭合工具块丢弃，已落库提案保留）。
+  void cancelActive() {
+    for (final h in activeTurns.values) {
+      h.channel.cancelActive();
+    }
+  }
+
+  @visibleForTesting
+  void debugReset() {
+    cancelActive();
+    for (final h in activeTurns.values) {
+      h._close();
+    }
+    activeTurns.clear();
+    turnsVersion.value++;
+  }
+
+  // ---- 消息操作：重试 / 编辑 / 撤回（2026-11-01） ----
+
+  /// 重试一条 assistant 回复：删除自触发它的用户消息起的全部后续消息
+  /// （pending 提案一并撤销），用原用户消息内容/附件重跑回合。
+  Future<AssistantTurnHandle?> retryAssistantMessage(
+      Conversation conversation, String assistantMessageId) async {
+    final db = AppDatabase.instance;
+    final messages = await db.getChatMessages(conversation.id);
+    final idx = messages.indexWhere((m) => m.id == assistantMessageId);
+    if (idx < 0) return null;
+    ChatMessage? userMsg;
+    for (var i = idx - 1; i >= 0; i--) {
+      if (messages[i].role == ChatRole.user) {
+        userMsg = messages[i];
+        break;
+      }
+    }
+    if (userMsg == null) return null;
+    await _truncateFrom(conversation.id, userMsg.id);
+    return startTurn(
+        conversation: conversation,
+        text: userMsg.content,
+        attachments: userMsg.attachments);
+  }
+
+  /// 编辑用户消息：删除该消息及后续（pending 提案撤销），用新文本
+  /// （沿用原附件）重跑回合。
+  Future<AssistantTurnHandle?> editUserMessage(
+      Conversation conversation, String messageId, String newText) async {
+    final db = AppDatabase.instance;
+    final messages = await db.getChatMessages(conversation.id);
+    final idx = messages.indexWhere((m) => m.id == messageId);
+    if (idx < 0 || messages[idx].role != ChatRole.user) return null;
+    final original = messages[idx];
+    await _truncateFrom(conversation.id, messageId);
+    return startTurn(
+        conversation: conversation,
+        text: newText,
+        attachments: original.attachments);
+  }
+
+  /// 撤回用户消息：删除该消息及后续（pending 提案撤销），不重跑。
+  Future<void> recallUserMessage(
+          Conversation conversation, String messageId) =>
+      _truncateFrom(conversation.id, messageId);
+
+  /// 截断：删除自 [messageId]（含）起的全部消息；这些消息里 assistant
+  /// 批次产出的 pending 提案一并置 rejected（applied 的走撤销队列，
+  /// 不在此处回滚）。
+  Future<void> _truncateFrom(String conversationId, String messageId) async {
+    final db = AppDatabase.instance;
+    final messages = await db.getChatMessages(conversationId);
+    final idx = messages.indexWhere((m) => m.id == messageId);
+    if (idx < 0) return;
+    final doomed = messages.sublist(idx);
+    final batchIds = [
+      for (final m in doomed)
+        if (m.role == ChatRole.assistant) m.id,
+    ];
+    if (batchIds.isNotEmpty) {
+      await db.rejectPendingProposalsByBatchIds(batchIds);
+    }
+    await db.deleteChatMessages([for (final m in doomed) m.id]);
+    await db.touchConversation(conversationId);
+  }
+
+  // ---- 回合 pump（服务自持） ----
+
+  /// 执行一个回合：落用户消息（首条消息生成对话标题）→ 建 streaming 状态的
+  /// assistant 占位消息 → 组装请求 → 流式消费 → 文本增量、工具块落提案/回注 →
+  /// 结束时把可见文本与状态写回 assistant 消息。全程事件经 [handle._emit] 广播。
+  Future<void> _runTurn(AssistantTurnHandle handle) async {
+    final conversation = handle.conversation;
     final db = AppDatabase.instance;
     final now = DateTime.now().millisecondsSinceEpoch;
 
@@ -152,15 +413,15 @@ class AssistantService {
       id: _uuid.v4(),
       conversationId: conversation.id,
       role: ChatRole.user,
-      content: text,
-      attachments: attachments,
+      content: handle.text,
+      attachments: handle.attachments,
       status: ChatMessageStatus.done,
       createdAt: now,
     );
     await db.insertChatMessage(userMsg);
     // 首条用户消息截断生成对话标题（design-v3 §1.4）
     if (conversation.title == '新对话') {
-      final title = text.trim();
+      final title = handle.text.trim();
       await db.renameConversation(
           conversation.id,
           title.length > 20 ? '${title.substring(0, 20)}…' : title);
@@ -176,6 +437,8 @@ class AssistantService {
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
     await db.insertChatMessage(assistantMsg);
+    // 用户消息与占位已落库：让对话页立即刷新上屏（不等首个 token）
+    handle._emit(const AssistantTurnStarted());
 
     // 请求消息序列：说明书前言（schema 的 role 枚举无 system，前言作为
     // 首条 user 消息注入，details §2.4 说明书由 mobile 组装）+ 历史
@@ -194,12 +457,22 @@ class AssistantService {
           content: '[系统说明]\n${buildToolSpecPrompt(DateTime.now())}'),
       ...history,
     ];
-    final expanded = await expandAttachments(attachments);
+    final vision = await handle.channel.isVisionCapable(conversation.modelConfigId);
+    final expanded =
+        await expandAttachments(handle.attachments, visionCapable: vision);
 
+    final thinkParser = ThinkTagParser();
     final parser = ToolBlockParser();
     final visible = StringBuffer();
     var interrupted = false;
     String? errorText;
+
+    /// 已播报「开始流入」的工具块序号（parser 只在块闭合时产出块，
+    /// 开始状态靠 inBlock + blockCount 组合探测）。
+    int announcedBlockStart = -1;
+
+    /// 闭包产出的事件中转队列（每回合独立，并行回合互不串扰）。
+    final pendingEvents = <AssistantEvent>[];
 
     Future<void> handleBlock(ParsedToolBlock block) async {
       final outcome = await ProposalService.instance.handleToolBlock(
@@ -209,24 +482,23 @@ class AssistantService {
       );
       switch (outcome) {
         case ProposalCreated():
-          // 事件在下方 yield（闭包无法 yield，用队列中转）
-          _pendingEvents.add(AssistantProposalCreated(outcome.proposal));
+          pendingEvents.add(AssistantProposalCreated(outcome.proposal));
         case ProposalDuplicate():
           break; // 重放命中去重键：跳过
         case ProposalValidationFailure():
           final content = '一个动作未能理解，已跳过：${outcome.reason}';
           await ProposalExecutor.instance
               .reportToolMessage(conversation.id, content);
-          _pendingEvents.add(AssistantToolMessage(content));
+          pendingEvents.add(AssistantToolMessage(block.index, content));
         case ReadToolResult():
           await ProposalExecutor.instance
               .reportToolMessage(conversation.id, outcome.text);
-          _pendingEvents.add(AssistantToolMessage(outcome.text));
+          pendingEvents.add(AssistantToolMessage(block.index, outcome.text));
       }
     }
 
     try {
-      await for (final ev in client.chat(
+      await for (final ev in handle.channel.chat(
         conversationId: conversation.id,
         messages: requestMessages,
         attachments: expanded,
@@ -234,10 +506,21 @@ class AssistantService {
       )) {
         switch (ev) {
           case ChatTokenDelta():
-            final res = parser.feed(ev.delta);
+            // 先剥思考块（<think> 标签），剩余文本再过工具块解析
+            final thinkRes = thinkParser.feed(ev.delta);
+            if (thinkRes.thinkingChanged || thinkRes.stateChanged) {
+              handle._emit(AssistantThinkingDelta(thinkParser.sectionIndex,
+                  thinkParser.sectionThinking, thinkParser.inThinking));
+            }
+            final res = parser.feed(thinkRes.text);
+            // 工具块开始流入：先出占位（闭合后由提案/回注事件落定状态）
+            if (parser.inBlock && parser.blockCount != announcedBlockStart) {
+              announcedBlockStart = parser.blockCount;
+              handle._emit(AssistantToolBlockStarted(parser.blockCount));
+            }
             if (res.text.isNotEmpty) {
               visible.write(res.text);
-              yield AssistantTextDelta(res.text, visible.toString());
+              handle._emit(AssistantTextDelta(res.text, visible.toString()));
             }
             for (final block in res.blocks) {
               await handleBlock(block);
@@ -251,8 +534,8 @@ class AssistantService {
             errorText = ev.error;
         }
         // 中转闭包产出的事件
-        while (_pendingEvents.isNotEmpty) {
-          yield _pendingEvents.removeAt(0);
+        while (pendingEvents.isNotEmpty) {
+          handle._emit(pendingEvents.removeAt(0));
         }
         if (errorText != null) break;
       }
@@ -260,36 +543,50 @@ class AssistantService {
       errorText = '$e';
     }
 
-    // 流收尾：未闭合块整体丢弃（details §2.2），尾行文本仍上屏
+    // 流收尾：先冲思考解析器的暂存（标签前缀残段按普通内容落出），
+    // 未闭合工具块整体丢弃（details §2.2），尾行文本仍上屏
+    final thinkTail = thinkParser.finish();
+    if (thinkTail.thinkingChanged || thinkTail.stateChanged) {
+      handle._emit(AssistantThinkingDelta(
+          thinkParser.sectionIndex, thinkParser.sectionThinking, false));
+    }
+    final toolTail = parser.feed(thinkTail.text);
+    if (toolTail.text.isNotEmpty) {
+      visible.write(toolTail.text);
+      handle._emit(AssistantTextDelta(toolTail.text, visible.toString()));
+    }
+    for (final block in toolTail.blocks) {
+      await handleBlock(block);
+    }
     final tail = parser.finish(interrupted: interrupted || errorText != null);
     if (tail.text.isNotEmpty) {
       visible.write(tail.text);
-      yield AssistantTextDelta(tail.text, visible.toString());
+      handle._emit(AssistantTextDelta(tail.text, visible.toString()));
     }
     for (final block in tail.blocks) {
       await handleBlock(block);
     }
-    while (_pendingEvents.isNotEmpty) {
-      yield _pendingEvents.removeAt(0);
+    while (pendingEvents.isNotEmpty) {
+      handle._emit(pendingEvents.removeAt(0));
     }
 
     if (errorText != null) {
       await db.updateChatMessageContent(assistantMsg.id, visible.toString());
       await db.updateChatMessageStatus(
           assistantMsg.id, ChatMessageStatus.error);
-      yield AssistantTurnError(errorText);
-      return;
+      handle._emit(AssistantTurnError(errorText));
+    } else {
+      await db.updateChatMessageContent(assistantMsg.id, visible.toString());
+      await db.updateChatMessageStatus(
+          assistantMsg.id, ChatMessageStatus.done);
+      handle._emit(const AssistantTurnDone());
     }
-    await db.updateChatMessageContent(assistantMsg.id, visible.toString());
-    await db.updateChatMessageStatus(assistantMsg.id, ChatMessageStatus.done);
-    yield const AssistantTurnDone();
+
+    // 回合收尾：移出在途表并通知（对话列表状态指示熄灭）
+    if (activeTurns[conversation.id] == handle) {
+      activeTurns.remove(conversation.id);
+    }
+    turnsVersion.value++;
+    handle._close();
   }
-
-  final List<AssistantEvent> _pendingEvents = [];
-
-  /// 中断在途回合（未闭合工具块丢弃，已落库提案保留）。
-  void cancelActive() => client.cancelActive();
-
-  @visibleForTesting
-  void debugReset() => _pendingEvents.clear();
 }

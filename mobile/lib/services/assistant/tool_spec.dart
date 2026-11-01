@@ -191,6 +191,8 @@ String buildToolSpecPrompt(DateTime now) {
     ..writeln('{"tool":"task.create","args":{"title":"买菜"}}')
     ..writeln('```')
     ..writeln('普通回复文本与工具块可任意交错；一个回合允许输出多个块。')
+    ..writeln('推理过程可用 <think>...</think> 标签包裹（不会展示为正文）；'
+        '一个回合中思考与正文可多次交替。')
     ..writeln()
     ..writeln('## 纪律（必须遵守）')
     ..writeln('1. 原子化：一个工具块只表达一个最小变更；做多件事就输出多个块。')

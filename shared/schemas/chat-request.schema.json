@@ -59,7 +59,15 @@
           "id": { "type": "string", "format": "uuid" },
           "content": {
             "type": "string",
-            "description": "展开后的正文内容（笔记/消息正文、文件文本抽取），带 [#note:标题] 类引用头，供 AI 引用定位"
+            "description": "展开后的正文内容（笔记/消息正文、文件文本抽取），带 [#note:标题] 类引用头，供 AI 引用定位；图片附件为图片说明头"
+          },
+          "mimeType": {
+            "type": "string",
+            "description": "文件附件的 MIME 类型（图片附件必有，如 image/png）。可选"
+          },
+          "dataBase64": {
+            "type": "string",
+            "description": "图片附件的内联图像数据（base64，PNG，手机端已按多模态输入缩放）。仅当目标模型声明 vision=true 时附带。可选"
           }
         }
       },

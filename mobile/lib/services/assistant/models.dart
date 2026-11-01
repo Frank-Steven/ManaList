@@ -95,23 +95,41 @@ class ChatAttachmentType {
 
 /// 对话附件。content 为 null 时仅是库实体引用（消息级 attachments）；
 /// 非 null 为展开后的正文块（请求顶层 attachments，带 [#note:标题] 引用头）。
+/// 图片附件（vision 模型）额外携带缩放后的内联图像（[dataBase64]，PNG）。
 class ChatAttachment {
   final String type;
   final String id;
   final String? content;
 
-  const ChatAttachment({required this.type, required this.id, this.content});
+  /// 文件附件的 MIME 类型（图片附件展开时写入，如 image/png）。
+  final String? mimeType;
+
+  /// 图片附件的内联图像（base64 PNG，已按多模态输入缩放）；
+  /// 仅当目标模型声明 vision=true 时填充。
+  final String? dataBase64;
+
+  const ChatAttachment({
+    required this.type,
+    required this.id,
+    this.content,
+    this.mimeType,
+    this.dataBase64,
+  });
 
   factory ChatAttachment.fromJson(Map<String, dynamic> json) => ChatAttachment(
         type: json['type'] as String,
         id: json['id'] as String,
         content: json['content'] as String?,
+        mimeType: json['mimeType'] as String?,
+        dataBase64: json['dataBase64'] as String?,
       );
 
   Map<String, dynamic> toJson() => {
         'type': type,
         'id': id,
         if (content != null) 'content': content,
+        if (mimeType != null) 'mimeType': mimeType,
+        if (dataBase64 != null) 'dataBase64': dataBase64,
       };
 }
 

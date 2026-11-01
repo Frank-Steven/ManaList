@@ -70,6 +70,10 @@ export interface ChatAttachment {
   type: "note" | "message" | "file";
   id: string;
   content: string;
+  /** 文件附件的 MIME 类型（图片附件必有，如 image/png） */
+  mimeType?: string;
+  /** 图片附件的内联图像数据（base64，PNG）；仅 vision 模型附带 */
+  dataBase64?: string;
 }
 
 export interface ChatRequest {
@@ -110,4 +114,6 @@ export interface ModelConfig {
   model: string;
   /** API key 所在环境变量名，不直接存密钥 */
   apiKeyEnv?: string;
+  /** 模型是否支持图像输入（多模态）；缺省 false */
+  vision?: boolean;
 }

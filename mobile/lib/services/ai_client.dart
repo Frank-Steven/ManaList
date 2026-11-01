@@ -49,6 +49,10 @@ class AiEndpoint {
   final String model;
   final bool isDesktop;
 
+  /// 该端点的模型是否支持图像输入（多模态）；true 时图片附件以
+  /// content parts 内联发送，false 时只给文字声明（避免端点报错）。
+  final bool vision;
+
   const AiEndpoint({
     required this.id,
     required this.name,
@@ -56,6 +60,7 @@ class AiEndpoint {
     this.apiKey = '',
     this.model = '',
     this.isDesktop = false,
+    this.vision = false,
   });
 
   factory AiEndpoint.fromJson(Map<String, dynamic> json) => AiEndpoint(
@@ -64,6 +69,7 @@ class AiEndpoint {
         baseUrl: json['baseUrl'] as String? ?? '',
         apiKey: json['apiKey'] as String? ?? '',
         model: json['model'] as String? ?? '',
+        vision: json['vision'] as bool? ?? false,
       );
 
   Map<String, dynamic> toJson() => {
@@ -72,6 +78,7 @@ class AiEndpoint {
         'baseUrl': baseUrl,
         'apiKey': apiKey,
         'model': model,
+        'vision': vision,
       };
 
   AiEndpoint copyWith({
@@ -79,6 +86,7 @@ class AiEndpoint {
     String? baseUrl,
     String? apiKey,
     String? model,
+    bool? vision,
   }) =>
       AiEndpoint(
         id: id,
@@ -87,6 +95,7 @@ class AiEndpoint {
         apiKey: apiKey ?? this.apiKey,
         model: model ?? this.model,
         isDesktop: isDesktop,
+        vision: vision ?? this.vision,
       );
 }
 

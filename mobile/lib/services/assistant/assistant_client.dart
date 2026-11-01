@@ -1,10 +1,61 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../ai_client.dart';
 import 'models.dart';
+
+/// 组装远程（OpenAI 兼容）通道的消息序列（纯函数，便于单测）：
+/// - [attachments] 非空时前置一条附件上下文 user 消息：含内联图像
+///   （dataBase64）且 [vision] 时用 content parts（text + 逐图 image_url
+///   data URL），否则纯文本——非 vision 模型附带图像会被端点拒绝；
+/// - tool 角色折叠为带前缀的 user 消息。
+/// 与 desktop buildProviderMessages（server.ts）的组装规则保持一致。
+@visibleForTesting
+List<Map<String, dynamic>> buildRemoteMessages(
+  List<ChatMessageModel> messages, {
+  List<ChatAttachment> attachments = const [],
+  bool vision = false,
+}) {
+  final out = <Map<String, dynamic>>[];
+  if (attachments.isNotEmpty) {
+    final blocks = attachments.map((a) => a.content).join('\n\n');
+    final intro = '以下是与本次对话相关的库内容（供引用定位）：\n\n$blocks';
+    final images = vision
+        ? attachments
+            .where((a) => a.dataBase64 != null && a.dataBase64!.isNotEmpty)
+            .toList()
+        : const <ChatAttachment>[];
+    if (images.isEmpty) {
+      out.add({'role': 'user', 'content': intro});
+    } else {
+      out.add({
+        'role': 'user',
+        'content': [
+          {'type': 'text', 'text': intro},
+          for (final a in images)
+            {
+              'type': 'image_url',
+              'image_url': {
+                'url':
+                    'data:${a.mimeType ?? 'image/png'};base64,${a.dataBase64}',
+              },
+            },
+        ],
+      });
+    }
+  }
+  for (final m in messages) {
+    if (m.role == ChatRole.tool) {
+      out.add({'role': 'user', 'content': '[工具执行结果]\n${m.content}'});
+    } else {
+      out.add({'role': m.role, 'content': m.content});
+    }
+  }
+  return out;
+}
 
 /// desktop `GET /v1/models` 返回的一个模型条目（design-v3 §6.2）。
 class DesktopModelEntry {
@@ -16,12 +67,16 @@ class DesktopModelEntry {
   /// 连通性探测结果；null = 尚未探测。
   final bool? reachable;
 
+  /// 是否支持图像输入（多模态，model-config.schema 的 vision，缺省 false）。
+  final bool vision;
+
   const DesktopModelEntry({
     required this.id,
     required this.name,
     required this.provider,
     required this.model,
     this.reachable,
+    this.vision = false,
   });
 
   factory DesktopModelEntry.fromJson(Map<String, dynamic> json) =>
@@ -31,6 +86,7 @@ class DesktopModelEntry {
         provider: json['provider'] as String? ?? ModelProvider.openaiCompat,
         model: json['model'] as String? ?? '',
         reachable: json['reachable'] as bool?,
+        vision: json['vision'] as bool? ?? false,
       );
 }
 
@@ -78,6 +134,8 @@ class AssistantClient {
   /// 测试注入：替换底层 client / 复位取消标记。
   void debugReset() {
     _cancelled = false;
+    _modelsCache = null;
+    _modelsCacheAt = null;
     closeClient();
   }
 
@@ -108,6 +166,49 @@ class AssistantClient {
     return (models: models, defaultModelId: data['defaultModelId'] as String?);
   }
 
+  /// /v1/models 结果缓存（isVisionCapable 用）：60s TTL，
+  /// 避免每个对话回合都多发一次请求。
+  ({List<DesktopModelEntry> models, String? defaultModelId})? _modelsCache;
+  DateTime? _modelsCacheAt;
+
+  /// 目标模型是否支持图像输入（多模态）。路由顺序与 [chat] 一致：
+  /// 1. [modelConfigId] 命中远程端点 → 该端点的 vision 配置；
+  /// 2. 电脑端在线 → /v1/models 中目标模型（[modelConfigId] ?? 默认模型）的
+  ///    vision（结果缓存 60s）；
+  /// 3. 离线 → 默认远程端点的 vision。
+  /// 探测失败按 false 处理：不附带图像，但不阻断对话。
+  Future<bool> isVisionCapable(String? modelConfigId) async {
+    final ai = AiClient.instance;
+    try {
+      if (modelConfigId != null) {
+        for (final e in await ai.getRemoteEndpoints()) {
+          if (e.id == modelConfigId) return e.vision;
+        }
+      }
+      if (await ai.isDesktopOnline()) {
+        final cachedAt = _modelsCacheAt;
+        if (_modelsCache == null ||
+            cachedAt == null ||
+            DateTime.now().difference(cachedAt) >=
+                const Duration(seconds: 60)) {
+          _modelsCache = await getDesktopModels();
+          _modelsCacheAt = DateTime.now();
+        }
+        final cache = _modelsCache!;
+        final targetId = modelConfigId ?? cache.defaultModelId;
+        for (final m in cache.models) {
+          if (m.id == targetId) return m.vision;
+        }
+        return false;
+      }
+      final endpoint = await ai.defaultRemoteEndpoint();
+      return endpoint?.vision ?? false;
+    } catch (_) {
+      // 离线抖动 / 模型列表拉取失败等：按不支持处理
+      return false;
+    }
+  }
+
   // ---- 对话 ----
 
   /// 发起一轮对话，产出 ChatEvent 流（token_delta / done / error）。
@@ -128,7 +229,7 @@ class AssistantClient {
     if (modelConfigId != null) {
       for (final e in await ai.getRemoteEndpoints()) {
         if (e.id == modelConfigId) {
-          yield* _chatViaRemote(e, messages);
+          yield* _chatViaRemote(e, messages, attachments);
           return;
         }
       }
@@ -153,7 +254,7 @@ class AssistantClient {
       yield const ChatError('LinkModel 不在线且未配置远程 AI 接口（助理 → 模型配置）');
       return;
     }
-    yield* _chatViaRemote(endpoint, messages);
+    yield* _chatViaRemote(endpoint, messages, attachments);
   }
 
   // ---- 电脑端通道：POST /v1/chat，SSE（data: {...}） ----
@@ -231,8 +332,10 @@ class AssistantClient {
 
   // ---- 远程通道：OpenAI 兼容 /chat/completions，SSE 自行解析 ----
 
-  Stream<ChatEvent> _chatViaRemote(
-      AiEndpoint endpoint, List<ChatMessageModel> messages) async* {
+  /// [attachments] 为本轮展开后的附件上下文块；端点声明 vision 时
+  /// 内联图像以 content parts 发送，否则仅文本（组装见 buildRemoteMessages）。
+  Stream<ChatEvent> _chatViaRemote(AiEndpoint endpoint,
+      List<ChatMessageModel> messages, List<ChatAttachment> attachments) async* {
     final hint = AiClient.endpointConfigHint(endpoint.baseUrl);
     if (hint != null) {
       yield ChatError(hint);
@@ -248,15 +351,8 @@ class AssistantClient {
       'model': endpoint.model,
       'temperature': 0,
       'stream': true,
-      'messages': [
-        for (final m in messages)
-          // OpenAI 兼容端点支持 system；tool 角色折叠为带前缀的 user 消息
-          // （与 desktop buildProviderMessages 的折叠规则一致）
-          switch (m.role) {
-            ChatRole.tool => {'role': 'user', 'content': '[工具执行结果]\n${m.content}'},
-            _ => {'role': m.role, 'content': m.content},
-          },
-      ],
+      'messages': buildRemoteMessages(messages,
+          attachments: attachments, vision: endpoint.vision),
     });
 
     final client = _client;

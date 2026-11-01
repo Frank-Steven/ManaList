@@ -151,6 +151,35 @@ test("POST /v1/chat（mock）：SSE 逐条 token_delta，done 收尾", async () 
   assert.ok(!events.some((e) => e.type === "error"));
 });
 
+test("POST /v1/chat（mock）：图片附件 → content parts，回复带图像计数", async () => {
+  const res = await fetch(`${base}/v1/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...auth() },
+    body: JSON.stringify({
+      conversationId: "c-img",
+      messages: [{ role: "user", content: "这张图里有什么" }],
+      attachments: [
+        {
+          type: "file",
+          id: "f1",
+          content: "[#file:照片.png]（image/png）\n[图像已内联：640×480 PNG]",
+          mimeType: "image/png",
+          dataBase64: "aGVsbG8=", // 内容不解码，仅透传
+        },
+      ],
+      stream: true,
+    }),
+  });
+  assert.equal(res.status, 200);
+  const events = await readSse(res);
+  const full = events
+    .filter((e) => e.type === "token_delta")
+    .map((t) => (t as { delta: string }).delta)
+    .join("");
+  assert.match(full, /含 1 张图片/, "含 dataBase64 的附件应组装为图像块");
+  assert.deepEqual(events.at(-1), { type: "done" });
+});
+
 test("POST /v1/chat 缺省 modelConfigId 走默认模型", async () => {
   const res = await fetch(`${base}/v1/chat`, {
     method: "POST",

@@ -231,6 +231,19 @@ Future<void> migrateToV9(DatabaseExecutor db) async {
   }
 }
 
+/// v9 → v10 迁移：library_folders 表（空文件夹持久化，2026-11-01）。
+/// v9 的文件夹只由文件 folder 字段派生（虚拟），会话内新建的空文件夹
+/// 重启即丢；v10 起新建文件夹落表，列表/移动选择器派生时与文件
+/// folder 字段取并集（空文件夹删除 = 删表内行）。
+Future<void> migrateToV10(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS library_folders(
+      path TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL
+    )
+  ''');
+}
+
 /// 批量入库的分块大小：SQLite 的绑定变量上限（老版本 999），留足余量。
 const int kMessageHashLookupChunk = 400;
 
@@ -378,7 +391,7 @@ class AppDatabase {
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'msgrepo.db'),
-      version: 9,
+      version: 10,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -416,6 +429,10 @@ class AppDatabase {
     if (oldVersion < 9) {
       // v9：files.folder（虚拟文件夹）+ conversations.draft_attachments（草稿附件）。
       await migrateToV9(db);
+    }
+    if (oldVersion < 10) {
+      // v10：library_folders（空文件夹持久化）。
+      await migrateToV10(db);
     }
   }
 
@@ -499,6 +516,8 @@ class AppDatabase {
     ''');
     await _createV4Tables(db);
     await createV8Tables(db);
+    // v10 起初始建库直接带上 library_folders（与老库升级链收敛）
+    await migrateToV10(db);
   }
 
   /// v2 数据层建表（设计 §1.1 messages、§1.2 tasks、§1.3 笔记三级）。
@@ -1493,12 +1512,76 @@ class AppDatabase {
     return rows.map(LibraryFile.fromRow).toList();
   }
 
+  /// 某个文件夹及其全部后代文件夹下的文件（2026-11-01 文件夹整选用）。
+  Future<List<LibraryFile>> getFilesUnderFolder(String folder) async {
+    if (folder.isEmpty) return getFiles();
+    final db = await database;
+    final rows = await db.query('files',
+        where: 'folder = ? OR folder LIKE ?',
+        whereArgs: [folder, '$folder/%'],
+        orderBy: 'created_at DESC');
+    return rows.map(LibraryFile.fromRow).toList();
+  }
+
   /// 全部非空文件夹路径（去重，按字典序；文件夹是虚拟的，由文件 folder 字段派生）。
   Future<List<String>> getFileFolders() async {
     final db = await database;
     final rows = await db.rawQuery(
         "SELECT DISTINCT folder FROM files WHERE folder != '' ORDER BY folder ASC");
     return [for (final r in rows) r['folder'] as String];
+  }
+
+  // ---- v10：library_folders（空文件夹持久化） ----
+
+  /// 持久化的文件夹路径（含空文件夹），按字典序。
+  Future<List<String>> getLibraryFolders() async {
+    final db = await database;
+    final rows = await db.query('library_folders', orderBy: 'path ASC');
+    return [for (final r in rows) r['path'] as String];
+  }
+
+  /// 新建文件夹落表（含祖先路径一并补齐，幂等）。
+  Future<void> insertLibraryFolder(String path) async {
+    if (path.isEmpty) return;
+    final db = await database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    var cur = path;
+    while (cur.isNotEmpty) {
+      await db.insert('library_folders', {'path': cur, 'created_at': now},
+          conflictAlgorithm: ConflictAlgorithm.ignore);
+      final i = cur.lastIndexOf('/');
+      cur = i < 0 ? '' : cur.substring(0, i);
+    }
+  }
+
+  /// 删除文件夹：删掉该路径及其全部后代（子文件夹跟随消失；
+  /// 其中文件由服务层先上移，不在此处理）。
+  Future<void> deleteLibraryFolderTree(String path) async {
+    if (path.isEmpty) return;
+    final db = await database;
+    await db.delete('library_folders',
+        where: 'path = ? OR path LIKE ?', whereArgs: [path, '$path/%']);
+  }
+
+  /// 文件夹重命名：整棵子树换前缀（与 files.folder 的换前缀同语义）。
+  Future<void> renameLibraryFolderTree(String from, String to) async {
+    if (from.isEmpty || from == to) return;
+    final db = await database;
+    final rows = await db.query('library_folders',
+        where: 'path = ? OR path LIKE ?', whereArgs: [from, '$from/%']);
+    for (final r in rows) {
+      final oldPath = r['path'] as String;
+      final newPath = '$to${oldPath.substring(from.length)}';
+      await db.delete('library_folders',
+          where: 'path = ?', whereArgs: [oldPath]);
+      await db.insert(
+          'library_folders',
+          {
+            'path': newPath,
+            'created_at': r['created_at'] as int,
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
   }
 
   /// 批量移动文件到目标文件夹（v9；'' = 根目录）。
@@ -1665,6 +1748,32 @@ class AppDatabase {
     final db = await database;
     await db.update('chat_messages', {'status': status},
         where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 按 id 批量删除消息（2026-11-01：编辑/撤回/重试的截断）。
+  Future<void> deleteChatMessages(List<String> ids) async {
+    if (ids.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(ids.length, '?').join(',');
+    await db.delete('chat_messages',
+        where: 'id IN ($placeholders)', whereArgs: ids);
+  }
+
+  /// 撤销这些 assistant 批次里仍 pending 的提案（编辑/撤回/重试联动，
+  /// 置 rejected 留痕；applied 的不动——回滚走撤销队列）。
+  Future<void> rejectPendingProposalsByBatchIds(List<String> batchIds) async {
+    if (batchIds.isEmpty) return;
+    final db = await database;
+    final placeholders = List.filled(batchIds.length, '?').join(',');
+    await db.update(
+      'change_proposals',
+      {
+        'status': 'rejected',
+        'resolved_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      where: "status = 'pending' AND batch_id IN ($placeholders)",
+      whereArgs: batchIds,
+    );
   }
 
   // ---- v8：变更提案（change_proposals，待确认区，design-v3 §1.4） ----
