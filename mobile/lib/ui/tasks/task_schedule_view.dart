@@ -150,8 +150,8 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 拖拽中中心点与手指保持同一相对位置，起手瞬间不跳。
   double _dragGrabDelta = 0;
 
-  /// 标题栏拖拽的计时与累计位移：短促拖拽（< 300ms 且 < 48px）视为点击
-  /// （用户意图是点标题栏切换，手指只是略有滑动）。
+  /// 标题栏拖拽的计时与累计位移：短促拖拽（< [_tapDragMaxMs]ms
+  static const _tapDragMaxMs = 2000;
   final _dragWatch = Stopwatch();
   double _dragAccum = 0;
   double _dragLastGlobalY = 0;
@@ -213,10 +213,11 @@ class TaskScheduleViewState extends State<TaskScheduleView>
         bottom - (globalY + _dragGrabDelta) + _barCollapsedH / 2, vp);
   }
 
-  /// 标题栏拖拽松手：短促拖拽（< 300ms 且累计位移 < 48px）视为点击，
-  /// 直接切换展开/收起；否则按松手位置吸附（见 [_barDragEnd]）。
+  /// 标题栏拖拽松手：短促拖拽（< [_tapDragMaxMs]ms 且累计位移
+  /// < [_tapDragMaxPx]px）视为点击，直接切换展开/收起；否则按松手位置
+  /// 吸附（见 [_barDragEnd]）。
   void _barHeaderDragEnd(double vp) {
-    if (_dragWatch.elapsedMilliseconds < 300 && _dragAccum < 48) {
+    if (_dragWatch.elapsedMilliseconds < _tapDragMaxMs) {
       _snapBarTo(!_barExpanded);
       return;
     }
