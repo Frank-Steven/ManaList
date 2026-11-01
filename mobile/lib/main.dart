@@ -13,7 +13,6 @@ import 'services/reminder_service.dart';
 import 'ui/assistant/conversations_page.dart';
 import 'ui/library/library_page.dart';
 import 'ui/settings_page.dart';
-import 'ui/splash_gate.dart';
 import 'ui/tasks/tasks_page.dart';
 import 'ui/theme_fader.dart';
 import 'services/app_log.dart';
@@ -76,12 +75,14 @@ Future<void> main() async {
     debugPrint('主题/位置记忆读取失败: $e');
   }
 
-  // F15：重活（提醒初始化/重排、采集轮询）不再阻塞 runApp —— 交给 SplashGate 在
-  // 「图标淡入」的启动页背后跑，用户看到的是动画而不是白屏。
-  runApp(MsgRepoApp(bootstrap: _bootstrapColdStart()));
+  // 2026-11-01：Flutter 启动页移除，启动画面完全交给原生启动窗
+  // （windowBackground 底色+图标，引擎就绪前一直在屏）。重活（提醒初始化/
+  // 重排、采集轮询）后台跑，不阻塞 runApp，失败也不阻塞界面。
+  runApp(const MsgRepoApp());
+  unawaited(_bootstrapColdStart());
 }
 
-/// 冷启动的初始化（F15 后移到 runApp 之后执行，失败也不阻塞界面）。
+/// 冷启动的初始化（runApp 之后后台执行，失败也不阻塞界面）。
 Future<void> _bootstrapColdStart() async {
   try {
     await ReminderService.instance.init();
@@ -157,10 +158,7 @@ final ThemeData _darkTheme = ThemeData(
 );
 
 class MsgRepoApp extends StatelessWidget {
-  const MsgRepoApp({super.key, required this.bootstrap});
-
-  /// 冷启动初始化（在启动页背后执行，见 [SplashGate]）。
-  final Future<void> bootstrap;
+  const MsgRepoApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -180,7 +178,7 @@ class MsgRepoApp extends StatelessWidget {
             themeAnimationDuration: Duration.zero,
             builder: (context, child) =>
                 ThemeFader(child: child ?? const SizedBox.shrink()),
-            home: SplashGate(bootstrap: bootstrap, child: const HomeShell()),
+            home: const HomeShell(),
         );
       },
     );

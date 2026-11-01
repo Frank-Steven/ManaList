@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- 2026-10-28：启动底色跟随深浅模式（取代 B07/Q13② 的统一品牌蓝）。
-         浅色档 #FAFAFA，与 mobile/lib/ui/splash_gate.dart 的 splashBackgroundLight 一致；
-         深色档在 values-night/colors.xml。改一处必须同步另一处（含 Dart 常量）。 -->
+         浅色档 #FAFAFA；深色档在 values-night/colors.xml。改一处必须同步另一处。
+         2026-11-01：Flutter 启动页已移除，启动画面完全由原生启动窗
+         （launch_background）构成，不再需要和 Dart 侧常量对齐。 -->
     <color name="splash_bg">#FAFAFA</color>
 
     <!-- B06：adaptive icon 背景层（取自品牌图自身底色 #F7F3FF，避免遮罩后露出白框） -->

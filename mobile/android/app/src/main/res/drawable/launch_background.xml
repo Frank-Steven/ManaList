@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 启动窗：品牌底色 + 居中 116dp 图标（2026-11-01 起原生直显，
-     取代 Q13-A 的纯底色——用户要求一点开应用就看到启动画面）。
+<!-- 启动窗：品牌底色 + 居中 88dp 图标（2026-11-01：Flutter 启动页已移除，
+     启动画面完全由此构成，引擎就绪、首帧画出即进入主界面）。
      Manifest 的 io.flutter.embedding.android.SplashScreenDrawable
-     也指向本文件，引擎初始化期间由它继续铺同一画面，
-     Flutter 首帧（splash_gate.dart）同位置同尺寸接力，全程无闪烁。 -->
+     也指向本文件，引擎初始化期间由它持续铺同一画面。 -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/splash_bg" />
     <item android:drawable="@drawable/splash_icon_centered" />
