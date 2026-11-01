@@ -263,6 +263,20 @@ class FilesPageState extends State<FilesPage> {
     return n == files.length ? 2 : 1;
   }
 
+  /// 文件夹长按：进入多选并整选该文件夹（含后代全部文件）——
+  /// 与文件长按进多选同一入口。修复（2026-11-01）：原先文件夹长按弹
+  /// 操作菜单，当本层只有文件夹、没有文件可长按时，根本进不了多选态，
+  /// 文件夹无法被选中。
+  void _startFolderSelection(String name) {
+    if (widget.pickMode) return;
+    final files = _subfolderFiles[name] ?? const [];
+    setState(() {
+      _selecting = true;
+      _selected.addAll(files.map((f) => f.id));
+    });
+    widget.onSelectionChanged?.call(true);
+  }
+
   void _toggleSelectFolder(String name) {
     final files = _subfolderFiles[name] ?? const [];
     if (files.isEmpty) return;
@@ -678,6 +692,15 @@ class FilesPageState extends State<FilesPage> {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
+              leading: const Icon(Icons.check_circle_outline),
+              title: const Text('选择'),
+              subtitle: const Text('进入多选并选中其中全部文件'),
+              onTap: () {
+                Navigator.of(sheetContext).pop();
+                _startFolderSelection(name);
+              },
+            ),
+            ListTile(
               leading: const Icon(Icons.drive_file_rename_outline),
               title: const Text('重命名文件夹'),
               onTap: () {
@@ -914,10 +937,15 @@ class FilesPageState extends State<FilesPage> {
               icon: const Icon(Icons.chevron_right),
               onPressed: () => _enterFolder(name),
             )
-          : const Icon(Icons.more_vert),
+          : IconButton(
+              tooltip: '更多',
+              icon: const Icon(Icons.more_vert),
+              onPressed: () => _showFolderActions(name),
+            ),
       onTap: () =>
           selectable ? _toggleSelectFolder(name) : _enterFolder(name),
-      onLongPress: selectable ? null : () => _showFolderActions(name),
+      onLongPress:
+          selectable ? null : () => _startFolderSelection(name),
     );
   }
 
@@ -936,7 +964,13 @@ class FilesPageState extends State<FilesPage> {
           '${libraryFileTypeLabel(file)} · ${_formatSize(file.size)} · ${_formatTime(file.createdAt)}',
           maxLines: 1,
           overflow: TextOverflow.ellipsis),
-      trailing: _selecting || pickUI ? null : const Icon(Icons.more_vert),
+      trailing: _selecting || pickUI
+          ? null
+          : IconButton(
+              tooltip: '更多',
+              icon: const Icon(Icons.more_vert),
+              onPressed: () => _showActions(file),
+            ),
       onTap: () {
         if (_selecting || pickUI) {
           _toggleSelect(file);
@@ -1001,7 +1035,7 @@ class FilesPageState extends State<FilesPage> {
         onTap: () =>
             selectable ? _toggleSelectFolder(name) : _enterFolder(name),
         onLongPress:
-            selectable ? null : () => _showFolderActions(name),
+            selectable ? null : () => _startFolderSelection(name),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -1042,6 +1076,13 @@ class FilesPageState extends State<FilesPage> {
                     GestureDetector(
                       onTap: () => _enterFolder(name),
                       child: Icon(Icons.chevron_right,
+                          size: 16, color: cs.onSurfaceVariant),
+                    )
+                  else
+                    // 非多选态：长按已用于进入多选，菜单入口放名称行尾
+                    GestureDetector(
+                      onTap: () => _showFolderActions(name),
+                      child: Icon(Icons.more_vert,
                           size: 16, color: cs.onSurfaceVariant),
                     ),
                 ],
