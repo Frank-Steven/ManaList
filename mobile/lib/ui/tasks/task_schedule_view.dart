@@ -133,35 +133,38 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   set _barExpanded(bool v) =>
       _barExpandedByGranularity[widget.granularity] = v;
 
-  /// 拖拽中的面板高度（null = 未拖拽，高度由 [_barExpanded] 推导）。
-  double? _dragBarH;
+  /// 面板展开度（0 = 收起，1 = 展开）——常驻控制器，**唯一的中间态载体**：
+  /// 拖拽中直接写 value（标题栏中心跟手），松手/点击 animateTo(0/1)。
+  /// 旧实现用「可空高度 + 一次性控制器」拼装，取消回调挂不上、动画被
+  /// Tab 切换的 TickerMode 打断时都会把面板留在中间高度；常驻控制器
+  /// 从结构上保证稳定态只有 0 和 1。
+  late final AnimationController _barCtrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 180),
+    value: _barExpanded ? 1.0 : 0.0,
+  );
 
   /// 起手时「标题栏中心 − 手指」的纵向差（全局坐标）：
   /// 拖拽中中心点与手指保持同一相对位置，起手瞬间不跳。
   double _dragGrabDelta = 0;
 
-  /// 松手后的吸附动画。
-  AnimationController? _barAnim;
-
-  /// 当前面板高度（拖拽中取 [_dragBarH]，否则按展开状态推导）。
+  /// 当前面板高度（由展开度插值，永不停留在中间稳定态）。
   double _barHeight(double vp) {
     final expandedH = vp * _barExpandedRatio;
-    final drag = _dragBarH;
-    if (drag != null) return drag.clamp(_barCollapsedH, expandedH);
-    return _barExpanded ? expandedH : _barCollapsedH;
+    return _barCollapsedH +
+        (expandedH - _barCollapsedH) * _barCtrl.value.clamp(0.0, 1.0);
   }
 
   void _barDragStart(double vp, double globalY) {
-    _barAnim?.stop();
-    final h = _barHeight(vp);
-    _dragBarH = h;
+    _barCtrl.stop();
     final box = _splitBox();
     if (box == null) {
       _dragGrabDelta = 0;
       return;
     }
     final bottom = box.localToGlobal(Offset(0, box.size.height)).dy;
-    _dragGrabDelta = (bottom - h + _barCollapsedH / 2) - globalY;
+    _dragGrabDelta =
+        (bottom - _barHeight(vp) + _barCollapsedH / 2) - globalY;
   }
 
   RenderBox? _splitBox() {
@@ -169,12 +172,20 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     return obj is RenderBox && obj.hasSize ? obj : null;
   }
 
+  /// 把目标高度换算成展开度写进控制器（clamp 到 [0,1]）。
+  void _barSetHeight(double h, double vp) {
+    final expandedH = vp * _barExpandedRatio;
+    final span = expandedH - _barCollapsedH;
+    if (span <= 0) return; // 视口异常矮时不做跟随，保持当前稳定态
+    _barCtrl.value = ((h - _barCollapsedH) / span).clamp(0.0, 1.0);
+  }
+
   /// 增量拖拽（列表滚到顶部继续下拉的 Overscroll 路径，无全局坐标）：
   /// [dy] 为手指纵向位移（正 = 向下，面板变矮）。
   void _barDragUpdate(double dy, double vp) {
     final expandedH = vp * _barExpandedRatio;
-    setState(() =>
-        _dragBarH = (_dragBarH! - dy).clamp(_barCollapsedH, expandedH));
+    final span = expandedH - _barCollapsedH;
+    _barCtrl.value = (_barCtrl.value - dy / span).clamp(0.0, 1.0);
   }
 
   /// 标题栏拖拽（有全局坐标）：面板标题栏中心跟随手指移动。
@@ -183,47 +194,20 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     final box = _splitBox();
     if (box == null) return;
     final bottom = box.localToGlobal(Offset(0, box.size.height)).dy;
-    final expandedH = vp * _barExpandedRatio;
-    final h = bottom - (globalY + _dragGrabDelta) + _barCollapsedH / 2;
-    setState(() => _dragBarH = h.clamp(_barCollapsedH, expandedH));
+    _barSetHeight(
+        bottom - (globalY + _dragGrabDelta) + _barCollapsedH / 2, vp);
   }
 
-  /// 松手：只看松手位置——面板顶边落在展开区域的上半（高度超过展开
-  /// 高度的一半）则吸附展开，否则收起；随后动画吸附到稳定态。
+  /// 松手：只看松手位置——展开度 ≥ 0.5 吸附展开，否则收起。
   void _barDragEnd(double vp) {
-    final expandedH = vp * _barExpandedRatio;
-    final h = _dragBarH ?? _barHeight(vp);
-    _snapBarTo(vp, h > expandedH / 2);
+    _snapBarTo(_barCtrl.value >= 0.5);
   }
 
-  /// 动画吸附到展开/收起稳定态（松手吸附与点击切换共用同一条路径，
-  /// 保证面板只有两种稳定状态，拖拽中间值永远不会停留）。
-  void _snapBarTo(double vp, bool expand) {
-    final expandedH = vp * _barExpandedRatio;
-    final target = expand ? expandedH : _barCollapsedH;
-    final h = _dragBarH ?? _barHeight(vp);
+  /// 动画吸附到展开/收起稳定态（松手吸附、取消吸附与点击切换共用同一条
+  /// 路径，保证面板只有两种稳定状态，拖拽中间值永远不会停留）。
+  void _snapBarTo(bool expand) {
     setState(() => _barExpanded = expand);
-    if ((h - target).abs() < 0.5) {
-      _dragBarH = null;
-      return;
-    }
-    _barAnim?.dispose();
-    final ctrl = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 180));
-    final anim = Tween(begin: h, end: target)
-        .animate(CurvedAnimation(parent: ctrl, curve: Curves.easeOut));
-    ctrl.addListener(() {
-      if (mounted) setState(() => _dragBarH = anim.value);
-    });
-    ctrl.addStatusListener((s) {
-      if (s == AnimationStatus.completed) {
-        setState(() => _dragBarH = null);
-        ctrl.dispose();
-        if (_barAnim == ctrl) _barAnim = null;
-      }
-    });
-    _barAnim = ctrl;
-    ctrl.forward();
+    _barCtrl.animateTo(expand ? 1.0 : 0.0, curve: Curves.easeOut);
   }
 
   @override
@@ -234,7 +218,7 @@ class TaskScheduleViewState extends State<TaskScheduleView>
 
   @override
   void dispose() {
-    _barAnim?.dispose();
+    _barCtrl.dispose();
     super.dispose();
   }
 
@@ -255,6 +239,8 @@ class TaskScheduleViewState extends State<TaskScheduleView>
       _selectedTask = null;
       _detailMode = false;
       _anchor = DateTime.now();
+      // 粒度各有记忆的面板状态：切换后同步控制器（瞬切，不做跨粒度动画）
+      _barCtrl.value = _barExpanded ? 1.0 : 0.0;
     });
   }
 
@@ -269,7 +255,6 @@ class TaskScheduleViewState extends State<TaskScheduleView>
           Expanded(flex: 2, child: _bottomSection(context, vp)),
         ]);
       }
-      final barH = _barHeight(vp);
       return KeyedSubtree(
         key: _splitKey,
         child: Column(children: [
@@ -306,19 +291,28 @@ class TaskScheduleViewState extends State<TaskScheduleView>
             if (n is OverscrollNotification &&
                 n.overscroll < 0 &&
                 n.metrics.axis == Axis.vertical) {
-              // 顶部继续下拉且面板还有高度可让：overscroll 为负，累减到面板高度
-              if (_barHeight(vp) > _barCollapsedH + 1) {
-                _dragBarH ??= _barHeight(vp);
+              // 顶部继续下拉且面板还有高度可让：overscroll 为负，累减展开度
+              if (_barCtrl.value > 0.001) {
                 _barDragUpdate(-n.overscroll, vp);
               }
-            } else if (n is ScrollEndNotification && _dragBarH != null) {
-              // 松手必须吸附（修复：旧守卫按高度拦截，拖到底时把
-              // ScrollEnd 一并挡掉，面板卡在 40px 的压缩中间态）
+            } else if (n is ScrollEndNotification &&
+                _barCtrl.value > 0 &&
+                _barCtrl.value < 1 &&
+                !_barCtrl.isAnimating) {
+              // 展开度停在 (0,1) 且没有吸附动画在进行 = 拖拽松手，必须吸附
+              //（普通列表滚动到底/到顶时展开度是 0 或 1，不会误触发）
               _barDragEnd(vp);
             }
             return false;
           },
-          child: SizedBox(height: barH, child: _bottomSection(context, vp)),
+          // 展开度驱动高度：拖拽/吸附动画经 AnimatedBuilder 逐帧重建
+          child: AnimatedBuilder(
+            animation: _barCtrl,
+            builder: (context, _) => SizedBox(
+              height: _barHeight(vp),
+              child: _bottomSection(context, vp),
+            ),
+          ),
         ),
       ]),
       );
@@ -560,6 +554,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     if (g != widget.granularity) {
       _pendingJump = true;
       widget.onSwitchGranularity?.call(g);
+    } else {
+      // 同粒度：面板动画展开（跨粒度的由 didUpdateWidget 同步控制器）
+      _barCtrl.animateTo(1.0, curve: Curves.easeOut);
     }
     _afterTwoFrames(() {
       switch (g) {
@@ -812,7 +809,8 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 展开态 = 详情模式 TaskDetailPanel（带返回按钮）或可视范围任务列表
   /// （选中行高亮，点击行进详情），内容滚到顶部后继续下拉 = 面板跟随手指收起。
   Widget _bottomSection(BuildContext context, double vp) {
-    if (!_barExpanded && _dragBarH == null) {
+    // 收起稳定态（展开度 0）只渲染标题行；吸附动画/拖拽中保持完整内容
+    if (_barCtrl.value <= 0) {
       return Column(children: [
         const Divider(height: 1),
         _dragHandleHeader(context, vp, _bottomTasks.length),
@@ -865,12 +863,14 @@ class TaskScheduleViewState extends State<TaskScheduleView>
                           task.id, () => GlobalKey()),
                       task: task,
                       selected: task.id == _selectedTask?.id,
-                      onTap: () => setState(() {
-                        // 详情需要列表区空间：若当前收起则顺手展开
-                        _barExpandedByGranularity[widget.granularity] = true;
-                        _selectedTask = task;
-                        _detailMode = true;
-                      }),
+                      onTap: () {
+                        // 详情需要列表区空间：若当前收起则顺手动画展开
+                        _snapBarTo(true);
+                        setState(() {
+                          _selectedTask = task;
+                          _detailMode = true;
+                        });
+                      },
                       onToggleDone: () => _toggleDone(task),
                       onShowSource: task.sourceMessageId == null
                           ? null
@@ -918,16 +918,17 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       // 两态都响应点击：收起态展开、展开态收起（吸附动画与拖拽松手同路径）
-      onTap: () => _snapBarTo(vp, !_barExpanded),
+      onTap: () => _snapBarTo(!_barExpanded),
       onVerticalDragStart:
           draggable ? (d) => _barDragStart(vp, d.globalPosition.dy) : null,
       onVerticalDragUpdate: draggable
           ? (d) => _barDragUpdateGlobal(d.globalPosition.dy, vp)
           : null,
       onVerticalDragEnd: draggable ? (d) => _barDragEnd(vp) : null,
-      // 手势被抢走（系统手势/多指）也要吸附回稳定态，不留中间高度
-      onVerticalDragCancel:
-          draggable && _dragBarH != null ? () => _barDragEnd(vp) : null,
+      // 手势被抢走（系统手势/多指）也要吸附回稳定态，不留中间高度。
+      // 无条件挂回调：旧实现按「拖拽中」在 build 时求值，拖拽起手没
+      // setState，回调压根挂不上——手势被取消后面板就停在中间高度
+      onVerticalDragCancel: draggable ? () => _barDragEnd(vp) : null,
       child: SizedBox(
         height: _barCollapsedH,
         child: Padding(
