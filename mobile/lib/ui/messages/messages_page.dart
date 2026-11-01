@@ -839,7 +839,8 @@ class MessagesPageState extends State<MessagesPage> {
 
   /// 单条消息行（多选 / 左滑 / 点开详情，能力与改动前一致）。
   /// pick 模式（附件选择）：点击即选中/取消，无左滑菜单、无需先长按进多选。
-  Widget _buildTile(Message m) {
+  /// [embedded] = 嵌在分组卡片里（不再是独立小卡，见 _buildSourceCard）。
+  Widget _buildTile(Message m, {bool embedded = false}) {
     final pickUI = widget.pickMode;
     return MessageTile(
       key: ValueKey(m.id),
@@ -847,6 +848,7 @@ class MessagesPageState extends State<MessagesPage> {
       selecting: pickUI || _selecting,
       selected: _selected.contains(m.id),
       swipeEnabled: !pickUI,
+      embedded: embedded,
       linkedTaskDone: _isLinkedDone(m),
       linkedTaskPriority: _linkedTaskPriority(m),
       linkedTaskCount: _linkedTaskIds(m).length,
@@ -937,6 +939,12 @@ class MessagesPageState extends State<MessagesPage> {
     );
   }
 
+  /// 嵌套卡片列表（2026-11-01 重构，替代「吸顶组头 + 独立消息小卡」）：
+  /// 一级来源 = 外层卡片（头行 + 消息行直接嵌在卡里）；
+  /// 聊天类来源的二级会话 = 内层嵌套卡片（更深底色、更窄圆角）。
+  /// 卡片内消息行间用发丝分隔线，「显示更多」收在卡片底部。
+  /// 组头不再吸顶（卡片是一个整体，吸顶会切断卡片视觉）；
+  /// 展开/折叠与整组选择的能力不变。
   Widget _buildList() {
     final sources = _sourceGroups;
     if (sources.isEmpty) {
@@ -949,77 +957,109 @@ class MessagesPageState extends State<MessagesPage> {
       );
     }
     final selectable = _selecting || widget.pickMode;
-    final slivers = <Widget>[];
-
-    /// 一组消息的分页 sliver：首屏 N 条 + 组尾「显示更多」。
-    void addPagedSliver(String groupKey, List<Message> all) {
-      final paged = _paged(groupKey, all);
-      final hasMore = all.length > paged.length;
-      slivers.add(SliverList.builder(
-        itemCount: paged.length + (hasMore ? 1 : 0),
-        itemBuilder: (context, i) => i < paged.length
-            ? _buildTile(paged[i])
-            : _buildLoadMore(groupKey, all.length),
-      ));
-    }
-
-    for (final s in sources) {
-      final sourceExpanded = _expandedSources.contains(s.key);
-      // 一级：来源应用。不用 pinned: 多个固定吸顶头挤在视口顶部会产生非法
-      // SliverGeometry（layoutExtent > paintExtent）导致整个视口不绘制。
-      slivers.add(SliverPersistentHeader(
-        delegate: _SourceHeaderDelegate(
-          sourceKey: s.key,
-          title: s.title,
-          count: s.count,
-          pendingCount: s.pendingCount,
-          expanded: sourceExpanded,
-          onToggle: () => setState(() {
-            if (!_expandedSources.remove(s.key)) _expandedSources.add(s.key);
-          }),
-          selectable: selectable,
-          selectState: _groupSelectState(s.messages),
-          onToggleSelect: () => _toggleSelectGroup(s.messages),
-          onLongPress: () => _startSelectionWithGroup(s.messages),
-        ),
-      ));
-      // 一级折叠：二级一个都不建（chat 与否都不用算）——这是避免 O(n²) 的关键
-      if (!sourceExpanded) continue;
-      if (!s.chat) {
-        // 非聊天类来源：不建二级，消息直接列在一级下面
-        addPagedSliver(s.key, s.messages);
-        continue;
-      }
-      // 二级：会话（仅聊天类来源），同样默认折叠
-      for (final c in _conversationGroupsOf(s)) {
-        final convExpanded = _expandedConversations.contains(c.key);
-        slivers.add(SliverPersistentHeader(
-          delegate: _ConversationHeaderDelegate(
-            conversationKey: c.key,
-            title: c.title,
-            count: c.count,
-            latestAt: c.latestAt,
-            pendingCount: c.pendingCount,
-            expanded: convExpanded,
-            onToggle: () => setState(() {
-              if (!_expandedConversations.remove(c.key)) {
-                _expandedConversations.add(c.key);
-              }
-            }),
-            selectable: selectable,
-            selectState: _groupSelectState(c.messages),
-            onToggleSelect: () => _toggleSelectGroup(c.messages),
-            onLongPress: () => _startSelectionWithGroup(c.messages),
-          ),
-        ));
-        if (convExpanded) addPagedSliver(c.key, c.messages);
-      }
-    }
-    slivers.add(const SliverToBoxAdapter(child: SizedBox(height: 80)));
-    return CustomScrollView(
+    return ListView.builder(
       physics: const AlwaysScrollableScrollPhysics(),
-      slivers: slivers,
+      padding: const EdgeInsets.only(bottom: 80),
+      itemCount: sources.length,
+      itemBuilder: (context, i) => _buildSourceCard(sources[i], selectable),
     );
+  }
+
+  /// 一级分组卡（来源应用）：头行 + （展开时）消息体 / 二级会话卡。
+  Widget _buildSourceCard(_SourceGroup s, bool selectable) {
+    final cs = Theme.of(context).colorScheme;
+    final expanded = _expandedSources.contains(s.key);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+      child: Material(
+        color: cs.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          children: [
+            _SourceGroupHeader(
+              packageName: s.key,
+              title: s.title,
+              count: s.count,
+              pendingCount: s.pendingCount,
+              expanded: expanded,
+              onToggle: () => setState(() {
+                if (!_expandedSources.remove(s.key)) {
+                  _expandedSources.add(s.key);
+                }
+              }),
+              selectable: selectable,
+              selectState: _groupSelectState(s.messages),
+              onToggleSelect: () => _toggleSelectGroup(s.messages),
+              onLongPress: () => _startSelectionWithGroup(s.messages),
+            ),
+            // 一级折叠：二级一个都不建（chat 与否都不用算）——这是避免 O(n²) 的关键
+            if (expanded)
+              if (!s.chat)
+                // 非聊天类来源：不建二级，消息直接嵌在一级卡片里
+                ..._groupBody(s.key, s.messages)
+              else
+                for (final c in _conversationGroupsOf(s))
+                  _buildConversationCard(c, selectable),
+            if (expanded && s.chat) const SizedBox(height: 4),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 二级嵌套卡（会话）：比一级更矮、底色更深，视觉上嵌在一级卡片内。
+  Widget _buildConversationCard(_ConversationGroup c, bool selectable) {
+    final cs = Theme.of(context).colorScheme;
+    final expanded = _expandedConversations.contains(c.key);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 4),
+      child: Material(
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(10),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          children: [
+            _ConversationGroupHeader(
+              title: c.title,
+              count: c.count,
+              latestAt: c.latestAt,
+              pendingCount: c.pendingCount,
+              expanded: expanded,
+              onToggle: () => setState(() {
+                if (!_expandedConversations.remove(c.key)) {
+                  _expandedConversations.add(c.key);
+                }
+              }),
+              selectable: selectable,
+              selectState: _groupSelectState(c.messages),
+              onToggleSelect: () => _toggleSelectGroup(c.messages),
+              onLongPress: () => _startSelectionWithGroup(c.messages),
+            ),
+            if (expanded) ..._groupBody(c.key, c.messages),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 卡片内的消息体：头行下发丝分隔线 + 分页消息行（行间缩进分隔线）
+  /// + 「显示更多」收尾。
+  List<Widget> _groupBody(String groupKey, List<Message> all) {
+    final paged = _paged(groupKey, all);
+    final hasMore = all.length > paged.length;
+    final out = <Widget>[const Divider(height: 1)];
+    for (var i = 0; i < paged.length; i++) {
+      if (i > 0) {
+        out.add(const Divider(height: 1, indent: 44, endIndent: 12));
+      }
+      out.add(_buildTile(paged[i], embedded: true));
+    }
+    if (hasMore) {
+      out.add(const Divider(height: 1, indent: 44, endIndent: 12));
+      out.add(_buildLoadMore(groupKey, all.length));
+    }
+    return out;
   }
 
   Widget _buildSelectionBar() {
@@ -1175,8 +1215,12 @@ class _ConversationGroup {
 
 /// F02 一级组头（来源应用）：单行「chevron + 应用名 …… N 条 · 未处理 M」，
 /// 字号比二级略大，作为层级锚点。
-class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
-  final String sourceKey;
+/// 一级分组头（来源应用，2026-11-01 嵌套卡片版）：应用图标 + 名称 +
+/// 「N 条 · 未处理 M」，整行点击 = 展开/折叠；多选态行首换三态勾选框，
+/// 点击 = 整组选择/取消，长按进入多选并选中整组。
+/// 作为一级卡片的头行渲染（无自身底色/外边距，容器由卡片提供）。
+class _SourceGroupHeader extends StatelessWidget {
+  final String packageName;
   final String title;
   final int count;
   final int pendingCount;
@@ -1191,8 +1235,8 @@ class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
   final VoidCallback onToggleSelect;
   final VoidCallback onLongPress;
 
-  const _SourceHeaderDelegate({
-    required this.sourceKey,
+  const _SourceGroupHeader({
+    required this.packageName,
     required this.title,
     required this.count,
     required this.pendingCount,
@@ -1204,78 +1248,48 @@ class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
     required this.onLongPress,
   });
 
-  /// 窄卡片：52 内容 + 上下各 3 边距。
-  static const double kHeight = 58;
-
   @override
-  double get minExtent => kHeight;
-
-  @override
-  double get maxExtent => kHeight;
-
-  @override
-  bool shouldRebuild(_SourceHeaderDelegate oldDelegate) =>
-      sourceKey != oldDelegate.sourceKey ||
-      title != oldDelegate.title ||
-      count != oldDelegate.count ||
-      pendingCount != oldDelegate.pendingCount ||
-      expanded != oldDelegate.expanded ||
-      selectable != oldDelegate.selectable ||
-      selectState != oldDelegate.selectState;
-
-  @override
-  Widget build(
-      BuildContext context, double shrinkOffset, bool overlapsContent) {
+  Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final meta = <String>['$count 条'];
     if (pendingCount > 0) meta.add('未处理 $pendingCount');
-    // 窄卡片分组头（2026-11-01）：整组内容视觉上收进一张圆角卡，
-    // 二级（会话）以更深的颜色嵌套在其内
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 3, 12, 3),
-      child: Material(
-        color: cs.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(12),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: selectable ? onToggleSelect : onToggle,
-          onLongPress: onLongPress,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            child: Row(
-              children: [
-                if (selectable)
-                  _GroupCheckbox(state: selectState)
-                else
-                  Icon(
-                    expanded ? Icons.expand_less : Icons.expand_more,
-                    size: 20,
-                    color: cs.onSurfaceVariant,
-                  ),
-                const SizedBox(width: 8),
-                // 分类后的应用图标收敛到组头（卡片里不再重复显示）
-                AppIcon(packageName: sourceKey, appName: title, size: 22),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
-                        color: cs.onSurface),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  meta.join(' · '),
-                  maxLines: 1,
-                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                ),
-              ],
+    return InkWell(
+      onTap: selectable ? onToggleSelect : onToggle,
+      onLongPress: onLongPress,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 13),
+        child: Row(
+          children: [
+            if (selectable)
+              _GroupCheckbox(state: selectState)
+            else
+              Icon(
+                expanded ? Icons.expand_less : Icons.expand_more,
+                size: 20,
+                color: cs.onSurfaceVariant,
+              ),
+            const SizedBox(width: 8),
+            // 分类后的应用图标收敛到组头（卡片里不再重复显示）
+            AppIcon(packageName: packageName, appName: title, size: 22),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: cs.onSurface),
+              ),
             ),
-          ),
+            const SizedBox(width: 8),
+            Text(
+              meta.join(' · '),
+              maxLines: 1,
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            ),
+          ],
         ),
       ),
     );
@@ -1300,11 +1314,10 @@ class _GroupCheckbox extends StatelessWidget {
   }
 }
 
-/// F02 二级组头（会话）：缩进对齐一级标题，会话名（主）+
-/// 「条数 · 最新时间 · 未处理 N」（次），整行点击切换展开/折叠；
-/// 多选态点击 = 整组选择/取消。
-class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
-  final String conversationKey;
+/// 二级分组头（会话，2026-11-01 嵌套卡片版）：会话名（主）+
+/// 「条数 · 最新时间 · 未处理 N」（次），整行点击 = 展开/折叠；
+/// 多选态点击 = 整组选择/取消。作为二级嵌套卡片的头行渲染。
+class _ConversationGroupHeader extends StatelessWidget {
   final String title;
   final int count;
   final int latestAt;
@@ -1320,8 +1333,7 @@ class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
   final VoidCallback onToggleSelect;
   final VoidCallback onLongPress;
 
-  const _ConversationHeaderDelegate({
-    required this.conversationKey,
+  const _ConversationGroupHeader({
     required this.title,
     required this.count,
     required this.latestAt,
@@ -1334,83 +1346,53 @@ class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
     required this.onLongPress,
   });
 
-  /// 嵌套窄卡片：48 内容 + 上下各 2 边距（比一级矮、缩进更深）。
-  static const double kHeight = 52;
-
   @override
-  double get minExtent => kHeight;
-
-  @override
-  double get maxExtent => kHeight;
-
-  @override
-  bool shouldRebuild(_ConversationHeaderDelegate oldDelegate) =>
-      conversationKey != oldDelegate.conversationKey ||
-      title != oldDelegate.title ||
-      count != oldDelegate.count ||
-      latestAt != oldDelegate.latestAt ||
-      pendingCount != oldDelegate.pendingCount ||
-      expanded != oldDelegate.expanded ||
-      selectable != oldDelegate.selectable ||
-      selectState != oldDelegate.selectState;
-
-  @override
-  Widget build(
-      BuildContext context, double shrinkOffset, bool overlapsContent) {
+  Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final meta = <String>['$count 条', formatMessageTime(latestAt)];
     if (pendingCount > 0) meta.add('未处理 $pendingCount');
-    // 嵌套卡片（2026-11-01）：缩进 24 + 更深底色，视觉上嵌在一级卡片内
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(24, 2, 12, 2),
-      child: Material(
-        color: cs.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(10),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: selectable ? onToggleSelect : onToggle,
-          onLongPress: onLongPress,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            child: Row(
-              children: [
-                if (selectable)
-                  _GroupCheckbox(state: selectState)
-                else
-                  Icon(
-                    expanded ? Icons.expand_less : Icons.expand_more,
-                    size: 18,
-                    color: cs.onSurfaceVariant,
+    return InkWell(
+      onTap: selectable ? onToggleSelect : onToggle,
+      onLongPress: onLongPress,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: Row(
+          children: [
+            if (selectable)
+              _GroupCheckbox(state: selectState)
+            else
+              Icon(
+                expanded ? Icons.expand_less : Icons.expand_more,
+                size: 18,
+                color: cs.onSurfaceVariant,
+              ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: cs.onSurface),
                   ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            color: cs.onSurface),
-                      ),
-                      const SizedBox(height: 1),
-                      Text(
-                        meta.join(' · '),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                            fontSize: 11.5, color: cs.onSurfaceVariant),
-                      ),
-                    ],
+                  const SizedBox(height: 1),
+                  Text(
+                    meta.join(' · '),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: 11.5, color: cs.onSurfaceVariant),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
+          ],
         ),
       ),
     );

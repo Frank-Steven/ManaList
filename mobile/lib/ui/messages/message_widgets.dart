@@ -361,6 +361,11 @@ class MessageTile extends StatefulWidget {
   final bool swipeEnabled;
   final List<SwipeAction> actions;
 
+  /// 嵌套模式（2026-11-01 嵌套卡片列表）：不作为独立卡片渲染
+  /// （无外边距/底色/圆角），由父级分组卡片提供容器；
+  /// 选中态改为整行底色高亮（原独立卡片的主色描边不适用）。
+  final bool embedded;
+
   /// 关联任务已完成（v2.4「已完成」筛选）：标题划线降色。
   final bool linkedTaskDone;
 
@@ -379,6 +384,7 @@ class MessageTile extends StatefulWidget {
     this.selected = false,
     this.swipeEnabled = true,
     this.actions = const [],
+    this.embedded = false,
     this.linkedTaskDone = false,
     this.linkedTaskPriority,
     this.linkedTaskCount = 0,
@@ -485,6 +491,98 @@ class _MessageTileState extends State<MessageTile> {
     final timeStyle = TextStyle(fontSize: 12, color: cs.onSurfaceVariant);
     final sourceStyle = TextStyle(fontSize: 11, color: cs.outline);
 
+    final body = SwipeActionRow(
+      actions: widget.actions,
+      swipeEnabled: widget.swipeEnabled && !widget.selecting,
+      onTap: _handleTap,
+      onLongPress: widget.onLongPress,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 多选勾选统一在行首（2026-11-01 与任务/文件区一致）
+            if (widget.selecting)
+              Padding(
+                padding: const EdgeInsets.only(right: 10, top: 1),
+                child: Icon(
+                  widget.selected
+                      ? Icons.check_circle
+                      : Icons.radio_button_unchecked,
+                  size: 20,
+                  color: widget.selected ? cs.primary : cs.outline,
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.only(top: 1),
+              child: _marker(context),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // 首行：标题（群名/发送者）+ 时间
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          message.title.isEmpty
+                              ? '(无标题)'
+                              : stripFoldMarkers(message.title),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: titleStyle,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(formatMessageTime(message.postedAt),
+                          style: timeStyle),
+                    ],
+                  ),
+                  // 正文为主视觉（最多 3 行）
+                  if (message.body.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      message.body,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: contentStyle,
+                    ),
+                  ],
+                  // 脚注：来源应用 · 会话（图标在分组吸顶头，不逐卡重复）
+                  if (message.appName?.isNotEmpty == true ||
+                      message.conversationTitle?.isNotEmpty == true) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      (message.appName?.isNotEmpty == true
+                              ? message.appName!
+                              : message.packageName) +
+                          (message.conversationTitle?.isNotEmpty == true
+                              ? ' · ${stripFoldMarkers(message.conversationTitle!)}'
+                              : ''),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: sourceStyle,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    // 嵌套模式：父级分组卡片提供容器，本行只做选中底色
+    if (widget.embedded) {
+      return Container(
+        color: widget.selected
+            ? cs.secondaryContainer.withValues(alpha: 0.5)
+            : null,
+        child: body,
+      );
+    }
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
       clipBehavior: Clip.antiAlias,
@@ -497,87 +595,7 @@ class _MessageTileState extends State<MessageTile> {
             ? BorderSide(color: cs.primary, width: 1.5)
             : BorderSide.none,
       ),
-      child: SwipeActionRow(
-        actions: widget.actions,
-        swipeEnabled: widget.swipeEnabled && !widget.selecting,
-        onTap: _handleTap,
-        onLongPress: widget.onLongPress,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.only(top: 1),
-                child: _marker(context),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // 首行：标题（群名/发送者）+ 时间
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            message.title.isEmpty
-                                ? '(无标题)'
-                                : stripFoldMarkers(message.title),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: titleStyle,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Text(formatMessageTime(message.postedAt),
-                            style: timeStyle),
-                      ],
-                    ),
-                    // 正文为主视觉（最多 3 行）
-                    if (message.body.isNotEmpty) ...[
-                      const SizedBox(height: 3),
-                      Text(
-                        message.body,
-                        maxLines: 3,
-                        overflow: TextOverflow.ellipsis,
-                        style: contentStyle,
-                      ),
-                    ],
-                    // 脚注：来源应用 · 会话（图标在分组吸顶头，不逐卡重复）
-                    if (message.appName?.isNotEmpty == true ||
-                        message.conversationTitle?.isNotEmpty == true) ...[
-                      const SizedBox(height: 4),
-                      Text(
-                        (message.appName?.isNotEmpty == true
-                                ? message.appName!
-                                : message.packageName) +
-                            (message.conversationTitle?.isNotEmpty == true
-                                ? ' · ${stripFoldMarkers(message.conversationTitle!)}'
-                                : ''),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: sourceStyle,
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              if (widget.selecting)
-                Padding(
-                  padding: const EdgeInsets.only(left: 10, top: 1),
-                  child: Icon(
-                    widget.selected
-                        ? Icons.check_circle
-                        : Icons.radio_button_unchecked,
-                    size: 20,
-                    color: widget.selected ? cs.primary : cs.outline,
-                  ),
-                ),
-            ],
-          ),
-        ),
-      ),
+      child: body,
     );
   }
 }

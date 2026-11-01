@@ -1013,7 +1013,7 @@ class FilesPageState extends State<FilesPage> {
                   if (selectable)
                     Positioned(
                       top: 4,
-                      right: 4,
+                      left: 4,
                       child: Icon(
                         switch (state) {
                           2 => Icons.check_circle,
@@ -1102,7 +1102,7 @@ class FilesPageState extends State<FilesPage> {
                   if (_selecting || pickUI)
                     Positioned(
                       top: 4,
-                      right: 4,
+                      left: 4,
                       child: Icon(
                         selected
                             ? Icons.check_circle
