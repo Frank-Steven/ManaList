@@ -901,12 +901,26 @@ class TaskScheduleViewState extends State<TaskScheduleView>
         _dragHandleHeader(context, vp, tasks.length),
         Expanded(
           child: tasks.isEmpty
-              ? Center(
-                  child: Text('无',
-                      style: TextStyle(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onSurfaceVariant)),
+              // 空态也要可滚动（2026-11-01：原先纯 Center 不发滚动通知，
+              // 空面板的下拉跟手与轻拨收起全部失效）——用与列表相同的
+              // AlwaysScrollable + Clamping，让 Overscroll/ScrollEnd
+              // 通知照常冒泡到面板手势层。
+              ? LayoutBuilder(
+                  builder: (context, c) => SingleChildScrollView(
+                    physics: const AlwaysScrollableScrollPhysics(
+                        parent: ClampingScrollPhysics()),
+                    child: ConstrainedBox(
+                      constraints:
+                          BoxConstraints(minHeight: c.maxHeight),
+                      child: Center(
+                        child: Text('无',
+                            style: TextStyle(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant)),
+                      ),
+                    ),
+                  ),
                 )
               : ListView.builder(
                   // AlwaysScrollable + Clamping：短列表滚到顶部继续下拉时
