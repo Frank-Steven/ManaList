@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../../models/library_file.dart';
 import '../../services/file_thumb_service.dart';
+import '../../services/library_file_service.dart' show guessMimeFromName;
 import 'files_page.dart' show libraryFileIcon;
 
 /// 文件缩略图（2026-11-01）：图片直接解码（cacheWidth 限制解码尺寸，
@@ -31,22 +32,19 @@ class FileThumbnail extends StatelessWidget {
     this.fill = false,
   });
 
-  static bool isImage(LibraryFile f) =>
-      (f.mimeType ?? '').startsWith('image/');
+  /// 判断口径统一：mime 优先，mime 缺失（旧数据未回填）按扩展名兜底。
+  static String _mime(LibraryFile f) =>
+      (f.mimeType ?? guessMimeFromName(f.name) ?? '').toLowerCase();
 
-  static bool isVideo(LibraryFile f) =>
-      (f.mimeType ?? '').startsWith('video/');
+  static bool isImage(LibraryFile f) => _mime(f).startsWith('image/');
 
-  static bool isPdf(LibraryFile f) {
-    final mime = (f.mimeType ?? '').toLowerCase();
-    return mime == 'application/pdf' ||
-        f.name.toLowerCase().endsWith('.pdf');
-  }
+  static bool isVideo(LibraryFile f) => _mime(f).startsWith('video/');
+
+  static bool isPdf(LibraryFile f) => _mime(f) == 'application/pdf';
 
   /// 可做内容片段预览的文本类文件。
   static bool isTextLike(LibraryFile f) {
-    final mime = (f.mimeType ?? '').toLowerCase();
-    if (mime.startsWith('text/')) return true;
+    if (_mime(f).startsWith('text/')) return true;
     const exts = [
       '.txt', '.md', '.markdown', '.log', '.json', '.csv',
       '.yaml', '.yml', '.xml', '.html', '.htm',

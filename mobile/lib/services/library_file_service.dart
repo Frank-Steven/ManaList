@@ -53,6 +53,71 @@ String folderName(String path) {
 bool folderIsUnder(String path, String ancestor) =>
     ancestor.isEmpty || path == ancestor || path.startsWith('$ancestor/');
 
+/// 从文件名扩展名推断 MIME（2026-11-01）：导入时调用方常给不出 mime，
+/// 不补的话 files 表 mime_type 为 NULL，缩略图/图标判断全部失效。
+/// 覆盖常见媒体/文档类型；未知返回 null（保留「未知」语义，不硬猜）。
+String? guessMimeFromName(String name) {
+  final ext = p.extension(name).toLowerCase();
+  if (ext.length < 2) return null;
+  return switch (ext.substring(1)) {
+    'png' => 'image/png',
+    'jpg' || 'jpeg' => 'image/jpeg',
+    'gif' => 'image/gif',
+    'webp' => 'image/webp',
+    'bmp' => 'image/bmp',
+    'heic' || 'heif' => 'image/heic',
+    'svg' => 'image/svg+xml',
+    'mp4' => 'video/mp4',
+    'mov' => 'video/quicktime',
+    'mkv' => 'video/x-matroska',
+    'webm' => 'video/webm',
+    '3gp' => 'video/3gpp',
+    'avi' => 'video/x-msvideo',
+    'mp3' => 'audio/mpeg',
+    'wav' => 'audio/wav',
+    'm4a' => 'audio/mp4',
+    'aac' => 'audio/aac',
+    'flac' => 'audio/flac',
+    'ogg' => 'audio/ogg',
+    'txt' || 'log' || 'md' || 'markdown' => 'text/plain',
+    'csv' => 'text/csv',
+    'json' => 'application/json',
+    'xml' || 'yaml' || 'yml' || 'html' || 'htm' => 'text/plain',
+    'pdf' => 'application/pdf',
+    'doc' => 'application/msword',
+    'docx' =>
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'xls' => 'application/vnd.ms-excel',
+    'xlsx' =>
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'ppt' => 'application/vnd.ms-powerpoint',
+    'pptx' =>
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'zip' => 'application/zip',
+    'apk' => 'application/vnd.android.package-archive',
+    _ => null,
+  };
+}
+
+/// 重命名锁定后缀（2026-11-01）：文件不允许改后缀名（类型语义会乱），
+/// 用户输入的不同后缀（或重复的原后缀）一律剥掉，再拼回 [original] 的
+/// 原后缀；原文件无后缀则按输入原样返回。
+String lockedRename(String original, String input) {
+  final ext = p.extension(original);
+  var base = input.trim();
+  if (ext.isEmpty) return base;
+  final lower = base.toLowerCase();
+  if (lower.endsWith(ext.toLowerCase())) {
+    base = base.substring(0, base.length - ext.length);
+  } else {
+    final typedExt = p.extension(base);
+    if (typedExt.isNotEmpty) {
+      base = base.substring(0, base.length - typedExt.length);
+    }
+  }
+  return '$base$ext';
+}
+
 /// 某文件夹的一层视图：直接子文件夹名 + 直接文件。
 class LibraryFolderView {
   /// 直接子文件夹名（不含路径前缀），按字典序。
@@ -91,10 +156,12 @@ class LibraryFileService {
       mimeType: mimeType,
     );
     if (att == null) return null;
+    final fileName = name ?? att.label ?? p.basename(path);
     final file = LibraryFile(
       id: _uuid.v4(),
-      name: name ?? att.label ?? p.basename(path),
-      mimeType: mimeType ?? att.access.mimeType,
+      name: fileName,
+      // 调用方没给 mime 时从扩展名推断：否则缩略图/图标判断失效
+      mimeType: mimeType ?? att.access.mimeType ?? guessMimeFromName(fileName),
       size: att.bytes,
       localPath: att.access.value,
       source: source,
@@ -123,7 +190,8 @@ class LibraryFileService {
     final file = LibraryFile(
       id: _uuid.v4(),
       name: name,
-      mimeType: mimeType ?? att.access.mimeType,
+      mimeType:
+          mimeType ?? att.access.mimeType ?? guessMimeFromName(name),
       size: att.bytes,
       localPath: att.access.value,
       source: source,
@@ -134,8 +202,14 @@ class LibraryFileService {
     return file;
   }
 
-  Future<void> rename(String id, String name) =>
-      AppDatabase.instance.renameFile(id, name);
+  /// 重命名（2026-11-01 起锁定后缀名，见 [lockedRename]）。
+  Future<void> rename(String id, String name) async {
+    final file = await AppDatabase.instance.getFileById(id);
+    if (file == null) return;
+    final newName = lockedRename(file.name, name);
+    if (newName.isEmpty || newName == file.name) return;
+    await AppDatabase.instance.renameFile(id, newName);
+  }
 
   // ---- 文件夹（v9 虚拟派生 + v10 空文件夹持久化） ----
 

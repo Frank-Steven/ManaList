@@ -1,6 +1,7 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:path/path.dart' as p;
 
 import '../../models/library_file.dart';
 import '../../services/assistant/models.dart';
@@ -15,8 +16,9 @@ import 'file_thumbnail.dart';
 import 'folder_tree.dart';
 
 /// 按 mime 给文件分区/附件选择器共用的行首图标（唯一事实源）。
+/// mime 缺失（旧数据）时按扩展名兜底推断。
 IconData libraryFileIcon(LibraryFile file) {
-  final mime = file.mimeType ?? '';
+  final mime = file.mimeType ?? guessMimeFromName(file.name) ?? '';
   if (mime.startsWith('image/')) return Icons.image_outlined;
   if (mime.startsWith('video/')) return Icons.videocam_outlined;
   if (mime.startsWith('audio/')) return Icons.audiotrack_outlined;
@@ -25,6 +27,35 @@ IconData libraryFileIcon(LibraryFile file) {
   }
   if (mime == 'application/pdf') return Icons.picture_as_pdf_outlined;
   return Icons.insert_drive_file_outlined;
+}
+
+/// 文件类型显示名（2026-11-01：类型随列表/卡片副标题展示）：
+/// 「PNG 图片」「MP4 视频」「PDF 文档」；无扩展名回退「文件」。
+String libraryFileTypeLabel(LibraryFile file) {
+  final mime = file.mimeType ?? guessMimeFromName(file.name) ?? '';
+  final ext = p.extension(file.name);
+  final extLabel =
+      ext.length > 1 ? ext.substring(1).toUpperCase() : '';
+  final kind = switch (mime) {
+    _ when mime.startsWith('image/') => '图片',
+    _ when mime.startsWith('video/') => '视频',
+    _ when mime.startsWith('audio/') => '音频',
+    _ when mime.startsWith('text/') || mime == 'application/json' => '文本',
+    'application/pdf' => '文档',
+    'application/msword' ||
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document' =>
+      '文档',
+    'application/vnd.ms-excel' ||
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' =>
+      '表格',
+    'application/vnd.ms-powerpoint' ||
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation' =>
+      '演示',
+    'application/zip' => '压缩包',
+    _ => '',
+  };
+  if (extLabel.isEmpty) return kind.isEmpty ? '文件' : kind;
+  return kind.isEmpty ? extLabel : '$extLabel $kind';
 }
 
 /// v3 阶段 3 库·文件区（design-v3 §1.3/§3.1）+ DB v9/v10 树形管理：
@@ -329,6 +360,73 @@ class FilesPageState extends State<FilesPage> {
     ]);
   }
 
+  /// 批量导出到下载目录（多选菜单，2026-11-01）。
+  Future<void> _exportSelected() async {
+    final targets = _selectedFiles;
+    if (targets.isEmpty) return;
+    var ok = 0;
+    for (final f in targets) {
+      try {
+        await SystemIntent.exportToDownloads(f.localPath,
+            name: f.name, mime: SystemIntent.mimeOf(f.name));
+        ok++;
+      } catch (_) {
+        // 单个失败不中断批量，最后统一汇报
+      }
+    }
+    if (!mounted) return;
+    setState(() => _exitSelection());
+    _toast(ok == targets.length
+        ? '已导出 $ok 个文件到下载目录'
+        : '导出 $ok/${targets.length} 个文件，其余失败');
+  }
+
+  /// 批量删除（多选菜单，2026-11-01）：引用检查合并提示，确认后强删。
+  Future<void> _deleteSelected() async {
+    final targets = _selectedFiles;
+    if (targets.isEmpty) return;
+    var noteRefs = 0;
+    var anchorRefs = 0;
+    for (final f in targets) {
+      final refs = await LibraryFileService.instance.countReferences(f.id);
+      noteRefs += refs.noteCount;
+      anchorRefs += refs.anchorCount;
+    }
+    if (!mounted) return;
+    if (noteRefs > 0 || anchorRefs > 0) {
+      final parts = <String>[
+        if (noteRefs > 0) '$noteRefs 处笔记附件',
+        if (anchorRefs > 0) '$anchorRefs 个任务锚点',
+      ];
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('文件仍被引用'),
+          content: Text('所选 ${targets.length} 个文件中，有被 ${parts.join('、')} '
+              '引用的。\n删除后这些引用会失效。仍要删除吗？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('仍要删除'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+    for (final f in targets) {
+      await LibraryFileService.instance.delete(f.id, force: true);
+    }
+    if (!mounted) return;
+    setState(() => _exitSelection());
+    await reload();
+    _toast('已删除 ${targets.length} 个文件');
+  }
+
   // ---- 导入（落到当前文件夹） ----
 
   Future<void> _importFiles() async {
@@ -402,10 +500,41 @@ class FilesPageState extends State<FilesPage> {
   // ---- 重命名 / 删除 ----
 
   Future<void> _rename(LibraryFile file) async {
-    final name = await promptNameDialog(context,
-        title: '重命名文件', initialValue: file.name);
-    if (name == null || name == file.name) return;
-    await LibraryFileService.instance.rename(file.id, name);
+    final ext = p.extension(file.name);
+    final base = ext.isEmpty
+        ? file.name
+        : file.name.substring(0, file.name.length - ext.length);
+    final controller = TextEditingController(text: base);
+    final newBase = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('重命名文件'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLines: 1,
+          decoration: InputDecoration(
+            // 后缀名锁定不可改（类型语义），只做展示
+            suffixText: ext.isEmpty ? null : ext,
+            helperText: ext.isEmpty ? null : '文件后缀名不可修改',
+          ),
+          onSubmitted: (v) => Navigator.of(dialogContext).pop(v.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+    if (newBase == null || newBase.isEmpty || newBase == base) return;
+    await LibraryFileService.instance.rename(file.id, newBase + ext);
     await reload();
   }
 
@@ -735,10 +864,22 @@ class FilesPageState extends State<FilesPage> {
           onTap: _moveSelected,
         ),
         SelectionAction(
+          icon: Icons.download_outlined,
+          tooltip: '导出到下载目录',
+          enabled: hasSelection,
+          onTap: _exportSelected,
+        ),
+        SelectionAction(
           icon: Icons.send_outlined,
           tooltip: '发送给助理',
           enabled: hasSelection,
           onTap: _sendSelectedToAssistant,
+        ),
+        SelectionAction(
+          icon: Icons.delete_outline,
+          tooltip: '删除',
+          enabled: hasSelection,
+          onTap: _deleteSelected,
         ),
       ],
     );
@@ -792,7 +933,9 @@ class FilesPageState extends State<FilesPage> {
           : FileThumbnail(file: file, size: 40),
       title: Text(file.name, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: Text(
-          '${_formatSize(file.size)} · ${_formatTime(file.createdAt)}'),
+          '${libraryFileTypeLabel(file)} · ${_formatSize(file.size)} · ${_formatTime(file.createdAt)}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis),
       trailing: _selecting || pickUI ? null : const Icon(Icons.more_vert),
       onTap: () {
         if (_selecting || pickUI) {
@@ -980,7 +1123,10 @@ class FilesPageState extends State<FilesPage> {
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
-              child: Text(_formatSize(file.size),
+              child: Text(
+                  '${libraryFileTypeLabel(file)} · ${_formatSize(file.size)}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
             ),
           ],

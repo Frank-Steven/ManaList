@@ -669,9 +669,6 @@ class MessagesPageState extends State<MessagesPage> {
 
   Widget _buildFilterRow(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    BorderSide chipSide(bool selected) => selected
-        ? BorderSide.none
-        : BorderSide(color: cs.outlineVariant);
     return SizedBox(
       height: 48,
       child: ListView(
@@ -682,23 +679,18 @@ class MessagesPageState extends State<MessagesPage> {
             Center(
               child: Padding(
                 padding: const EdgeInsets.only(right: 8),
-                child: FilterChip(
-                  avatar: Icon(messageGroupIcon(key), size: 16),
-                  label: Text(messageGroupLabel(key)),
+                // 纯图标筛选（2026-11-01 第三批）：文字收进 Tooltip
+                child: _IconChip(
+                  tooltip: messageGroupLabel(key),
                   selected: _groupFilter.contains(key),
-                  showCheckmark: false,
-                  selectedColor: cs.secondaryContainer,
-                  backgroundColor: cs.surfaceContainerHighest,
-                  side: chipSide(_groupFilter.contains(key)),
-                  visualDensity: VisualDensity.compact,
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  onSelected: (sel) => setState(() {
-                    if (sel) {
-                      _groupFilter.add(key);
-                    } else {
+                  onTap: () => setState(() {
+                    if (_groupFilter.contains(key)) {
                       _groupFilter.remove(key);
+                    } else {
+                      _groupFilter.add(key);
                     }
                   }),
+                  child: Icon(messageGroupIcon(key), size: 18),
                 ),
               ),
             ),
@@ -711,16 +703,15 @@ class MessagesPageState extends State<MessagesPage> {
               ),
             ),
           // 应用筛选（2026-11-01）：单个下拉按钮 + 多选菜单，
-          // 按钮上图标 = 所选应用图标前几个堆叠
-          if (_sources.isNotEmpty) _buildAppFilterButton(cs, chipSide),
+          // 按钮上图标 = 所选应用图标前几个堆叠（第三批：去文字）
+          if (_sources.isNotEmpty) _buildAppFilterButton(cs),
         ],
       ),
     );
   }
 
-  /// 应用筛选按钮：堆叠图标 + 文案 + 下拉箭头，点击弹多选菜单。
-  Widget _buildAppFilterButton(
-      ColorScheme cs, BorderSide Function(bool) chipSide) {
+  /// 应用筛选按钮：堆叠图标 + 下拉箭头（无文字），点击弹多选菜单。
+  Widget _buildAppFilterButton(ColorScheme cs) {
     final active = _appFilter.isNotEmpty;
     // 堆叠展示的图标来源：有筛选 = 所选应用（最多 3 个），无筛选 = 全部前 3
     final iconSources = (active
@@ -731,17 +722,19 @@ class MessagesPageState extends State<MessagesPage> {
     return Center(
       child: Padding(
         padding: const EdgeInsets.only(right: 8),
-        child: ActionChip(
-          avatar: _StackedAppIcons(sources: iconSources),
-          label: Text(
-              active ? '应用 ×${_appFilter.length}' : '全部应用',
-              style: const TextStyle(fontSize: 13)),
-          backgroundColor:
-              active ? cs.secondaryContainer : cs.surfaceContainerHighest,
-          side: chipSide(active),
-          visualDensity: VisualDensity.compact,
-          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          onPressed: _showAppFilterSheet,
+        child: _IconChip(
+          tooltip: active ? '已选 ${_appFilter.length} 个应用' : '按应用筛选',
+          selected: active,
+          onTap: _showAppFilterSheet,
+          wide: true,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _StackedAppIcons(sources: iconSources),
+              const SizedBox(width: 2),
+              const Icon(Icons.arrow_drop_down, size: 16),
+            ],
+          ),
         ),
       ),
     );
@@ -1460,6 +1453,62 @@ class _StackedAppIcons extends StatelessWidget {
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+/// 纯图标筛选 chip（2026-11-01 第三批：筛选栏去文字）：36px 圆形
+/// （wide = 胶囊，宽度随内容），选中态 secondaryContainer 实心、
+/// 未选态描边；文字说明收进 [tooltip]。
+class _IconChip extends StatelessWidget {
+  final Widget child;
+  final String tooltip;
+  final bool selected;
+  final VoidCallback onTap;
+
+  /// true 时宽度随内容（堆叠图标 + 箭头的应用筛选按钮用）。
+  final bool wide;
+
+  const _IconChip({
+    required this.child,
+    required this.tooltip,
+    required this.selected,
+    required this.onTap,
+    this.wide = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color:
+            selected ? cs.secondaryContainer : cs.surfaceContainerHighest,
+        shape: StadiumBorder(
+          side: selected
+              ? BorderSide.none
+              : BorderSide(color: cs.outlineVariant),
+        ),
+        child: InkWell(
+          customBorder: const StadiumBorder(),
+          onTap: onTap,
+          child: Container(
+            height: 36,
+            width: wide ? null : 36,
+            padding: wide ? const EdgeInsets.symmetric(horizontal: 10) : null,
+            child: IconTheme.merge(
+              data: IconThemeData(
+                size: 18,
+                color: selected
+                    ? cs.onSecondaryContainer
+                    : cs.onSurfaceVariant,
+              ),
+              child: Center(child: child),
+            ),
+          ),
+        ),
       ),
     );
   }

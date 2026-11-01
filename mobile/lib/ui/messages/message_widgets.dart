@@ -348,10 +348,11 @@ class _SwipeActionRowState extends State<SwipeActionRow>
   }
 }
 
-/// 消息卡片（v2.4 卡片化；v2.6 去颜色化）：左侧标记 + 标题/摘要/来源
-/// （含应用图标）+ 右侧时间。点击卡片行内展开/收起全文（选择模式下点击 = 勾选）。
-/// 标记规则（v2.6）：绑定任务的消息显示其任务优先级色点（+ 任务角标）；
-/// 未绑定 = 空心圆点；垃圾 = 灰色消息块 + 标题划线。不再按 AI 红/黄/绿染色。
+/// 消息卡片（v2.4 卡片化；v2.6 去颜色化；2026-11-01 第三批重构版式）：
+/// 左侧标记 + 标题（群名/发送者）/正文（主视觉，最多 3 行）/来源脚注
+/// （应用图标在分组吸顶头，不逐卡重复）+ 右侧时间。圆角 14、多选选中
+/// 主色描边。标记规则（v2.6）：绑定任务的消息显示其任务优先级色点
+/// （+ 任务角标）；未绑定 = 空心圆点；垃圾 = 灰色消息块 + 标题划线。
 /// 关联任务已完成的消息标题划线变淡。
 class MessageTile extends StatefulWidget {
   final Message message;
@@ -485,29 +486,37 @@ class _MessageTileState extends State<MessageTile> {
     final sourceStyle = TextStyle(fontSize: 11, color: cs.outline);
 
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
       clipBehavior: Clip.antiAlias,
       elevation: 0,
       color: isJunk ? cs.surfaceContainerHighest : cs.surfaceContainerLow,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        // 多选态选中 = 主色描边（与文件区卡片同一语言）
+        side: widget.selected
+            ? BorderSide(color: cs.primary, width: 1.5)
+            : BorderSide.none,
+      ),
       child: SwipeActionRow(
         actions: widget.actions,
         swipeEnabled: widget.swipeEnabled && !widget.selecting,
         onTap: _handleTap,
         onLongPress: widget.onLongPress,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Padding(
-                padding: const EdgeInsets.only(top: 2),
+                padding: const EdgeInsets.only(top: 1),
                 child: _marker(context),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // 首行：标题（群名/发送者）+ 时间
                     Row(
                       children: [
                         Expanded(
@@ -516,8 +525,7 @@ class _MessageTileState extends State<MessageTile> {
                                 ? '(无标题)'
                                 : stripFoldMarkers(message.title),
                             maxLines: 1,
-                            overflow:
-                                TextOverflow.ellipsis,
+                            overflow: TextOverflow.ellipsis,
                             style: titleStyle,
                           ),
                         ),
@@ -526,8 +534,9 @@ class _MessageTileState extends State<MessageTile> {
                             style: timeStyle),
                       ],
                     ),
+                    // 正文为主视觉（最多 3 行）
                     if (message.body.isNotEmpty) ...[
-                      const SizedBox(height: 2),
+                      const SizedBox(height: 3),
                       Text(
                         message.body,
                         maxLines: 3,
@@ -535,32 +544,28 @@ class _MessageTileState extends State<MessageTile> {
                         style: contentStyle,
                       ),
                     ],
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        // U7+（2026-11-01）：应用图标上移到分组吸顶头，
-                        // 卡片脚注只留来源文字（分组后图标逐卡重复是噪音）
-                        Expanded(
-                          child: Text(
-                            (message.appName?.isNotEmpty == true
-                                    ? message.appName!
-                                    : message.packageName) +
-                                (message.conversationTitle?.isNotEmpty == true
-                                    ? ' · ${stripFoldMarkers(message.conversationTitle!)}'
-                                    : ''),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: sourceStyle,
-                          ),
-                        ),
-                      ],
-                    ),
+                    // 脚注：来源应用 · 会话（图标在分组吸顶头，不逐卡重复）
+                    if (message.appName?.isNotEmpty == true ||
+                        message.conversationTitle?.isNotEmpty == true) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        (message.appName?.isNotEmpty == true
+                                ? message.appName!
+                                : message.packageName) +
+                            (message.conversationTitle?.isNotEmpty == true
+                                ? ' · ${stripFoldMarkers(message.conversationTitle!)}'
+                                : ''),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: sourceStyle,
+                      ),
+                    ],
                   ],
                 ),
               ),
               if (widget.selecting)
                 Padding(
-                  padding: const EdgeInsets.only(left: 8, top: 2),
+                  padding: const EdgeInsets.only(left: 10, top: 1),
                   child: Icon(
                     widget.selected
                         ? Icons.check_circle

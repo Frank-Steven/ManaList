@@ -269,6 +269,14 @@ shared/schemas 仍是双端协议事实源，v3 更新如下（同步更新 `des
 - **文件区**：文件夹与文件统一显示方式（列表行 40px 缩略图位 + 名称 + 元信息；卡片同款封面区 + 多选三态勾选）；文件缩略图分级预览——图片直接解码、视频经平台通道取首帧（Android `MediaMetadataRetriever`，叠加播放角标）、PDF 取首页渲染（`PdfRenderer`）、文本类文件显示内容开头片段（极小字号平铺），其余回退类型图标；通道与文本读取统一走 `FileThumbService`（内存缓存 + 并发合并）。
 - 测试：`message_group_test` 补分组分页常量与 `pagedPrefix` 边界；`library_folder_test` 补 `getFilesUnderFolder` 段边界用例。
 
+### 3.10 增量（2026-11-01 第四批，mime 修复与菜单补全）
+
+- **mime 推断修复（图片不显示的根因）**：`LibraryFileService.importFromPath/importBytes` 在调用方未给 mime 时按扩展名回填（`guessMimeFromName`，覆盖常见图片/视频/音频/文本/办公文档）；判断口径统一为「mime 优先、扩展名兜底」——`libraryFileIcon`、`FileThumbnail.isImage/isVideo/isPdf/isTextLike` 对旧数据（mime_type 为 NULL）同样生效，无需迁移。
+- **消息筛选栏去文字**：状态筛选与应用筛选改纯图标 chip（36px 圆形/胶囊，选中 secondaryContainer 实心、未选描边），文字说明收进 Tooltip。
+- **消息卡片重构**：圆角 14、间距收紧（卡片外边距 12/3、内边距 12/10），层级固定为 标题行（群名/发送者 + 时间）→ 正文（主视觉最多 3 行）→ 来源脚注；多选选中态主色描边（与文件区卡片同一语言）。
+- **文件区**：重命名锁定后缀——对话框只编辑基名（原后缀灰显为 suffix），服务层 `lockedRename` 兜底（输入的不同后缀/重复原后缀一律剥掉再拼回原后缀）；列表/卡片副标题显示文件类型（`libraryFileTypeLabel`：「PNG 图片」「PDF 文档」「MP4 视频」等）；多选菜单补齐为 移动到文件夹 / 导出到下载目录（批量）/ 发送给助理 / 删除（引用检查合并提示）。
+- 测试：`library_folder_test` 补 `guessMimeFromName`（含导入回填）与 `lockedRename`（含服务层强制锁后缀）用例。
+
 ---
 
 ## 4. 「任务」合并（待办+日程）

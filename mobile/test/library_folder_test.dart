@@ -192,4 +192,53 @@ void main() {
       expect(root, hasLength(5), reason: '空路径 = 全库');
     });
   });
+
+  // ---- 2026-11-01：mime 推断 + 重命名锁定后缀 ----
+
+  group('guessMimeFromName', () {
+    test('常见媒体/文档扩展名', () {
+      expect(guessMimeFromName('a.png'), 'image/png');
+      expect(guessMimeFromName('a.JPG'), 'image/jpeg', reason: '大小写不敏感');
+      expect(guessMimeFromName('a.mp4'), 'video/mp4');
+      expect(guessMimeFromName('a.mp3'), 'audio/mpeg');
+      expect(guessMimeFromName('a.pdf'), 'application/pdf');
+      expect(guessMimeFromName('a.md'), 'text/plain');
+      expect(guessMimeFromName('a.unknownext'), isNull);
+      expect(guessMimeFromName('无后缀'), isNull);
+    });
+
+    test('导入时 mime 缺省从扩展名回填', () async {
+      final f = await importFile('照片.png');
+      expect(f.mimeType, 'image/png');
+      final v = await importFile('视频.mov');
+      expect(v.mimeType, 'video/quicktime');
+      final u = await importFile('数据.unknownext');
+      expect(u.mimeType, isNull, reason: '未知类型保持未知，不硬猜');
+    });
+  });
+
+  group('lockedRename（重命名锁定后缀）', () {
+    test('输入不带后缀 → 拼回原后缀', () {
+      expect(lockedRename('报告.pdf', '周报'), '周报.pdf');
+    });
+    test('输入带原后缀 → 不重复拼接', () {
+      expect(lockedRename('报告.pdf', '周报.pdf'), '周报.pdf');
+      expect(lockedRename('报告.PDF', '周报.pdf'), '周报.PDF',
+          reason: '大小写不敏感命中，保留原后缀');
+    });
+    test('输入带别的后缀 → 剥掉再拼原后缀', () {
+      expect(lockedRename('照片.png', '截图.jpg'), '截图.png');
+    });
+    test('原文件无后缀 → 按输入原样', () {
+      expect(lockedRename('README', '说明'), '说明');
+      expect(lockedRename('README', '说明.md'), '说明.md');
+    });
+    test('服务层 rename 强制锁后缀', () async {
+      final f = await importFile('照片.png');
+      await service.rename(f.id, '新名字.gif');
+      expect((await appDb.getFileById(f.id))?.name, '新名字.png');
+      await service.rename(f.id, '新名字.png');
+      expect((await appDb.getFileById(f.id))?.name, '新名字.png');
+    });
+  });
 }
