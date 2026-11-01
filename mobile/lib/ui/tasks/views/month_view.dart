@@ -131,10 +131,11 @@ class MonthViewState extends State<MonthView> {
   }
 
   /// 「现在」：滚动到当前月并把今天所在周行/日格在可视区垂直居中，
-  /// 脉冲高亮今天（v2.6 定位加深）。
-  void scrollToNow() {
+  /// 脉冲高亮今天（v2.6 定位加深）。[animated]：按钮触发的定位平滑滚动，
+  /// 首帧自动定位保持硬跳。
+  void scrollToNow({bool animated = false}) {
     final now = DateTime.now();
-    _jumpToDay(now);
+    _jumpToDay(now, animated: animated);
     _pulseTimer?.cancel();
     setState(() => _pulseDay = DateTime(now.year, now.month, now.day));
     _pulseTimer = Timer(const Duration(milliseconds: 1500), () {
@@ -142,7 +143,8 @@ class MonthViewState extends State<MonthView> {
     });
   }
 
-  void scrollTo(DateTime target) => _jumpToDay(target);
+  void scrollTo(DateTime target, {bool animated = false}) =>
+      _jumpToDay(target, animated: animated);
 
   void scrollToTask(Task t) {
     final s = t.startAt;
@@ -150,16 +152,29 @@ class MonthViewState extends State<MonthView> {
     _jumpToMonth(_monthIndexOf(DateTime.fromMillisecondsSinceEpoch(s)));
   }
 
-  void _jumpToMonth(int index) {
+  /// 定位滚动：按钮触发（animated）平滑滚动 300ms，否则硬跳。
+  /// 平滑滚动结束的 ScrollEndNotification 会触发上报（见 build 的监听）。
+  void _scrollToOffset(double offset, bool animated) {
+    if (animated) {
+      _ctrl.animateTo(offset,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOutCubic);
+    } else {
+      _ctrl.jumpTo(offset);
+      _reportWindow();
+    }
+  }
+
+  void _jumpToMonth(int index, {bool animated = false}) {
     if (!_ctrl.hasClients) return;
     final max = _ctrl.position.maxScrollExtent;
     // 顶对齐目标月分段（标签行在顶部）
-    _ctrl.jumpTo((itemIndexForUnit(index) * _itemExtent - 4).clamp(0.0, max));
-    _reportWindow();
+    _scrollToOffset(
+        (itemIndexForUnit(index) * _itemExtent - 4).clamp(0.0, max), animated);
   }
 
   /// 滚动到指定日所在月并把该日的周行在可视区垂直居中（v2.6）。
-  void _jumpToDay(DateTime d) {
+  void _jumpToDay(DateTime d, {bool animated = false}) {
     if (!_ctrl.hasClients) return;
     final itemTop = itemIndexForUnit(_monthIndexOf(d)) * _itemExtent;
     // 与网格布局同一套公式：周网格行 = (首日偏移 + 日 - 1) ~/ 7
@@ -169,8 +184,8 @@ class MonthViewState extends State<MonthView> {
         _labelH + _MonthLayout.headerH + row * _cellH + _cellH / 2;
     final dim = _ctrl.position.viewportDimension;
     final max = _ctrl.position.maxScrollExtent;
-    _ctrl.jumpTo((itemTop + cellCenter - dim / 2).clamp(0.0, max));
-    _reportWindow();
+    _scrollToOffset(
+        (itemTop + cellCenter - dim / 2).clamp(0.0, max), animated);
   }
 
   @override

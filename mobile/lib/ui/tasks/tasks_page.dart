@@ -62,8 +62,10 @@ class TasksPageState extends State<TasksPage>
   }
 
   void _onTabChanged() {
-    if (_tab.indexIsChanging) return;
-    _switchMode(_tab.index);
+    // 点击即切：_tab.index 在指示器动画起跑时已指向目标档，内容过渡
+    // （AnimatedSwitcher 300ms）与指示器动画同步进行；原先等动画播完
+    // （indexIsChanging 归位）才切，内容滞后一拍。
+    if (_tab.index != _mode) _switchMode(_tab.index);
   }
 
   /// 壳层切页时刷新：列表始终刷新；甘特视图仅在已构建时刷新。

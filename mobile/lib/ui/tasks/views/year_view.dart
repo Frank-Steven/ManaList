@@ -117,9 +117,10 @@ class YearViewState extends State<YearView> {
   }
 
   /// 滚动到当前年、把当月块在可视区垂直居中，脉冲高亮当月块（设计 §13-10，v2.6）。
-  void scrollToNow() {
+  /// [animated]：按钮触发的定位平滑滚动，首帧自动定位保持硬跳。
+  void scrollToNow({bool animated = false}) {
     final now = DateTime.now();
-    _jumpToMonthBlock(now.year, now.month);
+    _jumpToMonthBlock(now.year, now.month, animated: animated);
     setState(() {
       _pulse = (now.year, now.month);
     });
@@ -132,7 +133,8 @@ class YearViewState extends State<YearView> {
 
   /// 滚动到指定年并把锚点所在月块在可视区垂直居中（期移箭头用；
   /// 2026-10-28：原先是顶对齐年初，期移后当月块常被顶出屏幕）。
-  void scrollTo(DateTime anchor) => _jumpToMonthBlock(anchor.year, anchor.month);
+  void scrollTo(DateTime anchor, {bool animated = false}) =>
+      _jumpToMonthBlock(anchor.year, anchor.month, animated: animated);
 
   /// 滚动到任务所在年（详情面板跳转用）。
   void scrollToTask(Task t) {
@@ -141,18 +143,31 @@ class YearViewState extends State<YearView> {
     _jumpToYear(DateTime.fromMillisecondsSinceEpoch(s).year);
   }
 
-  void _jumpToYear(int year) {
+  /// 定位滚动：按钮触发（animated）平滑滚动 300ms，否则硬跳。
+  /// 平滑滚动结束的 ScrollEndNotification 会触发上报（见 build 的监听）。
+  void _scrollToOffset(double offset, bool animated) {
+    if (animated) {
+      _scroll.animateTo(offset,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOutCubic);
+    } else {
+      _scroll.jumpTo(offset);
+      _reportWindow();
+    }
+  }
+
+  void _jumpToYear(int year, {bool animated = false}) {
     if (!_scroll.hasClients || _itemExtent <= 0) return;
     final idx = itemIndexForUnit(year - _baseYear);
     // 顶对齐（留 4px 边距）：itemExtent 常大于视口高，居中会把
     // 年网格第一行顶出屏幕（首行被裁）
     final target = idx * _itemExtent - 4;
-    _scroll.jumpTo(target.clamp(0.0, _scroll.position.maxScrollExtent));
-    _reportWindow();
+    _scrollToOffset(
+        target.clamp(0.0, _scroll.position.maxScrollExtent), animated);
   }
 
   /// 滚动到指定年并把指定月块在可视区垂直居中（v2.6「现在」定位加深）。
-  void _jumpToMonthBlock(int year, int month) {
+  void _jumpToMonthBlock(int year, int month, {bool animated = false}) {
     if (!_scroll.hasClients || _itemExtent <= 0 || _gridWidth <= 0) return;
     final itemTop = itemIndexForUnit(year - _baseYear) * _itemExtent;
     // 与网格布局同一套公式：3 列方块月块，行 = (month-1)~/3
@@ -161,9 +176,9 @@ class YearViewState extends State<YearView> {
         _YearLayout.pad + ((month - 1) ~/ 3) * (block + _YearLayout.gap);
     final center = itemTop + _yearLabelH + blockTop + block / 2;
     final dim = _scroll.position.viewportDimension;
-    _scroll.jumpTo(
-        (center - dim / 2).clamp(0.0, _scroll.position.maxScrollExtent));
-    _reportWindow();
+    _scrollToOffset(
+        (center - dim / 2).clamp(0.0, _scroll.position.maxScrollExtent),
+        animated);
   }
 
   @override

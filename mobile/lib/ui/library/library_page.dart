@@ -119,15 +119,6 @@ class LibraryPageState extends State<LibraryPage>
     return Scaffold(
       appBar: AppBar(
         title: const Text('库'),
-        actions: [
-          // 分区级操作上收（ui-structure §3）：归档箱仅消息分区显示。
-          if (_tab.index == AppUiState.librarySectionMessages)
-            IconButton(
-              tooltip: '已归档',
-              icon: const Icon(Icons.archive_outlined),
-              onPressed: () => _messagesKey.currentState?.openArchived(),
-            ),
-        ],
         bottom: TabBar(
           controller: _tab,
           tabs: [

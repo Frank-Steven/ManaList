@@ -174,33 +174,79 @@ class YearlyViewState extends State<YearlyView>
 
   // ---- 供父级调用的定位方法 ----
 
+  /// 按钮定位的平滑滚动（期移箭头/「现在」，2026-11-01）：300ms easeOutCubic
+  /// 平移到目标位置。复用 _flingCtrl 槽位，取消/回收路径与 fling 一致。
+  void _animateScrollTo(double targetYf) {
+    _cancelFling();
+    final start = _scrollYf;
+    if ((targetYf - start).abs() < 0.0001) {
+      setState(() => _scrollYf = targetYf);
+      _reportWindow();
+      return;
+    }
+    final ctrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 300));
+    final curve = CurvedAnimation(parent: ctrl, curve: Curves.easeOutCubic);
+    ctrl.addListener(() {
+      setState(() => _scrollYf = start + (targetYf - start) * curve.value);
+      _reportOnUnitChange(); // 标题实时跟随（单位变化才上报）
+    });
+    ctrl.addStatusListener((s) {
+      if (s == AnimationStatus.completed) {
+        _cancelFling();
+        _reportWindow();
+      }
+    });
+    _flingCtrl = ctrl;
+    ctrl.forward();
+  }
+
   /// 滚动到当前年并居中，短暂脉冲高亮（设计 §13-10）。
   /// v2.6.1：先停掉进行中的 fling 动画，否则动画下一帧会覆盖定位。
-  void scrollToNow() {
+  /// [animated]：按钮触发的定位平滑滚动，首帧自动定位保持硬跳。
+  void scrollToNow({bool animated = false}) {
     _cancelFling();
     final ppy = _ppy ?? (_viewW > 0 ? _viewW / 20 : 20.0);
     final nowYf = _yearFraction(DateTime.now().millisecondsSinceEpoch);
-    setState(() {
-      _scrollYf = (nowYf - _viewW / (2 * ppy)).clamp(_minScroll, _maxScroll);
-      _contentY = 0; // 定位语义：回到顶部第一行
-      _positioned = true;
-      _pulseYear = DateTime.now().year;
-    });
+    final target = (nowYf - _viewW / (2 * ppy)).clamp(_minScroll, _maxScroll);
+    if (animated) {
+      setState(() {
+        _contentY = 0; // 定位语义：回到顶部第一行
+        _positioned = true;
+      });
+      _animateScrollTo(target);
+    } else {
+      setState(() {
+        _scrollYf = target;
+        _contentY = 0; // 定位语义：回到顶部第一行
+        _positioned = true;
+      });
+      _reportWindow();
+    }
+    setState(() => _pulseYear = DateTime.now().year);
     _pulseTimer?.cancel();
     _pulseTimer = Timer(const Duration(milliseconds: 1500), () {
       if (mounted) setState(() => _pulseYear = null);
     });
-    _reportWindow();
     widget.onCenterChanged(DateTime.now());
   }
 
   /// 滚动到指定年并居中（期移箭头用）。
-  void scrollTo(DateTime anchor) {
+  void scrollTo(DateTime anchor, {bool animated = false}) {
     _cancelFling();
     final ppy = _ppy ?? 20.0;
     final yf = _yearFraction(anchor.millisecondsSinceEpoch);
+    final target = (yf - _viewW / (2 * ppy)).clamp(_minScroll, _maxScroll);
+    if (animated) {
+      setState(() {
+        _contentY = 0; // 期移后回到顶部第一行
+        _positioned = true;
+      });
+      _animateScrollTo(target);
+      return;
+    }
     setState(() {
-      _scrollYf = (yf - _viewW / (2 * ppy)).clamp(_minScroll, _maxScroll);
+      _scrollYf = target;
       _contentY = 0; // 期移后回到顶部第一行
       _positioned = true;
     });

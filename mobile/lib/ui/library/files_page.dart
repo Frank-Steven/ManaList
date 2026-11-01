@@ -7,9 +7,12 @@ import '../../services/assistant/models.dart';
 import '../../services/library_file_service.dart';
 import '../../services/notification_bridge.dart';
 import '../../services/system_intent.dart';
+import '../assistant/attachment_pick_controller.dart';
 import '../assistant/send_to_assistant.dart';
 import '../messages/message_widgets.dart' show SelectionAction, SelectionActionBar;
 import '../notes/notes_page.dart' show promptNameDialog;
+import 'file_thumbnail.dart';
+import 'folder_tree.dart';
 
 /// 按 mime 给文件分区/附件选择器共用的行首图标（唯一事实源）。
 IconData libraryFileIcon(LibraryFile file) {
@@ -24,16 +27,28 @@ IconData libraryFileIcon(LibraryFile file) {
   return Icons.insert_drive_file_outlined;
 }
 
-/// v3 阶段 3 库·文件区（design-v3 §1.3/§3.1）+ DB v9 树形管理：
-/// 当前文件夹面包屑 + 子文件夹列表 + 文件列表；文件夹是虚拟的（落在文件
-/// folder 字段上），支持新建/重命名/删除（删除 = 文件上移一层，不删文件）、
-/// 多选移动到文件夹、多选「发送给助理」（草稿附件）；导入落到当前文件夹。
-/// 重命名/删除文件沿用原有入口（删除保留引用检查）。
+/// v3 阶段 3 库·文件区（design-v3 §1.3/§3.1）+ DB v9/v10 树形管理：
+/// 当前文件夹面包屑 + 子文件夹列表 + 文件列表；文件夹落在文件的 folder 字段上，
+/// 空文件夹由 library_folders 表持久化（v10）。支持新建/重命名/删除
+/// （删除 = 文件上移一层，不删文件）、多选移动到文件夹（树形选择器）、
+/// 树形总览跳转、列表/卡片两种展示、多选「发送给助理」（草稿附件）；
+/// 导入落到当前文件夹。重命名/删除文件沿用原有入口（删除保留引用检查）。
 class FilesPage extends StatefulWidget {
-  const FilesPage({super.key, this.onSelectionChanged});
+  const FilesPage({
+    super.key,
+    this.onSelectionChanged,
+    this.pickMode = false,
+    this.pickController,
+  });
 
   /// 多选态变化回调：库页容器用来在多选时隐藏 FAB（与消息分区一致）。
   final ValueChanged<bool>? onSelectionChanged;
+
+  /// 附件选择模式（2026-11-01）：复用本页的多选/文件夹导航，
+  /// 选择状态写入 [pickController]（跨分区累积、跨文件夹不丢），
+  /// 底部操作条由附件选择页统一提供。
+  final bool pickMode;
+  final AttachmentPickController? pickController;
 
   @override
   State<FilesPage> createState() => FilesPageState();
@@ -45,49 +60,109 @@ class FilesPageState extends State<FilesPage> {
 
   LibraryFolderView _view = const LibraryFolderView(folders: [], files: []);
 
-  /// 会话内新建但还没有文件的虚拟文件夹（有文件落入后即由 DB 派生，可移除）。
-  final Set<String> _virtualFolders = {};
-
   bool _loading = true;
   bool _importing = false;
+
+  /// 会话级展示模式（'list' | 'grid'）。
+  String _viewMode = 'list';
 
   bool _selecting = false;
   final Set<String> _selected = {};
 
+  /// 当前层各直接子文件夹（含后代）的文件列表（文件夹整选用，
+  /// reload 时一并加载；文件夹数量少，代价可忽略）。
+  Map<String, List<LibraryFile>> _subfolderFiles = {};
+
   @override
   void initState() {
     super.initState();
+    // pick 模式：本地 _selected 是控制器（唯一事实源）的镜像
+    if (widget.pickMode) {
+      widget.pickController?.addListener(_syncFromPick);
+      _syncFromPick();
+    }
     reload();
   }
 
+  @override
+  void dispose() {
+    if (widget.pickMode) {
+      widget.pickController?.removeListener(_syncFromPick);
+    }
+    super.dispose();
+  }
+
+  AttachmentPickController? get _pick =>
+      widget.pickMode ? widget.pickController : null;
+
+  /// pick 模式：控制器 → 本地多选态回同步（跨文件夹选择也保留在控制器里）。
+  void _syncFromPick() {
+    final pick = _pick;
+    if (pick == null || !mounted) return;
+    setState(() {
+      _selected
+        ..clear()
+        ..addAll(pick.idsOfType(ChatAttachmentType.file));
+      if (_selected.isEmpty) _selecting = false;
+    });
+  }
+
   Future<void> reload() async {
-    final view = await LibraryFileService.instance
-        .listFolder(_folder, extraFolders: _virtualFolders);
+    final view = await LibraryFileService.instance.listFolder(_folder);
+    // 直接子文件夹（含后代）的文件，供文件夹整选/勾选态显示
+    final subFiles = <String, List<LibraryFile>>{};
+    for (final name in view.folders) {
+      subFiles[name] = await LibraryFileService.instance
+          .filesUnderFolder(joinFolderPath(_folder, name));
+    }
     if (mounted) {
       setState(() {
         _view = view;
+        _subfolderFiles = subFiles;
         _loading = false;
-        _selected.removeWhere((id) => !view.files.any((f) => f.id == id));
-        if (_selected.isEmpty) _selecting = false;
+        if (!widget.pickMode) {
+          // 保留子文件夹整选带入的选择（它们的文件不在本层视图里）
+          final keep = <String>{
+            ...view.files.map((f) => f.id),
+            for (final files in subFiles.values) ...files.map((f) => f.id),
+          };
+          _selected.removeWhere((id) => !keep.contains(id));
+          if (_selected.isEmpty) _selecting = false;
+        }
       });
+      // pick 模式：为已选条目补充显示名（底栏 chip 用）
+      final pick = _pick;
+      if (pick != null) {
+        final all = [...view.files, for (final fs in subFiles.values) ...fs];
+        for (final f in all) {
+          if (pick.isSelected(ChatAttachmentType.file, f.id)) {
+            pick.registerMeta(
+                ChatAttachmentType.file, f.id, f.name, libraryFileIcon(f));
+          }
+        }
+      }
       widget.onSelectionChanged?.call(_selecting);
     }
   }
 
-  void _enterFolder(String name) {
+  Future<void> _enterFolder(String name) async {
     setState(() {
       _folder = joinFolderPath(_folder, name);
-      _exitSelection(notify: false);
+      // pick 模式：选择跨文件夹保留（存在控制器里）
+      if (!widget.pickMode) _exitSelection(notify: false);
     });
-    widget.onSelectionChanged?.call(false);
+    if (!widget.pickMode) widget.onSelectionChanged?.call(false);
+    // 必须重新拉取：否则 _view 仍是上一层数据，空文件夹可无限「进入」
+    await reload();
   }
 
-  void _jumpTo(String path) {
+  Future<void> _jumpTo(String path) async {
     setState(() {
       _folder = path;
-      _exitSelection(notify: false);
+      if (!widget.pickMode) _exitSelection(notify: false);
     });
-    widget.onSelectionChanged?.call(false);
+    if (!widget.pickMode) widget.onSelectionChanged?.call(false);
+    await reload();
   }
 
   // ---- 文件夹 ----
@@ -104,7 +179,8 @@ class FilesPageState extends State<FilesPage> {
       _toast('已存在同名文件夹');
       return;
     }
-    setState(() => _virtualFolders.add(path));
+    // 空文件夹落库（library_folders 表），离开页面后仍可见
+    await LibraryFileService.instance.createFolder(path);
     await reload();
   }
 
@@ -119,22 +195,12 @@ class FilesPageState extends State<FilesPage> {
       _toast('${e.message}');
       return;
     }
-    // 会话内虚拟文件夹跟随换前缀
-    final newPath = joinFolderPath(_folder, newName);
-    final remapped = <String>{};
-    for (final v in _virtualFolders) {
-      remapped.add(folderIsUnder(v, path) ? '$newPath${v.substring(path.length)}' : v);
-    }
-    _virtualFolders
-      ..clear()
-      ..addAll(remapped);
     await reload();
   }
 
   Future<void> _deleteFolder(String name) async {
     final path = joinFolderPath(_folder, name);
     final moved = await LibraryFileService.instance.deleteFolder(path);
-    _virtualFolders.removeWhere((v) => folderIsUnder(v, path));
     await reload();
     _toast(moved > 0 ? '文件夹已删除，$moved 个文件已移到上级' : '文件夹已删除');
   }
@@ -142,6 +208,14 @@ class FilesPageState extends State<FilesPage> {
   // ---- 多选 ----
 
   void _toggleSelect(LibraryFile f) {
+    final pick = _pick;
+    if (pick != null) {
+      // pick 模式：写控制器，本地状态由 _syncFromPick 回同步
+      pick.toggle(ChatAttachmentType.file, f.id,
+          title: f.name, icon: libraryFileIcon(f));
+      setState(() => _selecting = true);
+      return;
+    }
     setState(() {
       if (!_selected.remove(f.id)) _selected.add(f.id);
       if (_selected.isEmpty) _selecting = false;
@@ -149,14 +223,67 @@ class FilesPageState extends State<FilesPage> {
     widget.onSelectionChanged?.call(_selecting);
   }
 
+  /// 文件夹整选（2026-11-01）：勾选文件夹 = 选中其（含后代）全部文件。
+  int _folderSelectState(String name) {
+    final files = _subfolderFiles[name] ?? const [];
+    if (files.isEmpty) return 0;
+    final n = files.where((f) => _selected.contains(f.id)).length;
+    if (n == 0) return 0;
+    return n == files.length ? 2 : 1;
+  }
+
+  void _toggleSelectFolder(String name) {
+    final files = _subfolderFiles[name] ?? const [];
+    if (files.isEmpty) return;
+    final allSelected = files.every((f) => _selected.contains(f.id));
+    final pick = _pick;
+    if (pick != null) {
+      for (final f in files) {
+        final sel = pick.isSelected(ChatAttachmentType.file, f.id);
+        if (allSelected ? sel : !sel) {
+          pick.toggle(ChatAttachmentType.file, f.id,
+              title: f.name, icon: libraryFileIcon(f));
+        }
+      }
+      setState(() {});
+      return;
+    }
+    setState(() {
+      if (allSelected) {
+        _selected.removeAll(files.map((f) => f.id));
+        if (_selected.isEmpty) _selecting = false;
+      } else {
+        _selected.addAll(files.map((f) => f.id));
+      }
+    });
+    widget.onSelectionChanged?.call(_selecting);
+  }
+
   void _exitSelection({bool notify = true}) {
+    final pick = _pick;
+    if (pick != null) {
+      pick.clearType(ChatAttachmentType.file);
+      setState(() => _selecting = false);
+      return;
+    }
     _selecting = false;
     _selected.clear();
     if (notify) widget.onSelectionChanged?.call(false);
   }
 
-  List<LibraryFile> get _selectedFiles =>
-      _view.files.where((f) => _selected.contains(f.id)).toList();
+  /// 当前选中的文件实体（本层视图 + 子文件夹整选带入，去重）。
+  List<LibraryFile> get _selectedFiles {
+    final out = <String, LibraryFile>{
+      for (final f in _view.files)
+        if (_selected.contains(f.id)) f.id: f,
+    };
+    for (final files in _subfolderFiles.values) {
+      for (final f in files) {
+        if (_selected.contains(f.id)) out[f.id] = f;
+      }
+    }
+    return out.values.toList();
+  }
 
   Future<void> _moveSelected() async {
     final targets = _selectedFiles;
@@ -170,53 +297,18 @@ class FilesPageState extends State<FilesPage> {
     _toast('已移动 ${targets.length} 个文件到${dest.isEmpty ? '根目录' : '「$dest」'}');
   }
 
-  /// 移动目标选择（L5 小型 sheet）：根目录 + 全部文件夹 + 新建文件夹。
+  /// 移动目标选择：树形文件夹选择器（可展开层级），含新建文件夹。
   Future<String?> _pickMoveTarget() async {
-    final folders = await LibraryFileService.instance
-        .allFolders(extraFolders: _virtualFolders);
+    final folders = await LibraryFileService.instance.allFolders();
     if (!mounted) return null;
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      showDragHandle: true,
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const ListTile(
-              title: Text('移动到',
-                  style: TextStyle(fontWeight: FontWeight.w600)),
-            ),
-            const Divider(height: 1),
-            Flexible(
-              child: ListView(
-                shrinkWrap: true,
-                children: [
-                  ListTile(
-                    leading: const Icon(Icons.home_outlined),
-                    title: const Text('根目录'),
-                    onTap: () => Navigator.of(sheetContext).pop(''),
-                  ),
-                  for (final f in folders)
-                    ListTile(
-                      leading: const Icon(Icons.folder_outlined),
-                      title:
-                          Text(f, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      onTap: () => Navigator.of(sheetContext).pop(f),
-                    ),
-                  ListTile(
-                    leading: const Icon(Icons.create_new_folder_outlined),
-                    title: const Text('新建文件夹…'),
-                    onTap: () => Navigator.of(sheetContext).pop('__new__'),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
+    final choice = await showFolderTreePicker(
+      context,
+      title: '移动到',
+      folders: folders,
+      allowCreate: true,
     );
     if (choice == null || choice != '__new__') return choice;
-    // 新建文件夹作为移动目标：建在根目录下，立即成为移动落点（不算空虚拟文件夹）
+    // 新建文件夹作为移动目标：建在根目录下，立即成为移动落点
     if (!mounted) return null;
     final name = await promptNameDialog(context, title: '新建文件夹');
     if (name == null) return null;
@@ -494,8 +586,6 @@ class FilesPageState extends State<FilesPage> {
     return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
   }
 
-  IconData _iconFor(LibraryFile file) => libraryFileIcon(file);
-
   /// 面包屑行（分区级首行工具条，ui-structure §4）：
   /// 「文件 / seg / seg」逐级可点跳转，尾端新建文件夹入口。
   Widget _buildBreadcrumb(BuildContext context) {
@@ -520,9 +610,37 @@ class FilesPageState extends State<FilesPage> {
             ),
           ),
           IconButton(
+            tooltip: '文件夹总览',
+            icon: const Icon(Icons.account_tree_outlined),
+            onPressed: () async {
+              final folders =
+                  await LibraryFileService.instance.allFolders();
+              if (!context.mounted) return;
+              showFolderTreeOverview(
+                context,
+                folders: folders,
+                currentFolder: _folder,
+                onJump: _jumpTo,
+              );
+            },
+          ),
+          IconButton(
+            tooltip: _viewMode == 'list' ? '卡片模式' : '列表模式',
+            icon: Icon(_viewMode == 'list'
+                ? Icons.view_module_outlined
+                : Icons.view_list_outlined),
+            onPressed: () => setState(
+                () => _viewMode = _viewMode == 'list' ? 'grid' : 'list'),
+          ),
+          IconButton(
             tooltip: '新建文件夹',
             icon: const Icon(Icons.create_new_folder_outlined),
             onPressed: _createFolder,
+          ),
+          IconButton(
+            tooltip: '导入文件',
+            icon: const Icon(Icons.upload_file_outlined),
+            onPressed: importEntry,
           ),
         ],
       ),
@@ -574,14 +692,31 @@ class FilesPageState extends State<FilesPage> {
           Text('已选 ${_selected.length} 项'),
           const Spacer(),
           TextButton(
-            onPressed: () =>
-                setState(() => _selected.addAll(_view.files.map((f) => f.id))),
+            onPressed: () {
+              final pick = _pick;
+              if (pick != null) {
+                for (final f in _view.files) {
+                  pick.select(ChatAttachmentType.file, f.id,
+                      title: f.name, icon: libraryFileIcon(f));
+                }
+                return;
+              }
+              setState(
+                  () => _selected.addAll(_view.files.map((f) => f.id)));
+            },
             child: const Text('全选'),
           ),
           TextButton(
             onPressed: _selected.isEmpty
                 ? null
-                : () => setState(() => _selected.clear()),
+                : () {
+                      final pick = _pick;
+                      if (pick != null) {
+                        pick.clearType(ChatAttachmentType.file);
+                        return;
+                      }
+                      setState(() => _selected.clear());
+                    },
             child: const Text('取消'),
           ),
         ],
@@ -609,44 +744,248 @@ class FilesPageState extends State<FilesPage> {
     );
   }
 
+  /// 文件夹条目与文件条目同一套版式（2026-11-01）：40px 缩略图位
+  /// （文件夹图标代替文件缩略图）+ 名称 + 副标题（文件数）。
+  /// 多选/附件选择态：行首变三态勾选（整选含后代全部文件），
+  /// 「进入」移到尾端箭头。
   Widget _buildFolderTile(String name) {
+    final cs = Theme.of(context).colorScheme;
+    final selectable = _selecting || widget.pickMode;
+    final state = _folderSelectState(name);
+    final count = (_subfolderFiles[name] ?? const []).length;
     return ListTile(
-      leading: const Icon(Icons.folder_outlined),
+      leading: selectable
+          ? Icon(
+              switch (state) {
+                2 => Icons.check_circle,
+                1 => Icons.indeterminate_check_box,
+                _ => Icons.radio_button_unchecked,
+              },
+              color: state == 0 ? cs.outline : cs.primary,
+            )
+          : const _FolderThumbnail(size: 40),
       title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
-      trailing: const Icon(Icons.more_vert),
-      onTap: () => _enterFolder(name),
-      onLongPress: () => _showFolderActions(name),
+      subtitle: Text('$count 个文件'),
+      trailing: selectable
+          // 多选态：点击行 = 整选，进入文件夹保留为尾端按钮
+          ? IconButton(
+              tooltip: '进入',
+              icon: const Icon(Icons.chevron_right),
+              onPressed: () => _enterFolder(name),
+            )
+          : const Icon(Icons.more_vert),
+      onTap: () =>
+          selectable ? _toggleSelectFolder(name) : _enterFolder(name),
+      onLongPress: selectable ? null : () => _showFolderActions(name),
     );
   }
 
   Widget _buildFileTile(LibraryFile file) {
     final selected = _selected.contains(file.id);
+    // pick 模式（附件选择）：点击即选中/取消，无操作菜单、无需先长按进多选
+    final pickUI = widget.pickMode;
     return ListTile(
-      leading: _selecting
+      leading: _selecting || pickUI
           ? Icon(selected
               ? Icons.check_circle
               : Icons.radio_button_unchecked)
-          : Icon(_iconFor(file)),
+          : FileThumbnail(file: file, size: 40),
       title: Text(file.name, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: Text(
           '${_formatSize(file.size)} · ${_formatTime(file.createdAt)}'),
-      trailing: _selecting ? null : const Icon(Icons.more_vert),
+      trailing: _selecting || pickUI ? null : const Icon(Icons.more_vert),
       onTap: () {
-        if (_selecting) {
+        if (_selecting || pickUI) {
           _toggleSelect(file);
         } else {
           _showActions(file);
         }
       },
-      onLongPress: () {
-        if (!_selecting) {
-          setState(() {
-            _selecting = true;
-            _selected.add(file.id);
-          });
-          widget.onSelectionChanged?.call(true);
+      onLongPress: pickUI
+          ? null
+          : () {
+              if (!_selecting) {
+                setState(() {
+                  _selecting = true;
+                  _selected.add(file.id);
+                });
+                widget.onSelectionChanged?.call(true);
+              }
+            },
+    );
+  }
+
+  /// 卡片模式（grid）：文件夹大卡 + 文件缩略图卡，点击行为与列表一致。
+  Widget _buildGrid() {
+    final itemCount = _view.folders.length + _view.files.length;
+    return GridView.builder(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.all(12),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+        childAspectRatio: 0.82,
+      ),
+      itemCount: itemCount,
+      itemBuilder: (context, index) {
+        if (index < _view.folders.length) {
+          return _buildFolderCard(_view.folders[index]);
         }
+        return _buildFileCard(_view.files[index - _view.folders.length]);
       },
+    );
+  }
+
+  /// 文件夹卡与文件卡同一套版式：缩略图区（文件夹图标）+ 名称 + 元信息；
+  /// 多选态右上角三态勾选，名称旁的箭头进入文件夹。
+  Widget _buildFolderCard(String name) {
+    final cs = Theme.of(context).colorScheme;
+    final selectable = _selecting || widget.pickMode;
+    final state = _folderSelectState(name);
+    final count = (_subfolderFiles[name] ?? const []).length;
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      elevation: 0,
+      color: cs.surfaceContainerLow,
+      shape: state != 0
+          ? RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: cs.primary, width: 2),
+            )
+          : null,
+      child: InkWell(
+        onTap: () =>
+            selectable ? _toggleSelectFolder(name) : _enterFolder(name),
+        onLongPress:
+            selectable ? null : () => _showFolderActions(name),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  const _FolderThumbnail(size: 96, fill: true),
+                  if (selectable)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: Icon(
+                        switch (state) {
+                          2 => Icons.check_circle,
+                          1 => Icons.indeterminate_check_box,
+                          _ => Icons.radio_button_unchecked,
+                        },
+                        size: 22,
+                        color: state == 0 ? cs.onSurfaceVariant : cs.primary,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 6, 8, 2),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12.5)),
+                  ),
+                  if (selectable)
+                    // 多选态保留进入入口（点击卡片 = 整选）
+                    GestureDetector(
+                      onTap: () => _enterFolder(name),
+                      child: Icon(Icons.chevron_right,
+                          size: 16, color: cs.onSurfaceVariant),
+                    ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
+              child: Text('$count 个文件',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFileCard(LibraryFile file) {
+    final cs = Theme.of(context).colorScheme;
+    final selected = _selected.contains(file.id);
+    final pickUI = widget.pickMode;
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      elevation: 0,
+      color: cs.surfaceContainerLow,
+      shape: selected
+          ? RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: cs.primary, width: 2),
+            )
+          : null,
+      child: InkWell(
+        onTap: () {
+          if (_selecting || pickUI) {
+            _toggleSelect(file);
+          } else {
+            _showActions(file);
+          }
+        },
+        onLongPress: pickUI
+            ? null
+            : () {
+                if (!_selecting) {
+                  setState(() {
+                    _selecting = true;
+                    _selected.add(file.id);
+                  });
+                  widget.onSelectionChanged?.call(true);
+                }
+              },
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  FileThumbnail(file: file, size: 96, fill: true),
+                  if (_selecting || pickUI)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: Icon(
+                        selected
+                            ? Icons.check_circle
+                            : Icons.radio_button_unchecked,
+                        size: 22,
+                        color: selected ? cs.primary : cs.onSurfaceVariant,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 6, 8, 2),
+              child: Text(file.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12.5)),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
+              child: Text(_formatSize(file.size),
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -660,7 +999,13 @@ class FilesPageState extends State<FilesPage> {
       body: Column(
         children: [
           if (_importing) const LinearProgressIndicator(minHeight: 2),
-          if (_selecting) _buildSelectionHeader() else _buildBreadcrumb(context),
+          // 面包屑始终显示；多选工具条独立占一行（2026-11-01：原先多选
+          // 会顶掉面包屑，多选期间无法导航/切换视图/导入）
+          _buildBreadcrumb(context),
+          if (_selecting) ...[
+            const Divider(height: 1),
+            _buildSelectionHeader(),
+          ],
           const Divider(height: 1),
           Expanded(
             child: _loading
@@ -673,21 +1018,56 @@ class FilesPageState extends State<FilesPage> {
                       )
                     : RefreshIndicator(
                         onRefresh: reload,
-                        child: ListView.builder(
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          itemCount: itemCount,
-                          itemBuilder: (context, index) {
-                            if (index < _view.folders.length) {
-                              return _buildFolderTile(_view.folders[index]);
-                            }
-                            return _buildFileTile(
-                                _view.files[index - _view.folders.length]);
-                          },
-                        ),
+                        child: _viewMode == 'grid'
+                            ? _buildGrid()
+                            : ListView.builder(
+                                physics:
+                                    const AlwaysScrollableScrollPhysics(),
+                                itemCount: itemCount,
+                                itemBuilder: (context, index) {
+                                  if (index < _view.folders.length) {
+                                    return _buildFolderTile(
+                                        _view.folders[index]);
+                                  }
+                                  return _buildFileTile(_view.files[
+                                      index - _view.folders.length]);
+                                },
+                              ),
                       ),
           ),
-          if (_selecting) _buildSelectionBar(),
+          // pick 模式：底部操作条由附件选择页统一提供（已选附件 + 确认）
+          if (_selecting && !widget.pickMode) _buildSelectionBar(),
         ],
+      ),
+    );
+  }
+}
+
+/// 文件夹「缩略图」（2026-11-01 与文件条目统一版式）：与 [FileThumbnail]
+/// 相同的容器尺寸与圆角，内容固定为文件夹图标。
+class _FolderThumbnail extends StatelessWidget {
+  final double size;
+  final bool fill;
+
+  const _FolderThumbnail({this.size = 40, this.fill = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final icon = Icon(Icons.folder_outlined,
+        size: fill ? 44 : size * 0.55, color: cs.primary);
+    if (fill) {
+      return SizedBox.expand(
+        child: Container(color: cs.surfaceContainerHigh, child: Center(child: icon)),
+      );
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: Container(
+            color: cs.surfaceContainerHigh, child: Center(child: icon)),
       ),
     );
   }

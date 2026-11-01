@@ -40,6 +40,8 @@ void main() {
   setUp(() async {
     db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
     await createFilesTable(db);
+    // v10 起 listFolder/allFolders 与 library_folders 表取并集（空文件夹持久化）
+    await migrateToV10(db);
     appDb.debugAttachDatabase(db);
     tmp = Directory.systemTemp.createTempSync('msgrepo-folder-');
     AttachmentStore.debugDirOverride = tmp;
@@ -172,5 +174,22 @@ void main() {
     final nested = await importFile('n.txt', folder: '工作/截图');
     expect(nested.folder, '工作/截图');
     expect((await appDb.getFileById(nested.id))?.folder, '工作/截图');
+  });
+
+  group('getFilesUnderFolder（文件夹整选）', () {
+    test('命中本层与全部后代，段边界外不受影响', () async {
+      await importFile('a.txt', folder: '工作');
+      await importFile('b.txt', folder: '工作/截图');
+      await importFile('c.txt', folder: '工作/截图/原图');
+      await importFile('d.txt', folder: '工作2');
+      await importFile('e.txt');
+
+      final under = await appDb.getFilesUnderFolder('工作');
+      expect(under.map((f) => f.name).toSet(), {'a.txt', 'b.txt', 'c.txt'},
+          reason: '含多级后代，不含 工作2 与根目录文件');
+
+      final root = await appDb.getFilesUnderFolder('');
+      expect(root, hasLength(5), reason: '空路径 = 全库');
+    });
   });
 }

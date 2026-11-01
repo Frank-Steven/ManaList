@@ -54,7 +54,8 @@ class TaskScheduleView extends StatefulWidget {
   State<TaskScheduleView> createState() => TaskScheduleViewState();
 }
 
-class TaskScheduleViewState extends State<TaskScheduleView> {
+class TaskScheduleViewState extends State<TaskScheduleView>
+    with SingleTickerProviderStateMixin {
   /// 当前视图的可视中心（由各视图 onCenterChanged 回写）。
   DateTime _anchor = DateTime.now();
 
@@ -98,12 +99,14 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
   final _monthKey = GlobalKey<MonthViewState>();
   final _dayKey = GlobalKey<DayViewState>();
 
-  // ---- 甘特 / 底部任务列表分栏：展开/收起双模态（2026-10-28）----
+  // ---- 甘特 / 底部任务列表分栏：展开/收起双模态（2026-11-01 改为跟随拖拽）----
   //
-  // 取消手动拖拽调高（原 F13② 的拖动手柄 + 高度持久化全部下线）：
-  //  · 期导航工具条上的展开/收起按钮两态切换；
-  //  · 展开态 = 分栏视口的 [_barExpandedRatio]（约屏高 35%）；
-  //  · 收起态 = 只留列表标题行（[_barCollapsedH]，含该期任务数）；
+  // 交互（2026-11-01 改版，替代期导航工具条上的展开/收起按钮）：
+  //  · 展开态：列表内容滚动到顶部后继续向下拖拽，面板高度跟随手指，
+  //    松手按位置/速度决定收起还是回弹展开（标题行本身也可直接拖拽）；
+  //  · 收起态：点击标题行展开，或向上拖拽，松手按位置/速度决定；
+  //  · 展开态高度 = 分栏视口的 [_barExpandedRatio]（约屏高 35%），
+  //    收起态 = 只留列表标题行（[_barCollapsedH]，含该期任务数）；
   //  · 状态按粒度记忆在 State 内（[_barExpandedByGranularity]），不持久化。
   static const _barCollapsedH = 40.0;
   static const _barExpandedRatio = 0.35;
@@ -114,13 +117,83 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
   bool get _barExpanded =>
       _barExpandedByGranularity[widget.granularity] ?? true;
 
-  void _toggleBar() => setState(
-      () => _barExpandedByGranularity[widget.granularity] = !_barExpanded);
+  set _barExpanded(bool v) =>
+      _barExpandedByGranularity[widget.granularity] = v;
+
+  /// 拖拽中的面板高度（null = 未拖拽，高度由 [_barExpanded] 推导）。
+  double? _dragBarH;
+
+  /// 松手后的吸附动画。
+  AnimationController? _barAnim;
+
+  /// 当前面板高度（拖拽中取 [_dragBarH]，否则按展开状态推导）。
+  double _barHeight(double vp) {
+    final expandedH = vp * _barExpandedRatio;
+    final drag = _dragBarH;
+    if (drag != null) return drag.clamp(_barCollapsedH, expandedH);
+    return _barExpanded ? expandedH : _barCollapsedH;
+  }
+
+  void _barDragStart(double vp) {
+    _barAnim?.stop();
+    _dragBarH = _barHeight(vp);
+  }
+
+  /// [dy] 为手指纵向位移（正 = 向下，面板变矮）。
+  void _barDragUpdate(double dy, double vp) {
+    final expandedH = vp * _barExpandedRatio;
+    setState(() =>
+        _dragBarH = (_dragBarH! - dy).clamp(_barCollapsedH, expandedH));
+  }
+
+  /// 松手：只看松手位置——面板顶边落在展开区域的上半（高度超过展开
+  /// 高度的一半）则吸附展开，否则收起；随后动画吸附到稳定态。
+  void _barDragEnd(double vp) {
+    final expandedH = vp * _barExpandedRatio;
+    final h = _dragBarH ?? _barHeight(vp);
+    _snapBarTo(vp, h > expandedH / 2);
+  }
+
+  /// 动画吸附到展开/收起稳定态（松手吸附与点击切换共用同一条路径，
+  /// 保证面板只有两种稳定状态，拖拽中间值永远不会停留）。
+  void _snapBarTo(double vp, bool expand) {
+    final expandedH = vp * _barExpandedRatio;
+    final target = expand ? expandedH : _barCollapsedH;
+    final h = _dragBarH ?? _barHeight(vp);
+    setState(() => _barExpanded = expand);
+    if ((h - target).abs() < 0.5) {
+      _dragBarH = null;
+      return;
+    }
+    _barAnim?.dispose();
+    final ctrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 180));
+    final anim = Tween(begin: h, end: target)
+        .animate(CurvedAnimation(parent: ctrl, curve: Curves.easeOut));
+    ctrl.addListener(() {
+      if (mounted) setState(() => _dragBarH = anim.value);
+    });
+    ctrl.addStatusListener((s) {
+      if (s == AnimationStatus.completed) {
+        setState(() => _dragBarH = null);
+        ctrl.dispose();
+        if (_barAnim == ctrl) _barAnim = null;
+      }
+    });
+    _barAnim = ctrl;
+    ctrl.forward();
+  }
 
   @override
   void initState() {
     super.initState();
     reload();
+  }
+
+  @override
+  void dispose() {
+    _barAnim?.dispose();
+    super.dispose();
   }
 
   @override
@@ -132,12 +205,15 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
       _pendingJump = false;
       return;
     }
-    // 宿主切换视图模式：清选中并滚动到当前锚点（原段选器 onChanged 的行为）
+    // 宿主切换视图模式（纯 Tab 切换）：清选中，锚点重置到现在——
+    // 新挂载的视图会自行定位到当前（月/年 scrollToNow、日首帧居中），
+    // 不要再跳到旧锚点（2026-11-01 修复：原先这里两帧后 _scrollCurrentTo
+    // 旧锚点，视图先正确定位到「现在」又被跳走）。
     setState(() {
       _selectedTask = null;
       _detailMode = false;
+      _anchor = DateTime.now();
     });
-    _afterTwoFrames(() => _scrollCurrentTo(_anchor));
   }
 
   /// 布局：**永远铺满屏幕**，自由度只有「底部任务列表展开 / 收起」两态。
@@ -148,14 +224,58 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
       if (!vp.isFinite || vp <= 0) {
         return Column(children: [
           Expanded(flex: 3, child: _ganttView()),
-          Expanded(flex: 2, child: _bottomSection(context)),
+          Expanded(flex: 2, child: _bottomSection(context, vp)),
         ]);
       }
-      var barH = _barExpanded ? vp * _barExpandedRatio : _barCollapsedH;
-      if (barH < _barCollapsedH) barH = _barCollapsedH;
+      final barH = _barHeight(vp);
       return Column(children: [
-        Expanded(child: _ganttView()),
-        SizedBox(height: barH, child: _bottomSection(context)),
+        // 粒度切换：淡出淡入 + 轻微横移过渡。时长与任务页 TabBar 指示器
+        // 动画（kTabScrollDuration 300ms）一致，两者同步起跑同步结束。
+        Expanded(
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            switchInCurve: Curves.easeOut,
+            switchOutCurve: Curves.easeIn,
+            transitionBuilder: (child, anim) => FadeTransition(
+              opacity: anim,
+              child: SlideTransition(
+                position: Tween<Offset>(
+                        begin: const Offset(0.04, 0), end: Offset.zero)
+                    .animate(anim),
+                child: child,
+              ),
+            ),
+            child: KeyedSubtree(
+              key: ValueKey('gantt-${widget.granularity}'),
+              // 任务数据变化（拖放/新建/编辑/删除落库后 reload）时，
+              // 图形层做一次快速 settle 过渡，替代生硬跳变
+              child: _GanttSettleTransition(
+                revision: _cacheRevision,
+                child: _ganttView(),
+              ),
+            ),
+          ),
+        ),
+        // 列表/详情内容滚到顶部后继续下拉 → 面板跟随手指变矮（收起手势）
+        NotificationListener<ScrollNotification>(
+          onNotification: (n) {
+            if (n is OverscrollNotification &&
+                n.overscroll < 0 &&
+                n.metrics.axis == Axis.vertical) {
+              // 顶部继续下拉且面板还有高度可让：overscroll 为负，累减到面板高度
+              if (_barHeight(vp) > _barCollapsedH + 1) {
+                _dragBarH ??= _barHeight(vp);
+                _barDragUpdate(-n.overscroll, vp);
+              }
+            } else if (n is ScrollEndNotification && _dragBarH != null) {
+              // 松手必须吸附（修复：旧守卫按高度拦截，拖到底时把
+              // ScrollEnd 一并挡掉，面板卡在 40px 的压缩中间态）
+              _barDragEnd(vp);
+            }
+            return false;
+          },
+          child: SizedBox(height: barH, child: _bottomSection(context, vp)),
+        ),
       ]);
     });
   }
@@ -480,6 +600,7 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
   }
 
   /// 标题栏箭头平移：年度 ±20 年、年 ±1 年、月 ±1 月、日 ±1 天。
+  /// 按钮触发的定位平滑滚动（2026-11-01：原先硬跳，图形位置突变）。
   void _shiftPeriod(int delta) {
     final target = switch (widget.granularity) {
       0 => DateTime(_anchor.year + delta * 20, _anchor.month),
@@ -488,20 +609,20 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
       _ => DateTime(_anchor.year, _anchor.month, _anchor.day + delta),
     };
     setState(() => _anchor = target);
-    _scrollCurrentTo(target);
+    _scrollCurrentTo(target, animated: true);
   }
 
-  /// 滚动当前粒度视图到指定日期。
-  void _scrollCurrentTo(DateTime target) {
+  /// 滚动当前粒度视图到指定日期（[animated] = 平滑滚动，按钮定位用）。
+  void _scrollCurrentTo(DateTime target, {bool animated = false}) {
     switch (widget.granularity) {
       case 0:
-        _yearlyKey.currentState?.scrollTo(target);
+        _yearlyKey.currentState?.scrollTo(target, animated: animated);
       case 1:
-        _yearKey.currentState?.scrollTo(target);
+        _yearKey.currentState?.scrollTo(target, animated: animated);
       case 2:
-        _monthKey.currentState?.scrollTo(target);
+        _monthKey.currentState?.scrollTo(target, animated: animated);
       case 3:
-        _dayKey.currentState?.scrollTo(target);
+        _dayKey.currentState?.scrollTo(target, animated: animated);
     }
   }
 
@@ -511,13 +632,13 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
   void _goNow() {
     switch (widget.granularity) {
       case 0:
-        _yearlyKey.currentState?.scrollToNow();
+        _yearlyKey.currentState?.scrollToNow(animated: true);
       case 1:
-        _yearKey.currentState?.scrollToNow();
+        _yearKey.currentState?.scrollToNow(animated: true);
       case 2:
-        _monthKey.currentState?.scrollToNow();
+        _monthKey.currentState?.scrollToNow(animated: true);
       case 3:
-        _dayKey.currentState?.scrollToNow();
+        _dayKey.currentState?.scrollToNow(animated: true);
     }
   }
 
@@ -559,6 +680,7 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
           onYearTap: (year) {
             final target = DateTime(year, 7);
             setState(() => _anchor = target);
+            _pendingJump = true; // 下钻自带定位（下方 scrollTo），跳过 didUpdateWidget
             widget.onSwitchGranularity?.call(1);
             _afterTwoFrames(() => _yearKey.currentState?.scrollTo(target));
           },
@@ -575,6 +697,7 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
             final d = DateTime.fromMillisecondsSinceEpoch(ms);
             final target = DateTime(d.year, d.month, d.day);
             setState(() => _anchor = target);
+            _pendingJump = true;
             widget.onSwitchGranularity?.call(3);
             _afterTwoFrames(() => _dayKey.currentState?.scrollTo(target));
           },
@@ -610,6 +733,7 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
             final m = DateTime.fromMillisecondsSinceEpoch(ms);
             final target = DateTime(m.year, m.month, 15);
             setState(() => _anchor = target);
+            _pendingJump = true;
             widget.onSwitchGranularity?.call(2);
             _afterTwoFrames(() => _monthKey.currentState?.scrollTo(target));
           },
@@ -628,14 +752,14 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
     }
   }
 
-  /// 底部板块（v2.5 双模式 + 2026-10-28 展开/收起）：收起态只留列表标题行
-  ///（含该期任务数）；展开态 = 详情模式 TaskDetailPanel（带返回按钮）或
-  /// 可视范围任务列表（选中行高亮，点击行进详情）。
-  Widget _bottomSection(BuildContext context) {
-    if (!_barExpanded) {
+  /// 底部板块（2026-11-01 拖拽版）：收起态只留标题行（点击展开 / 上拖跟随）；
+  /// 展开态 = 详情模式 TaskDetailPanel（带返回按钮）或可视范围任务列表
+  /// （选中行高亮，点击行进详情），内容滚到顶部后继续下拉 = 面板跟随手指收起。
+  Widget _bottomSection(BuildContext context, double vp) {
+    if (!_barExpanded && _dragBarH == null) {
       return Column(children: [
         const Divider(height: 1),
-        _listHeader(_bottomTasks.length),
+        _dragHandleHeader(context, vp, _bottomTasks.length),
       ]);
     }
     final selected = _selectedTask;
@@ -644,6 +768,9 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
         const Divider(height: 1),
         Expanded(
           child: SingleChildScrollView(
+            // Clamping：顶部继续下拉时发 OverscrollNotification（收起手势）
+            physics: const AlwaysScrollableScrollPhysics(
+                parent: ClampingScrollPhysics()),
             child: TaskDetailPanel(
               key: ValueKey(selected.id),
               task: selected,
@@ -659,7 +786,7 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
     return Column(
       children: [
         const Divider(height: 1),
-        _listHeader(tasks.length),
+        _dragHandleHeader(context, vp, tasks.length),
         Expanded(
           child: tasks.isEmpty
               ? Center(
@@ -670,6 +797,10 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
                               .onSurfaceVariant)),
                 )
               : ListView.builder(
+                  // AlwaysScrollable + Clamping：短列表滚到顶部继续下拉时
+                  // 也能发 OverscrollNotification（面板跟随手指收起）
+                  physics: const AlwaysScrollableScrollPhysics(
+                      parent: ClampingScrollPhysics()),
                   itemCount: tasks.length,
                   itemBuilder: (context, i) {
                     final task = tasks[i];
@@ -696,18 +827,42 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
     );
   }
 
-  /// 列表标题行：「任务」+ 该期任务数（收起态下底部只留这一行）。
-  Widget _listHeader(int count) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 6, 12, 2),
-      child: Row(
-        children: [
-          Text('任务', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(width: 8),
-          Text('$count',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant)),
-        ],
+  /// 列表标题行：整行点击 = 展开/收起切换；纵向拖拽跟随手指调面板高度，
+  /// 松手按位置吸附（展开区域上半 → 展开，否则收起）。
+  Widget _dragHandleHeader(BuildContext context, double vp, int count) {
+    final draggable = vp.isFinite && vp > 0;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      // 两态都响应点击：收起态展开、展开态收起（吸附动画与拖拽松手同路径）
+      onTap: () => _snapBarTo(vp, !_barExpanded),
+      onVerticalDragStart: draggable ? (_) => _barDragStart(vp) : null,
+      onVerticalDragUpdate:
+          draggable ? (d) => _barDragUpdate(d.delta.dy, vp) : null,
+      onVerticalDragEnd: draggable ? (d) => _barDragEnd(vp) : null,
+      // 手势被抢走（系统手势/多指）也要吸附回稳定态，不留中间高度
+      onVerticalDragCancel:
+          draggable && _dragBarH != null ? () => _barDragEnd(vp) : null,
+      child: SizedBox(
+        height: _barCollapsedH,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 6, 12, 2),
+          child: Row(
+            children: [
+              Text('任务', style: Theme.of(context).textTheme.titleSmall),
+              const SizedBox(width: 8),
+              Text('$count',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color:
+                          Theme.of(context).colorScheme.onSurfaceVariant)),
+              const Spacer(),
+              Icon(
+                _barExpanded ? Icons.expand_more : Icons.expand_less,
+                size: 18,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -730,8 +885,8 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
     );
   }
 
-  /// 期导航首行工具条（原 AppBar 标题 Row 降级而来）：上一期/标题/下一期 +
-  /// 底部任务列表展开/收起切换（2026-10-28 双模态，替代原拖拽分割线）。
+  /// 期导航首行工具条（原 AppBar 标题 Row 降级而来）：上一期/标题/下一期。
+  /// 底部任务列表的展开/收起改为面板自身拖拽手势（2026-11-01），
   /// 「现在」已上收任务页 AppBar actions（ui-structure §6.2）。
   Widget _buildPeriodHeader() {
     return SizedBox(
@@ -749,13 +904,6 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
           visualDensity: VisualDensity.compact,
           onPressed: () => _shiftPeriod(1),
           icon: const Icon(Icons.chevron_right),
-        ),
-        IconButton(
-          tooltip: _barExpanded ? '收起任务列表' : '展开任务列表',
-          visualDensity: VisualDensity.compact,
-          onPressed: _toggleBar,
-          icon: Icon(
-              _barExpanded ? Icons.expand_more : Icons.expand_less),
         ),
       ]),
     );
@@ -779,6 +927,56 @@ class TaskScheduleViewState extends State<TaskScheduleView> {
             Expanded(child: _splitBody(context)),
         ],
       ),
+    );
+  }
+}
+
+/// 甘特图形层的数据变化过渡（2026-11-01）：任务拖放/新建/编辑落库后
+/// 任务条会跳到新位置——视图是 CustomPainter 渲染，逐条任务插值成本
+/// 高，这里对整层做一次快速「淡入 + 轻微上移」settle 动画，让图形
+/// 变化读起来是连续过渡而不是生硬跳变。[revision] 变化时重放一次。
+class _GanttSettleTransition extends StatefulWidget {
+  final int revision;
+  final Widget child;
+
+  const _GanttSettleTransition({required this.revision, required this.child});
+
+  @override
+  State<_GanttSettleTransition> createState() =>
+      _GanttSettleTransitionState();
+}
+
+class _GanttSettleTransitionState extends State<_GanttSettleTransition>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 200), value: 1);
+
+  @override
+  void didUpdateWidget(_GanttSettleTransition oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.revision != widget.revision) {
+      _ctrl.forward(from: 0);
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (context, child) => Opacity(
+        opacity: 0.55 + 0.45 * _ctrl.value,
+        child: Transform.translate(
+          offset: Offset(0, 6 * (1 - _ctrl.value)),
+          child: child,
+        ),
+      ),
+      child: widget.child,
     );
   }
 }

@@ -77,7 +77,9 @@ void main() {
 
       // 切回「年」：同一宿主换粒度 → YearView
       await tester.tap(switcherLabel('年'));
-      await settle(tester);
+      // 粒度切换有 AnimatedSwitcher 淡出淡入（220ms）：旧视图过渡期间
+      // 仍挂载，多 pump 几拍等动画完成再断言卸载
+      await settle(tester, 40);
       expect(find.byType(YearView), findsOneWidget);
       expect(find.byType(YearlyView), findsNothing);
       expect(find.byType(AppBar), findsOneWidget, reason: '换视图后仍唯一 AppBar');

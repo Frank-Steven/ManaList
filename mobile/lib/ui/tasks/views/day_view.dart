@@ -155,6 +155,33 @@ class DayViewState extends State<DayView>
     ctrl.animateWith(sim);
   }
 
+  /// 按钮定位的平滑滚动（期移箭头/「现在」，2026-11-01）：300ms easeOutCubic
+  /// 平移到目标位置。复用 _flingCtrl 槽位，取消/回收路径与 fling 一致。
+  void _animateScrollTo(double targetMin) {
+    _cancelFling();
+    final start = _scrollMin;
+    if ((targetMin - start).abs() < 0.01) {
+      setState(() => _scrollMin = targetMin);
+      _reportWindow();
+      return;
+    }
+    final ctrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 300));
+    final curve = CurvedAnimation(parent: ctrl, curve: Curves.easeOutCubic);
+    ctrl.addListener(() {
+      setState(() => _scrollMin = start + (targetMin - start) * curve.value);
+      _reportOnUnitChange(); // 标题实时跟随（单位变化才上报）
+    });
+    ctrl.addStatusListener((s) {
+      if (s == AnimationStatus.completed) {
+        _cancelFling();
+        _reportWindow();
+      }
+    });
+    _flingCtrl = ctrl;
+    ctrl.forward();
+  }
+
   double get _nowMin =>
       (DateTime.now().millisecondsSinceEpoch - _epochMs) / 60000.0;
 
@@ -180,30 +207,49 @@ class DayViewState extends State<DayView>
 
   /// 滚动到当前时刻并居中，短暂脉冲高亮（设计 §13-10）。
   /// v2.6.1：先停掉进行中的 fling 动画，否则动画下一帧会覆盖定位。
-  void scrollToNow() {
+  /// [animated]：按钮触发的定位平滑滚动，首帧自动定位保持硬跳。
+  void scrollToNow({bool animated = false}) {
     _cancelFling();
     final ppm = _ppm ?? (_viewW > 0 ? _viewW / 1440 : 1.0);
-    setState(() {
-      _scrollMin = (_nowMin - _viewW / (2 * ppm)).clamp(0.0, _maxMin);
-      _contentY = 0; // 定位语义：回到第一行
-      _positioned = true;
-      _pulseMin = _nowMin;
-    });
+    final target = (_nowMin - _viewW / (2 * ppm)).clamp(0.0, _maxMin);
+    if (animated) {
+      setState(() {
+        _contentY = 0; // 定位语义：回到第一行
+        _positioned = true;
+      });
+      _animateScrollTo(target);
+    } else {
+      setState(() {
+        _scrollMin = target;
+        _contentY = 0; // 定位语义：回到第一行
+        _positioned = true;
+      });
+      _reportWindow();
+    }
+    setState(() => _pulseMin = _nowMin);
     _pulseTimer?.cancel();
     _pulseTimer = Timer(const Duration(milliseconds: 1500), () {
       if (mounted) setState(() => _pulseMin = null);
     });
-    _reportWindow();
     widget.onCenterChanged(DateTime.now());
   }
 
   /// 滚动到指定时间点并居中（期移箭头用）。
-  void scrollTo(DateTime anchor) {
+  void scrollTo(DateTime anchor, {bool animated = false}) {
     _cancelFling();
     final ppm = _ppm ?? 1.0;
     final min = (anchor.millisecondsSinceEpoch - _epochMs) / 60000.0;
+    final target = (min - _viewW / (2 * ppm)).clamp(0.0, _maxMin);
+    if (animated) {
+      setState(() {
+        _contentY = 0; // 期移后回到第一行
+        _positioned = true;
+      });
+      _animateScrollTo(target);
+      return;
+    }
     setState(() {
-      _scrollMin = (min - _viewW / (2 * ppm)).clamp(0.0, _maxMin);
+      _scrollMin = target;
       _contentY = 0; // 期移后回到第一行
       _positioned = true;
     });
@@ -414,9 +460,11 @@ class DayViewState extends State<DayView>
       builder: (context, constraints) {
         _viewW = constraints.maxWidth;
         final minPpm = constraints.maxWidth / 1440;
+        // 默认比例：首帧一屏约 3 小时（2026-11-01：原先默认 = minPpm，
+        // 24 小时挤满一屏，任务条/文字小到不可读）。
         // _ppm 必须在此初始化：_reportWindow 依赖它，若保持 null
         // 则 onCenterChanged/onVisibleWindowChanged 永不上报（标题与内容脱节）
-        _ppm = (_ppm ?? minPpm).clamp(minPpm, _maxPpm);
+        _ppm = (_ppm ?? constraints.maxWidth / 180).clamp(minPpm, _maxPpm);
         final ppm = _ppm!;
         if (!_positioned) {
           // 首帧：当前时刻居中

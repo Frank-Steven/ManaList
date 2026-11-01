@@ -11,9 +11,10 @@ import '../../services/database.dart';
 import '../../services/notification_bridge.dart';
 import '../../services/undo_service.dart';
 import '../add_message_page.dart';
+import '../assistant/attachment_pick_controller.dart';
 import '../assistant/send_to_assistant.dart';
+import '../shared/app_icon.dart';
 import '../tasks/task_editor.dart';
-import 'archived_page.dart';
 import 'message_detail_sheet.dart';
 import 'message_widgets.dart';
 import '../../services/app_log.dart';
@@ -25,10 +26,21 @@ import '../../services/fold_markers.dart';
 /// ui-structure §3 收编：本页不持有 AppBar（由库页容器统一持有）；
 /// 多选态的「已选/全选/退出」从 AppBar 降级为内容首行工具条（§4 分区级操作）。
 class MessagesPage extends StatefulWidget {
-  const MessagesPage({super.key, this.onSelectionChanged});
+  const MessagesPage({
+    super.key,
+    this.onSelectionChanged,
+    this.pickMode = false,
+    this.pickController,
+  });
 
   /// 多选态变化回调：库页容器用来在多选时隐藏 FAB（避免遮挡底部操作条）。
   final ValueChanged<bool>? onSelectionChanged;
+
+  /// 附件选择模式（2026-11-01）：复用本页的多选/筛选器/分类展开，
+  /// 选择状态写入 [pickController]（跨分区累积），底部操作条由
+  /// 附件选择页统一提供（已选附件列表 + 确认按钮），本页不再渲染操作菜单。
+  final bool pickMode;
+  final AttachmentPickController? pickController;
 
   @override
   State<MessagesPage> createState() => MessagesPageState();
@@ -48,15 +60,18 @@ class MessagesPageState extends State<MessagesPage> {
   Map<String, List<String>> _taskLinks = {};
   bool _loading = true;
 
-  /// 截断提示只提示一次/会话（P3-8）
-  bool _limitHintShown = false;
+  /// 展示分组多选筛选（默认全选；2026-11-01 四分组：未处理/未完成/完成/垃圾）。
+  final Set<String> _groupFilter = Set.of(kDisplayGroupOrder);
 
-  /// 状态分组多选筛选（默认全选）；另含特殊键 [kFilterDone]（已完成）。
-  final Set<String> _groupFilter = Set.of(kGroupOrder);
-  String? _appFilter; // null = 全部应用
+  /// 应用多选筛选（2026-11-01 下拉复选；空集 = 全部应用）。
+  final Set<String> _appFilter = {};
 
   bool _selecting = false;
   final Set<String> _selected = {};
+
+  /// 各最小分类单元（非聊天来源 / 会话）当前展示的条数
+  /// （2026-11-01 分组分页：首屏 10 条，点「显示更多」每次 +5）。
+  final Map<String, int> _shownCounts = {};
 
   /// F02 两级折叠的展开状态（默认全部折叠；只存本页 State，不持久化）。
   /// 一级 = 来源应用（key = packageName）；二级 = 会话（key = packageName + NUL + 会话名，
@@ -73,13 +88,38 @@ class MessagesPageState extends State<MessagesPage> {
   void initState() {
     super.initState();
     _sub = NotificationBridge.instance.onNewMessages.listen((_) => reload());
+    // pick 模式：本地 _selected 是控制器（唯一事实源）的镜像
+    if (widget.pickMode) {
+      widget.pickController?.addListener(_syncFromPick);
+      _syncFromPick();
+    }
     reload();
   }
 
   @override
   void dispose() {
+    if (widget.pickMode) {
+      widget.pickController?.removeListener(_syncFromPick);
+    }
     _sub?.cancel();
     super.dispose();
+  }
+
+  AttachmentPickController? get _pick =>
+      widget.pickMode ? widget.pickController : null;
+
+  /// pick 模式：控制器 → 本地多选态回同步（底栏 chip 移除等外部变化）。
+  void _syncFromPick() {
+    final pick = _pick;
+    if (pick == null || !mounted) return;
+    setState(() {
+      _selected
+        ..clear()
+        ..addAll(pick
+            .idsOfType(ChatAttachmentType.message)
+            .where((id) => _messages.any((m) => m.id == id)));
+      if (_selected.isEmpty) _selecting = false;
+    });
   }
 
   /// 角标 = DB 里的未处理条数（与页面筛选无关，后台也会被调用）。
@@ -94,46 +134,45 @@ class MessagesPageState extends State<MessagesPage> {
   }
 
   /// 重新加载列表（供 GlobalKey 外部触发）。
-  /// v2.5：消息与来源是关键路径；任务表（绑定色点/「已完成」筛选/划线用）
+  /// v2.5：消息与来源是关键路径；任务表（绑定色点/状态分组/划线用）
   /// 失败不阻塞列表展示——此前三者同处一个 Future.wait，任一路失败会让列表
   /// 永远停在「加载中…」（表现为"消息抓取失效"）。
+  /// 2026-11-01：取消全局 500 条上限，改为分组内分页（每组首屏 10 条、
+  /// 「显示更多」每次 +5）；应用筛选为多选，本地过滤不再走 SQL。
   Future<void> reload() async {
     try {
       final results = await Future.wait([
-        _db.getMessages(packageName: _appFilter),
+        // 大上限 ≈ 全量：分组分页后不再靠全局限额控制内存
+        _db.getMessages(limit: 100000),
         _db.getDistinctMessageSources(),
-        _db.countMessages(packageName: _appFilter),
         _db.messageAnchorTaskIds(),
       ]);
       if (!mounted) return;
-      // P3-8：超过默认上限时提示一次，不再静默截断
-      final total = results[2] as int;
-      final fetched = (results[0] as List<Message>).length;
-      if (fetched < total && !_limitHintShown) {
-        _limitHintShown = true;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text('消息较多：仅显示最近 $fetched 条（共 $total 条），更早的未加载'),
-            duration: const Duration(seconds: 4),
-          ));
-        });
-      }
       setState(() {
         _messages = (results[0] as List<Message>)
             .where((m) => m.status != MessageStatus.archived)
+            .where((m) =>
+                _appFilter.isEmpty || _appFilter.contains(m.packageName))
             .toList();
         _sources = results[1] as List<SourceApp>;
-        _taskLinks = results[3] as Map<String, List<String>>;
+        _taskLinks = results[2] as Map<String, List<String>>;
         _loading = false;
-        // 所选应用的消息可能已不存在，回退到全部
-        if (_appFilter != null &&
-            !_sources.any((s) => s.packageName == _appFilter)) {
-          _appFilter = null;
-        }
+        // 所选应用的消息可能已不存在，从筛选集里剔除
+        _appFilter.removeWhere(
+            (pkg) => !_sources.any((s) => s.packageName == pkg));
         _selected.removeWhere((id) => !_messages.any((m) => m.id == id));
         if (_selected.isEmpty) _selecting = false;
       });
+      // pick 模式：为已选条目补充显示名（底栏 chip 用）
+      final pick = _pick;
+      if (pick != null) {
+        for (final m in _messages) {
+          if (pick.isSelected(ChatAttachmentType.message, m.id)) {
+            pick.registerMeta(
+                ChatAttachmentType.message, m.id, m.title, Icons.mail_outline);
+          }
+        }
+      }
       widget.onSelectionChanged?.call(_selecting);
     } catch (e, st) {
       AppLog.instance.warn('messages.reload', e, st);
@@ -162,9 +201,18 @@ class MessagesPageState extends State<MessagesPage> {
     return (single == null || single.isEmpty) ? const [] : [single];
   }
 
-  /// 任一关联任务已完成即视为「已完成」（用于筛选与划线）。
-  bool _isLinkedDone(Message m) =>
-      _linkedTaskIds(m).any((id) => _tasksById[id]?.status == TaskStatus.done);
+  /// 关联任务**全部**完成（2026-11-01 状态新规：消息「完成」的口径；
+  /// 行划线同口径——有未完成任务时不划线）。无关联任务返回 false。
+  bool _isLinkedDone(Message m) {
+    final ids = _linkedTaskIds(m);
+    return ids.isNotEmpty &&
+        ids.every((id) => _tasksById[id]?.status == TaskStatus.done);
+  }
+
+  /// 展示分组键（2026-11-01 状态新规）：未处理 / 未完成 / 完成 / 垃圾。
+  String _displayKey(Message m) => messageDisplayGroupKey(m,
+      linkedTaskCount: _linkedTaskIds(m).length,
+      linkedAllDone: _isLinkedDone(m));
 
   /// 主关联任务的优先级（决定消息卡色点）。
   String? _linkedTaskPriority(Message m) {
@@ -195,11 +243,8 @@ class MessagesPageState extends State<MessagesPage> {
   List<Message> get _visible {
     final cached = _visibleCache;
     if (cached != null && _cachesFresh()) return cached;
-    final visible = _messages.where((m) {
-      if (_groupFilter.contains(messageGroupKey(m))) return true;
-      // 「已完成」筛选：额外放行关联任务已完成的消息（不占分组）
-      return _groupFilter.contains(kFilterDone) && _isLinkedDone(m);
-    }).toList();
+    final visible =
+        _messages.where((m) => _groupFilter.contains(_displayKey(m))).toList();
     _visibleCache = visible;
     _sourceCache = null;
     _conversationCache.clear();
@@ -210,13 +255,13 @@ class MessagesPageState extends State<MessagesPage> {
   }
 
   /// 条数 / 最新时间 / 未处理数（两级组头共用口径）。
-  /// 「未处理」与顶部 chip 同口径：messageGroupKey == pending。
+  /// 「未处理」与顶部 chip 同口径：展示分组键 == pending。
   (int, int, int) _groupStats(List<Message> msgs) {
     var latest = 0;
     var pending = 0;
     for (final m in msgs) {
       if (m.postedAt > latest) latest = m.postedAt;
-      if (messageGroupKey(m) == kGroupPending) pending++;
+      if (_displayKey(m) == kGroupPending) pending++;
     }
     return (msgs.length, latest, pending);
   }
@@ -480,6 +525,14 @@ class MessagesPageState extends State<MessagesPage> {
       _messages.where((m) => _selected.contains(m.id)).toList();
 
   void _toggleSelect(Message m) {
+    final pick = _pick;
+    if (pick != null) {
+      // pick 模式：写控制器，本地状态由 _syncFromPick 回同步
+      pick.toggle(ChatAttachmentType.message, m.id,
+          title: m.title, icon: Icons.mail_outline);
+      setState(() => _selecting = true);
+      return;
+    }
     setState(() {
       if (!_selected.remove(m.id)) _selected.add(m.id);
       if (_selected.isEmpty) _selecting = false;
@@ -488,6 +541,12 @@ class MessagesPageState extends State<MessagesPage> {
   }
 
   void _exitSelection() {
+    final pick = _pick;
+    if (pick != null) {
+      pick.clearType(ChatAttachmentType.message);
+      setState(() => _selecting = false);
+      return;
+    }
     setState(() {
       _selecting = false;
       _selected.clear();
@@ -558,17 +617,6 @@ class MessagesPageState extends State<MessagesPage> {
     ];
   }
 
-  // ---- 归档入口 ----
-
-  Future<void> _openArchived() async {
-    await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const ArchivedMessagesPage()));
-    await reload();
-  }
-
-  /// 库页 AppBar「归档箱」入口（ui-structure §6.1：消息分区时显示）。
-  Future<void> openArchived() => _openArchived();
-
   // ---- UI ----
 
   /// 多选态首行工具条（ui-structure §4 分区级操作；原多选 AppBar 降级而来）。
@@ -588,14 +636,30 @@ class MessagesPageState extends State<MessagesPage> {
           Text('已选 ${_selected.length} 项'),
           const Spacer(),
           TextButton(
-            onPressed: () => setState(
-                () => _selected.addAll(_visible.map((m) => m.id))),
+            onPressed: () {
+              final pick = _pick;
+              if (pick != null) {
+                for (final m in _visible) {
+                  pick.select(ChatAttachmentType.message, m.id,
+                      title: m.title, icon: Icons.mail_outline);
+                }
+                return;
+              }
+              setState(() => _selected.addAll(_visible.map((m) => m.id)));
+            },
             child: const Text('全选'),
           ),
           TextButton(
             onPressed: _selected.isEmpty
                 ? null
-                : () => setState(() => _selected.clear()),
+                : () {
+                      final pick = _pick;
+                      if (pick != null) {
+                        pick.clearType(ChatAttachmentType.message);
+                        return;
+                      }
+                      setState(() => _selected.clear());
+                    },
             child: const Text('取消'),
           ),
         ],
@@ -614,11 +678,12 @@ class MessagesPageState extends State<MessagesPage> {
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 12),
         children: [
-          for (final key in kGroupOrder)
+          for (final key in kDisplayGroupOrder)
             Center(
               child: Padding(
                 padding: const EdgeInsets.only(right: 8),
                 child: FilterChip(
+                  avatar: Icon(messageGroupIcon(key), size: 16),
                   label: Text(messageGroupLabel(key)),
                   selected: _groupFilter.contains(key),
                   showCheckmark: false,
@@ -637,29 +702,6 @@ class MessagesPageState extends State<MessagesPage> {
                 ),
               ),
             ),
-          // 「已完成」（v2.4）：不占分组，额外显示关联任务已完成的消息
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: FilterChip(
-                label: Text(messageGroupLabel(kFilterDone)),
-                selected: _groupFilter.contains(kFilterDone),
-                showCheckmark: false,
-                selectedColor: cs.secondaryContainer,
-                backgroundColor: cs.surfaceContainerHighest,
-                side: chipSide(_groupFilter.contains(kFilterDone)),
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                onSelected: (sel) => setState(() {
-                  if (sel) {
-                    _groupFilter.add(kFilterDone);
-                  } else {
-                    _groupFilter.remove(kFilterDone);
-                  }
-                }),
-              ),
-            ),
-          ),
           if (_sources.isNotEmpty)
             Center(
               child: Padding(
@@ -668,48 +710,106 @@ class MessagesPageState extends State<MessagesPage> {
                     width: 1, height: 24, color: cs.outlineVariant),
               ),
             ),
-          if (_sources.isNotEmpty) ...[
-            Center(
-              child: Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: ChoiceChip(
-                  label: const Text('全部'),
-                  selected: _appFilter == null,
-                  showCheckmark: false,
-                  selectedColor: cs.secondaryContainer,
-                  backgroundColor: cs.surfaceContainerHighest,
-                  side: chipSide(_appFilter == null),
-                  visualDensity: VisualDensity.compact,
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  onSelected: (_) {
-                    setState(() => _appFilter = null);
-                    reload();
-                  },
+          // 应用筛选（2026-11-01）：单个下拉按钮 + 多选菜单，
+          // 按钮上图标 = 所选应用图标前几个堆叠
+          if (_sources.isNotEmpty) _buildAppFilterButton(cs, chipSide),
+        ],
+      ),
+    );
+  }
+
+  /// 应用筛选按钮：堆叠图标 + 文案 + 下拉箭头，点击弹多选菜单。
+  Widget _buildAppFilterButton(
+      ColorScheme cs, BorderSide Function(bool) chipSide) {
+    final active = _appFilter.isNotEmpty;
+    // 堆叠展示的图标来源：有筛选 = 所选应用（最多 3 个），无筛选 = 全部前 3
+    final iconSources = (active
+            ? _sources.where((s) => _appFilter.contains(s.packageName))
+            : _sources)
+        .take(3)
+        .toList();
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.only(right: 8),
+        child: ActionChip(
+          avatar: _StackedAppIcons(sources: iconSources),
+          label: Text(
+              active ? '应用 ×${_appFilter.length}' : '全部应用',
+              style: const TextStyle(fontSize: 13)),
+          backgroundColor:
+              active ? cs.secondaryContainer : cs.surfaceContainerHighest,
+          side: chipSide(active),
+          visualDensity: VisualDensity.compact,
+          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          onPressed: _showAppFilterSheet,
+        ),
+      ),
+    );
+  }
+
+  /// 应用多选菜单（底部弹层）：每行 图标 + 应用名 + 勾选；支持清除。
+  void _showAppFilterSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void toggle(String pkg, bool sel) {
+            setSheetState(() {
+              if (sel) {
+                _appFilter.add(pkg);
+              } else {
+                _appFilter.remove(pkg);
+              }
+            });
+            setState(() {});
+            reload();
+          }
+
+          final cs = Theme.of(context).colorScheme;
+          return SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  title: const Text('按应用筛选',
+                      style: TextStyle(fontWeight: FontWeight.w600)),
+                  trailing: _appFilter.isEmpty
+                      ? null
+                      : TextButton(
+                          onPressed: () {
+                            setSheetState(_appFilter.clear);
+                            setState(() {});
+                            reload();
+                          },
+                          child: const Text('清除'),
+                        ),
                 ),
-              ),
-            ),
-            for (final s in _sources)
-              Center(
-                child: Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: ChoiceChip(
-                    label: Text(s.displayName),
-                    selected: _appFilter == s.packageName,
-                    showCheckmark: false,
-                    selectedColor: cs.secondaryContainer,
-                    backgroundColor: cs.surfaceContainerHighest,
-                    side: chipSide(_appFilter == s.packageName),
-                    visualDensity: VisualDensity.compact,
-                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    onSelected: (_) {
-                      setState(() => _appFilter = s.packageName);
-                      reload();
-                    },
+                const Divider(height: 1),
+                Flexible(
+                  child: ListView(
+                    shrinkWrap: true,
+                    children: [
+                      for (final s in _sources)
+                        CheckboxListTile(
+                          value: _appFilter.contains(s.packageName),
+                          onChanged: (v) => toggle(s.packageName, v ?? false),
+                          secondary: AppIcon(
+                              packageName: s.packageName,
+                              appName: s.displayName,
+                              size: 24),
+                          title: Text(s.displayName,
+                              maxLines: 1, overflow: TextOverflow.ellipsis),
+                          controlAffinity: ListTileControlAffinity.trailing,
+                          activeColor: cs.primary,
+                        ),
+                    ],
                   ),
                 ),
-              ),
-          ],
-        ],
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -745,33 +845,102 @@ class MessagesPageState extends State<MessagesPage> {
   }
 
   /// 单条消息行（多选 / 左滑 / 点开详情，能力与改动前一致）。
+  /// pick 模式（附件选择）：点击即选中/取消，无左滑菜单、无需先长按进多选。
   Widget _buildTile(Message m) {
+    final pickUI = widget.pickMode;
     return MessageTile(
       key: ValueKey(m.id),
       message: m,
-      selecting: _selecting,
+      selecting: pickUI || _selecting,
       selected: _selected.contains(m.id),
+      swipeEnabled: !pickUI,
       linkedTaskDone: _isLinkedDone(m),
       linkedTaskPriority: _linkedTaskPriority(m),
       linkedTaskCount: _linkedTaskIds(m).length,
-      actions: _actionsFor(m),
+      actions: pickUI ? const [] : _actionsFor(m),
       onTap: () {
-        if (_selecting) {
+        if (pickUI || _selecting) {
           _toggleSelect(m);
         } else {
           // P3-2：点开详情看正文与附件（图片可放大）
           showMessageDetail(context, m);
         }
       },
-      onLongPress: () {
-        if (!_selecting) {
-          setState(() {
-            _selecting = true;
-            _selected.add(m.id);
-          });
-          widget.onSelectionChanged?.call(true);
+      onLongPress: pickUI
+          ? null
+          : () {
+              if (!_selecting) {
+                setState(() {
+                  _selecting = true;
+                  _selected.add(m.id);
+                });
+                widget.onSelectionChanged?.call(true);
+              }
+            },
+    );
+  }
+
+  /// 多选态下整组选择/取消（类别选择，2026-11-01）：组内消息全选 ⇄ 全不选。
+  void _toggleSelectGroup(List<Message> msgs) {
+    if (msgs.isEmpty) return;
+    final allSelected = msgs.every((m) => _selected.contains(m.id));
+    final pick = _pick;
+    if (pick != null) {
+      for (final m in msgs) {
+        final sel = pick.isSelected(ChatAttachmentType.message, m.id);
+        if (allSelected ? sel : !sel) {
+          pick.toggle(ChatAttachmentType.message, m.id,
+              title: m.title, icon: Icons.mail_outline);
         }
-      },
+      }
+      setState(() {});
+      return;
+    }
+    setState(() {
+      if (allSelected) {
+        _selected.removeAll(msgs.map((m) => m.id));
+      } else {
+        _selected.addAll(msgs.map((m) => m.id));
+      }
+    });
+    widget.onSelectionChanged?.call(_selecting);
+  }
+
+  /// 组头的三态勾选（0 无 / 1 部分 / 2 全部）。
+  int _groupSelectState(List<Message> msgs) {
+    if (msgs.isEmpty) return 0;
+    final n = msgs.where((m) => _selected.contains(m.id)).length;
+    if (n == 0) return 0;
+    return n == msgs.length ? 2 : 1;
+  }
+
+  /// 长按组头：进入多选并选中整组（与长按消息卡同入口）。
+  void _startSelectionWithGroup(List<Message> msgs) {
+    if (_selecting || widget.pickMode) return;
+    setState(() {
+      _selecting = true;
+      _selected.addAll(msgs.map((m) => m.id));
+    });
+    widget.onSelectionChanged?.call(true);
+  }
+
+  /// 分组分页（2026-11-01）：每组首屏 [kGroupPageInitial] 条，
+  /// 点「显示更多」每次 +[kGroupPageStep]（取代原全局最近 500 条）。
+  List<Message> _paged(String groupKey, List<Message> all) =>
+      pagedPrefix(all, _shownCounts[groupKey] ?? kGroupPageInitial);
+
+  /// 「显示更多」行：还有 N 条未展示时出现在组尾。
+  Widget _buildLoadMore(String groupKey, int total) {
+    final shown = _shownCounts[groupKey] ?? kGroupPageInitial;
+    final remaining = total - shown;
+    return Center(
+      child: TextButton.icon(
+        onPressed: () => setState(
+            () => _shownCounts[groupKey] = shown + kGroupPageStep),
+        icon: const Icon(Icons.expand_more, size: 16),
+        label: Text('显示更多（还有 $remaining 条）',
+            style: const TextStyle(fontSize: 12)),
+      ),
     );
   }
 
@@ -786,7 +955,21 @@ class MessagesPageState extends State<MessagesPage> {
         ],
       );
     }
+    final selectable = _selecting || widget.pickMode;
     final slivers = <Widget>[];
+
+    /// 一组消息的分页 sliver：首屏 N 条 + 组尾「显示更多」。
+    void addPagedSliver(String groupKey, List<Message> all) {
+      final paged = _paged(groupKey, all);
+      final hasMore = all.length > paged.length;
+      slivers.add(SliverList.builder(
+        itemCount: paged.length + (hasMore ? 1 : 0),
+        itemBuilder: (context, i) => i < paged.length
+            ? _buildTile(paged[i])
+            : _buildLoadMore(groupKey, all.length),
+      ));
+    }
+
     for (final s in sources) {
       final sourceExpanded = _expandedSources.contains(s.key);
       // 一级：来源应用。不用 pinned: 多个固定吸顶头挤在视口顶部会产生非法
@@ -801,16 +984,17 @@ class MessagesPageState extends State<MessagesPage> {
           onToggle: () => setState(() {
             if (!_expandedSources.remove(s.key)) _expandedSources.add(s.key);
           }),
+          selectable: selectable,
+          selectState: _groupSelectState(s.messages),
+          onToggleSelect: () => _toggleSelectGroup(s.messages),
+          onLongPress: () => _startSelectionWithGroup(s.messages),
         ),
       ));
       // 一级折叠：二级一个都不建（chat 与否都不用算）——这是避免 O(n²) 的关键
       if (!sourceExpanded) continue;
       if (!s.chat) {
         // 非聊天类来源：不建二级，消息直接列在一级下面
-        slivers.add(SliverList.builder(
-          itemCount: s.messages.length,
-          itemBuilder: (context, i) => _buildTile(s.messages[i]),
-        ));
+        addPagedSliver(s.key, s.messages);
         continue;
       }
       // 二级：会话（仅聊天类来源），同样默认折叠
@@ -829,14 +1013,13 @@ class MessagesPageState extends State<MessagesPage> {
                 _expandedConversations.add(c.key);
               }
             }),
+            selectable: selectable,
+            selectState: _groupSelectState(c.messages),
+            onToggleSelect: () => _toggleSelectGroup(c.messages),
+            onLongPress: () => _startSelectionWithGroup(c.messages),
           ),
         ));
-        if (convExpanded) {
-          slivers.add(SliverList.builder(
-            itemCount: c.messages.length,
-            itemBuilder: (context, i) => _buildTile(c.messages[i]),
-          ));
-        }
+        if (convExpanded) addPagedSliver(c.key, c.messages);
       }
     }
     slivers.add(const SliverToBoxAdapter(child: SizedBox(height: 80)));
@@ -911,7 +1094,13 @@ class MessagesPageState extends State<MessagesPage> {
       body: Column(
         children: [
           if (_listenerEnabled == false) _buildListenerBanner(context),
-          if (_selecting) _buildSelectionHeader() else _buildFilterRow(context),
+          // 筛选行始终显示；多选态的工具条独立占一行（2026-11-01：
+          // 原先多选会顶掉筛选行，筛选器/应用筛选在多选期间不可达）
+          _buildFilterRow(context),
+          if (_selecting) ...[
+            const Divider(height: 1),
+            _buildSelectionHeader(),
+          ],
           const Divider(height: 1),
           Expanded(
             child: RefreshIndicator(
@@ -919,7 +1108,8 @@ class MessagesPageState extends State<MessagesPage> {
               child: _buildList(),
             ),
           ),
-          if (_selecting) _buildSelectionBar(),
+          // pick 模式：底部操作条由附件选择页统一提供（已选附件 + 确认）
+          if (_selecting && !widget.pickMode) _buildSelectionBar(),
         ],
       ),
     );
@@ -1000,6 +1190,14 @@ class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
   final bool expanded;
   final VoidCallback onToggle;
 
+  /// 多选态（2026-11-01 类别选择）：行首换三态勾选框，点击 = 整组选择/取消。
+  final bool selectable;
+
+  /// 0 无 / 1 部分 / 2 全部。
+  final int selectState;
+  final VoidCallback onToggleSelect;
+  final VoidCallback onLongPress;
+
   const _SourceHeaderDelegate({
     required this.sourceKey,
     required this.title,
@@ -1007,10 +1205,14 @@ class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
     required this.pendingCount,
     required this.expanded,
     required this.onToggle,
+    this.selectable = false,
+    this.selectState = 0,
+    required this.onToggleSelect,
+    required this.onLongPress,
   });
 
-  /// 单行：8 + 24 + 8 + 余量。
-  static const double kHeight = 46;
+  /// 窄卡片：52 内容 + 上下各 3 边距。
+  static const double kHeight = 58;
 
   @override
   double get minExtent => kHeight;
@@ -1024,7 +1226,9 @@ class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
       title != oldDelegate.title ||
       count != oldDelegate.count ||
       pendingCount != oldDelegate.pendingCount ||
-      expanded != oldDelegate.expanded;
+      expanded != oldDelegate.expanded ||
+      selectable != oldDelegate.selectable ||
+      selectState != oldDelegate.selectState;
 
   @override
   Widget build(
@@ -1032,38 +1236,52 @@ class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
     final cs = Theme.of(context).colorScheme;
     final meta = <String>['$count 条'];
     if (pendingCount > 0) meta.add('未处理 $pendingCount');
-    return Material(
-      color: cs.surface,
-      child: InkWell(
-        onTap: onToggle,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Row(
-            children: [
-              Icon(
-                expanded ? Icons.expand_less : Icons.expand_more,
-                size: 22,
-                color: cs.onSurfaceVariant,
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                      fontSize: 14.5,
-                      fontWeight: FontWeight.w700,
-                      color: cs.onSurface),
+    // 窄卡片分组头（2026-11-01）：整组内容视觉上收进一张圆角卡，
+    // 二级（会话）以更深的颜色嵌套在其内
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 3, 12, 3),
+      child: Material(
+        color: cs.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(12),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: selectable ? onToggleSelect : onToggle,
+          onLongPress: onLongPress,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Row(
+              children: [
+                if (selectable)
+                  _GroupCheckbox(state: selectState)
+                else
+                  Icon(
+                    expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 20,
+                    color: cs.onSurfaceVariant,
+                  ),
+                const SizedBox(width: 8),
+                // 分类后的应用图标收敛到组头（卡片里不再重复显示）
+                AppIcon(packageName: sourceKey, appName: title, size: 22),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: cs.onSurface),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                meta.join(' · '),
-                maxLines: 1,
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-              ),
-            ],
+                const SizedBox(width: 8),
+                Text(
+                  meta.join(' · '),
+                  maxLines: 1,
+                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1071,8 +1289,27 @@ class _SourceHeaderDelegate extends SliverPersistentHeaderDelegate {
   }
 }
 
-/// F02 二级组头（会话）：缩进 32dp 显示层级，会话名（主）+
-/// 「条数 · 最新时间 · 未处理 N」（次），整行点击切换展开/折叠。
+/// 组头三态勾选框（多选态）：无 / 部分 / 全部。
+class _GroupCheckbox extends StatelessWidget {
+  final int state;
+
+  const _GroupCheckbox({required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final (icon, color) = switch (state) {
+      2 => (Icons.check_box, cs.primary),
+      1 => (Icons.indeterminate_check_box, cs.primary),
+      _ => (Icons.check_box_outline_blank, cs.outline),
+    };
+    return Icon(icon, size: 22, color: color);
+  }
+}
+
+/// F02 二级组头（会话）：缩进对齐一级标题，会话名（主）+
+/// 「条数 · 最新时间 · 未处理 N」（次），整行点击切换展开/折叠；
+/// 多选态点击 = 整组选择/取消。
 class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
   final String conversationKey;
   final String title;
@@ -1082,6 +1319,14 @@ class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
   final bool expanded;
   final VoidCallback onToggle;
 
+  /// 多选态（2026-11-01 类别选择）：行首换三态勾选框，点击 = 整组选择/取消。
+  final bool selectable;
+
+  /// 0 无 / 1 部分 / 2 全部。
+  final int selectState;
+  final VoidCallback onToggleSelect;
+  final VoidCallback onLongPress;
+
   const _ConversationHeaderDelegate({
     required this.conversationKey,
     required this.title,
@@ -1090,10 +1335,14 @@ class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
     required this.pendingCount,
     required this.expanded,
     required this.onToggle,
+    this.selectable = false,
+    this.selectState = 0,
+    required this.onToggleSelect,
+    required this.onLongPress,
   });
 
-  /// 两行（会话名 + 元信息），44 放不下；58 = 8 + 20 + 2 + 16 + 8 + 余量。
-  static const double kHeight = 58;
+  /// 嵌套窄卡片：48 内容 + 上下各 2 边距（比一级矮、缩进更深）。
+  static const double kHeight = 52;
 
   @override
   double get minExtent => kHeight;
@@ -1108,7 +1357,9 @@ class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
       count != oldDelegate.count ||
       latestAt != oldDelegate.latestAt ||
       pendingCount != oldDelegate.pendingCount ||
-      expanded != oldDelegate.expanded;
+      expanded != oldDelegate.expanded ||
+      selectable != oldDelegate.selectable ||
+      selectState != oldDelegate.selectState;
 
   @override
   Widget build(
@@ -1116,48 +1367,99 @@ class _ConversationHeaderDelegate extends SliverPersistentHeaderDelegate {
     final cs = Theme.of(context).colorScheme;
     final meta = <String>['$count 条', formatMessageTime(latestAt)];
     if (pendingCount > 0) meta.add('未处理 $pendingCount');
-    return Material(
-      color: cs.surfaceContainerLow,
-      child: InkWell(
-        onTap: onToggle,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(32, 0, 16, 0),
-          child: Row(
-            children: [
-              Icon(
-                expanded ? Icons.expand_less : Icons.expand_more,
-                size: 20,
-                color: cs.onSurfaceVariant,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: cs.onSurface),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      meta.join(' · '),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style:
-                          TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                    ),
-                  ],
+    // 嵌套卡片（2026-11-01）：缩进 24 + 更深底色，视觉上嵌在一级卡片内
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 2, 12, 2),
+      child: Material(
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(10),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: selectable ? onToggleSelect : onToggle,
+          onLongPress: onLongPress,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Row(
+              children: [
+                if (selectable)
+                  _GroupCheckbox(state: selectState)
+                else
+                  Icon(
+                    expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 18,
+                    color: cs.onSurfaceVariant,
+                  ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: cs.onSurface),
+                      ),
+                      const SizedBox(height: 1),
+                      Text(
+                        meta.join(' · '),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            fontSize: 11.5, color: cs.onSurfaceVariant),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 应用图标堆叠（2026-11-01 应用筛选按钮）：最多 3 个 16px 图标
+/// 依次右移层叠，整体宽 16 + 10×(n-1)。
+class _StackedAppIcons extends StatelessWidget {
+  final List<SourceApp> sources;
+
+  const _StackedAppIcons({required this.sources});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    if (sources.isEmpty) {
+      return Icon(Icons.apps_outlined, size: 16, color: cs.onSurfaceVariant);
+    }
+    final width = 16.0 + 10.0 * (sources.length - 1);
+    return SizedBox(
+      width: width,
+      height: 16,
+      child: Stack(
+        children: [
+          for (var i = 0; i < sources.length; i++)
+            Positioned(
+              left: 10.0 * i,
+              child: Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  // 描边让层叠图标彼此可辨
+                  border: Border.all(color: cs.surface, width: 1.5),
+                ),
+                child: AppIcon(
+                  packageName: sources[i].packageName,
+                  appName: sources[i].displayName,
+                  size: 16,
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }

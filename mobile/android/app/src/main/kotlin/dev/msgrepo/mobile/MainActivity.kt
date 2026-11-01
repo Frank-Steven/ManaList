@@ -64,6 +64,28 @@ class MainActivity : FlutterActivity() {
           "getQueueDir" ->
                         result.success(File(filesDir, "queue").absolutePath)
 
+                    // 视频首帧缩略图（MediaMetadataRetriever，框架 API 无需依赖）；
+                    // 返回 JPEG 字节（≤192px），失败/文件不存在返回 null
+                    "getVideoThumbnail" -> {
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrBlank()) {
+                            result.success(null)
+                        } else {
+                            Thread { result.success(videoThumbnailJpeg(path)) }.start()
+                        }
+                    }
+
+                    // PDF 首页渲染（android.graphics.pdf.PdfRenderer，框架 API）；
+                    // 返回 PNG 字节（宽 ≤192px），失败返回 null
+                    "getPdfThumbnail" -> {
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrBlank()) {
+                            result.success(null)
+                        } else {
+                            Thread { result.success(pdfThumbnailPng(path)) }.start()
+                        }
+                    }
+
                     // 已见应用列表（NotificationCaptureService 维护），返回文件内容
                     "getSeenApps" -> {
                         val file = File(filesDir, "seen_apps.json")
@@ -249,6 +271,64 @@ class MainActivity : FlutterActivity() {
         } catch (t: Throwable) {
             null
         }
+    }
+
+    /// 视频首帧缩略图：取 0 秒帧缩到 ≤192px 后 JPEG 编码（缩略图场景质量足够）。
+    private fun videoThumbnailJpeg(path: String): ByteArray? {
+        return try {
+            val file = File(path)
+            if (!file.isFile) return null
+            val retriever = android.media.MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(path)
+                val frame = retriever.getFrameAtTime(0) ?: return null
+                val scaled = scaleToMax(frame, 192)
+                val out = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                out.toByteArray()
+            } finally {
+                retriever.release()
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /// PDF 首页缩略图：PdfRenderer 渲染第 0 页（白底），宽 ≤192px，PNG 编码。
+    private fun pdfThumbnailPng(path: String): ByteArray? {
+        return try {
+            val file = File(path)
+            if (!file.isFile) return null
+            val pfd = android.os.ParcelFileDescriptor.open(
+                file, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+            pfd.use {
+                android.graphics.pdf.PdfRenderer(pfd).use { renderer ->
+                    if (renderer.pageCount <= 0) return null
+                    renderer.openPage(0).use { page ->
+                        val w = 192
+                        val h = (page.height.toFloat() / page.width * w).toInt()
+                            .coerceAtLeast(1)
+                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        bmp.eraseColor(android.graphics.Color.WHITE)
+                        page.render(bmp, null, null,
+                            android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        val out = ByteArrayOutputStream()
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                        out.toByteArray()
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    private fun scaleToMax(src: Bitmap, max: Int): Bitmap {
+        if (src.width <= max && src.height <= max) return src
+        val ratio = max.toFloat() / maxOf(src.width, src.height)
+        val w = (src.width * ratio).toInt().coerceAtLeast(1)
+        val h = (src.height * ratio).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(src, w, h, true)
     }
 
     private fun drawableToBitmap(d: Drawable): Bitmap {

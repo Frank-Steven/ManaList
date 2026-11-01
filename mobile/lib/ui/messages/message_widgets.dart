@@ -4,7 +4,6 @@ import 'package:flutter_slidable/flutter_slidable.dart';
 import '../../models/message.dart';
 import '../../services/fold_markers.dart';
 import '../../services/undo_service.dart';
-import '../shared/app_icon.dart';
 import '../shared/priority_dot.dart';
 
 /// 未处理分组键（设计 §5.1）。
@@ -33,13 +32,60 @@ String messageGroupKey(Message m) {
   return kGroupPending;
 }
 
+/// 未完成分组键（2026-11-01 状态四分组）：已处理、有关联任务、但未全部完成。
+const String kGroupUnfinished = 'unfinished';
+
+/// 消息列表的展示分组顺序（2026-11-01 状态新规，取代原「未处理/已处理/垃圾 +
+/// 已完成特殊筛选」）：未处理 → 未完成 → 完成 → 垃圾。
+/// 「完成」复用 [kFilterDone] 的键值（'done'），语义升级为正式分组。
+const List<String> kDisplayGroupOrder = [
+  kGroupPending,
+  kGroupUnfinished,
+  kFilterDone,
+  MessagePriority.junk,
+];
+
+/// 展示分组键（2026-11-01 状态新规，与关联任务联动）：
+/// - 显式标记垃圾（priority=junk）恒为垃圾；
+/// - 未标记已处理 → 未处理；
+/// - 已处理：无关联任务 → 垃圾；关联任务全部完成 → 完成；否则 → 未完成。
+String messageDisplayGroupKey(Message m,
+    {required int linkedTaskCount, required bool linkedAllDone}) {
+  if (m.priority == MessagePriority.junk) return MessagePriority.junk;
+  if (m.status != MessageStatus.processed) return kGroupPending;
+  if (linkedTaskCount == 0) return MessagePriority.junk;
+  if (linkedAllDone) return kFilterDone;
+  return kGroupUnfinished;
+}
+
 String messageGroupLabel(String key) => switch (key) {
       kGroupPending => '未处理',
       kGroupProcessed => '已处理',
+      kGroupUnfinished => '未完成',
       MessagePriority.junk => '垃圾',
-      kFilterDone => '已完成',
+      kFilterDone => '完成',
       _ => key,
     };
+
+/// 分组图标（2026-11-01 筛选 chip 图标化）。
+IconData messageGroupIcon(String key) => switch (key) {
+      kGroupPending => Icons.mark_email_unread_outlined,
+      kGroupProcessed => Icons.fact_check_outlined,
+      kGroupUnfinished => Icons.pending_actions_outlined,
+      MessagePriority.junk => Icons.delete_outline,
+      kFilterDone => Icons.task_alt,
+      _ => Icons.label_outline,
+    };
+
+/// 分组分页（2026-11-01）：每个最小分类单元（来源/会话）首屏
+/// [kGroupPageInitial] 条，点「显示更多」每次 +[kGroupPageStep]
+/// （取代原全局最近 500 条截断）。
+const int kGroupPageInitial = 10;
+const int kGroupPageStep = 5;
+
+/// 取一组消息当前应展示的前缀；shown 越界时收敛到全组。
+List<T> pagedPrefix<T>(List<T> all, int shown) =>
+    all.take(shown.clamp(0, all.length)).toList();
 
 /// AI 评估三色的圆点颜色（仅 AI 面板展示评估结果用；v2.6 起消息列表
 /// 不再按它染色）；未处理/垃圾返回 null（用空心圆点）。
@@ -492,14 +538,8 @@ class _MessageTileState extends State<MessageTile> {
                     const SizedBox(height: 4),
                     Row(
                       children: [
-                        Opacity(
-                          opacity: 0.75,
-                          child: AppIcon(
-                              packageName: message.packageName,
-                              appName: message.appName,
-                              size: 12),
-                        ),
-                        const SizedBox(width: 5),
+                        // U7+（2026-11-01）：应用图标上移到分组吸顶头，
+                        // 卡片脚注只留来源文字（分组后图标逐卡重复是噪音）
                         Expanded(
                           child: Text(
                             (message.appName?.isNotEmpty == true

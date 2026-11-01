@@ -170,6 +170,12 @@ CREATE INDEX idx_proposals_status ON change_proposals(status);
 - `conversations` 加列 `draft_attachments TEXT NOT NULL DEFAULT '[]'`：对话草稿附件（JSON 数组 `[{type,id}]`），库内「发送给助理」与对话页附件 bar 的唯一事实源；
 - 迁移测试：`mobile/test/db_v9_migration_test.dart`。
 
+### 1.7 v10 增量（2026-11-01，UI 细节批次）
+
+- 新增表 `library_folders(path TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`：**空文件夹持久化**。v9 的文件夹只由文件 `folder` 字段派生（虚拟），会话内新建的空文件夹重启即丢；v10 起新建文件夹落表（含祖先路径补齐），`listFolder/allFolders` 派生时与文件 `folder` 字段取并集；删除/重命名文件夹时整棵子树同步删行/换前缀。
+- DAO：`getLibraryFolders / insertLibraryFolder / deleteLibraryFolderTree / renameLibraryFolderTree`（`AppDatabase`）；`deleteChatMessages(ids)`、`rejectPendingProposalsByBatchIds(batchIds)`（消息重试/编辑/撤回的截断与提案撤销，见 §3.7）。
+- 迁移测试：`mobile/test/db_v10_migration_test.dart`。
+
 ---
 
 ## 2. shared/ 契约更新
@@ -185,6 +191,11 @@ shared/schemas 仍是双端协议事实源，v3 更新如下（同步更新 `des
 | `model-config.schema.json` | **新增**：`{id, name, provider(openai-compat/mock), baseUrl, model, apiKeyEnv?}` |
 | `sync-request/response.schema.json`、process 相关 | 标注 superseded：`/v1/process` 批处理协议随管线废弃（见 §6.3） |
 | `registry/default.json` | 保留归档（分类注册表随批处理管线退出主流程，不再主动演进） |
+
+增量注记（2026-11-01，多模态图像输入）：
+
+- `chat-request.schema.json`：attachments items 新增可选 `mimeType` / `dataBase64`——目标模型声明 vision 时，图片附件内联缩放后的 PNG（base64，最大边 1024）。desktop `buildProviderMessages` 把含 `dataBase64` 的附件上下文组装为 OpenAI vision content parts（text + 逐图 `image_url` data URL）；mobile 远程通道（`buildRemoteMessages`）同一格式。
+- `model-config.schema.json`：新增可选 `vision`（缺省 false）；mobile 远程端点配置同步加 `vision` 开关。非 vision 模型一律不附带图像，只在附件头部文字声明「未附带图像内容」（避免端点报错、也避免模型误以为能看图）。
 
 ---
 
@@ -231,6 +242,32 @@ shared/schemas 仍是双端协议事实源，v3 更新如下（同步更新 `des
 - 批处理能力以工具形式保留（§5.4 `inbox.triage`）：其实现代码（提示词构建、结果解析）从 ai_processing 迁移收敛到 `lib/services/assistant/tools/` 内部。
 - `junk_rules.dart` 保留为 `inbox.triage` 工具的本地预过滤组件。
 - 附件内容内联：附件（笔记/消息正文、文件文本抽取）在请求前展开为上下文块，带 `[#note:标题]` 类引用头，供 AI 引用定位。
+
+### 3.7 v10 增量（2026-11-01，UI 细节批次）
+
+- **多 Agent 并行回合**：`AssistantService` 回合 pump 服务自持（`AssistantTurnHandle`：broadcast 事件流 + `TurnPhase` 阶段），离开对话页回合不死，多个对话的回合并行（同对话新回合先取消旧回合）；对话列表按 `turnsVersion` 显示在途状态（呼吸圆点 + 阶段标签）。
+- **消息操作**：assistant 消息「重试」、用户消息「编辑/撤回」——均自目标消息（重试时为触发它的用户消息）起截断后续消息，doomed 批次的 pending 提案置 `rejected`（applied 的走撤销队列，不回滚）；重试/编辑用原文（或新文本）+ 原附件重跑回合。
+- **对话页流式呈现**：去掉「正在输入」块，改呼吸圆点光标内联在流式文本末尾；工具块显示图标 + 中文名 + 状态 + 自然语言摘要（不再裸露 JSON）；思考块/工具块可展开收起、淡入动画。
+- **附件选择页**：复用各分区多选/筛选/文件夹导航，点击即选中（无操作菜单）；底部统一已选附件列表 + 确认按钮。
+- **文件区（v10）**：修复进入空文件夹不刷新可无限「进入」的 bug（导航后未 reload）；空文件夹落 `library_folders` 表持久化；新增树形总览跳转、树形移动选择器（可展开层级）、图片缩略图（`cacheWidth` 限解码尺寸）、列表/卡片两种展示，树形总览/视图切换/新建文件夹/导入按钮收进面包屑尾端同行。
+- **任务视图**：日程任务面板只有展开/收起两个稳定态（拖拽仅跟手，松手按位置吸附）；粒度切换加 AnimatedSwitcher 淡出淡入过渡，任务图形数据变化加快速 settle 过渡。
+- 测试：`folder_tree_test`（树构建）、`db_v10_migration_test`（迁移 + 文件夹 DAO）、`chat_message_ops_test`（重试/编辑/撤回 + 提案撤销）、`library_folder_test` 补建 v10 表；`tasks_page_yearly_test` 适配切换动画时长。
+
+### 3.8 增量（2026-11-01 第二批，交互与状态细化）
+
+- **任务视图**：期移箭头/「现在」按钮的定位改平滑滚动（300ms easeOutCubic；首帧自动定位仍硬跳）；粒度切换的 AnimatedSwitcher 时长对齐 TabBar 指示器动画（300ms），且 Tab 点击即切内容（不再等指示器动画播完），两者同步起跑；任务面板标题行整行点击切换展开/收起，拖拽松手按「面板顶边是否在展开区域上半」吸附（不再看甩动速度），双横线把手图标移除。
+- **消息列表**：状态改为四分组（`messageDisplayGroupKey`，与关联任务联动）——未标记已处理 → **未处理**；已处理：无关联任务 → **垃圾**、关联任务全部完成 → **完成**、否则 → **未完成**；显式标记垃圾（priority=junk）恒为垃圾。原「已完成」叠加筛选键升级为正式分组（键值 'done' 复用），行划线口径同步为「关联任务全部完成」。归档页沿用旧三分组（`messageGroupKey` 不变）。
+- **分组吸顶头（可展开标签）**：一级加高到 52px 并显示来源应用图标（卡片脚注的图标移除，只留文字）；二级 50px、缩进与一级标题对齐；多选态行首换三态勾选框，点击 = 整组选择/取消（类别选择），长按组头进入多选并选中整组。
+- **多选工具条独立成行**：消息页筛选行、文件区面包屑在多选期间保持显示，选择工具条在下方单独一行，不再顶掉筛选器/导航。
+- **文件区**：文件夹在多选/附件选择态可整选（勾选 = 选中其含后代全部文件，DAO 新增 `getFilesUnderFolder`），多选态点击进入入口移到尾端箭头；批量操作的目标集合含子文件夹整选带入的文件。
+- **Agent 对话 UI 一轮视觉统一**：气泡改为用户实心 primary（右下小角）/ Agent surfaceContainerHigh 描边（左下小角），最大宽度按屏宽 82%（上限 560），气泡右下角加 HH:mm 时间戳；Agent 正文 Markdown 渲染（`flutter_markdown`，代码块/引用/表格样式定制），用户消息保持纯文本；输入区改圆角胶囊容器（附件按钮内置左端），发送键用 M3 filled 圆形按钮（回合中同位置变红色停止键）；附件条加顶部分隔线；回合错误显示为 errorContainer 横幅。
+
+### 3.9 增量（2026-11-01 第三批，列表与预览细化）
+
+- **任务视图**：日视图默认比例由「24 小时挤满一屏」改为一屏约 3 小时（仍可在最小/最大比例间缩放）。
+- **消息列表**：分组吸顶头改为窄卡片-嵌套卡片（一级 58px surfaceContainerLow 卡片、二级 52px surfaceContainerHighest 嵌套卡片）；状态筛选 chip 加分组图标（`messageGroupIcon`）；应用筛选由横排 ChoiceChip 改为下拉复选（空集 = 全部），入口按钮用前几个来源应用图标堆叠显示；分组分页——每个最小分类单元（来源/会话）首屏 10 条、点「显示更多」每次 +5（`kGroupPageInitial/kGroupPageStep/pagedPrefix`，取代原全局最近 500 条截断）；库页 AppBar 的「已归档」入口移除（归档页保留，归档动作仍在滑动菜单）。
+- **文件区**：文件夹与文件统一显示方式（列表行 40px 缩略图位 + 名称 + 元信息；卡片同款封面区 + 多选三态勾选）；文件缩略图分级预览——图片直接解码、视频经平台通道取首帧（Android `MediaMetadataRetriever`，叠加播放角标）、PDF 取首页渲染（`PdfRenderer`）、文本类文件显示内容开头片段（极小字号平铺），其余回退类型图标；通道与文本读取统一走 `FileThumbService`（内存缓存 + 并发合并）。
+- 测试：`message_group_test` 补分组分页常量与 `pagedPrefix` 边界；`library_folder_test` 补 `getFilesUnderFolder` 段边界用例。
 
 ---
 

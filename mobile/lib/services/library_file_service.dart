@@ -137,16 +137,24 @@ class LibraryFileService {
   Future<void> rename(String id, String name) =>
       AppDatabase.instance.renameFile(id, name);
 
-  // ---- 文件夹（v9，虚拟：只由文件 folder 字段派生） ----
+  // ---- 文件夹（v9 虚拟派生 + v10 空文件夹持久化） ----
+
+  /// 新建空文件夹落库（v10；含祖先路径补齐，幂等）。
+  Future<void> createFolder(String path) =>
+      AppDatabase.instance.insertLibraryFolder(path);
+
+  /// 某文件夹及其全部后代文件夹下的文件（2026-11-01 文件夹整选用）。
+  Future<List<LibraryFile>> filesUnderFolder(String path) =>
+      AppDatabase.instance.getFilesUnderFolder(path);
 
   /// 一层视图：[path] 下的直接子文件夹名 + 直接文件。
-  /// [extraFolders]：UI 层会话内新建但还没有文件的虚拟文件夹路径，
-  /// 参与子文件夹派生（否则空文件夹一刷新就消失）。
+  /// [extraFolders]：UI 层会话内补充的文件夹路径，参与子文件夹派生。
   Future<LibraryFolderView> listFolder(String path,
       {Set<String> extraFolders = const {}}) async {
     final files = await AppDatabase.instance.getFilesInFolder(path);
     final allPaths = {
       ...await AppDatabase.instance.getFileFolders(),
+      ...await AppDatabase.instance.getLibraryFolders(),
       ...extraFolders,
     };
     final children = <String>{};
@@ -167,6 +175,7 @@ class LibraryFileService {
   Future<List<String>> allFolders({Set<String> extraFolders = const {}}) async {
     final all = {
       ...await AppDatabase.instance.getFileFolders(),
+      ...await AppDatabase.instance.getLibraryFolders(),
       ...extraFolders,
     }.toList()
       ..sort();
@@ -177,14 +186,18 @@ class LibraryFileService {
   Future<void> moveToFolder(List<String> ids, String path) =>
       AppDatabase.instance.moveFilesToFolder(ids, path);
 
-  /// 重命名文件夹：[path] 整棵子树换前缀（虚拟文件夹 = 批量改 folder 字段）。
+  /// 重命名文件夹：[path] 整棵子树换前缀（虚拟文件夹 = 批量改 folder 字段；
+  /// v10 持久化文件夹行同步换前缀）。
   /// 返回受影响文件数；[newName] 不合法或目标已存在时抛 [ArgumentError]。
   Future<int> renameFolder(String path, String newName) async {
     if (path.isEmpty) throw ArgumentError('根目录不能重命名');
     if (!isValidFolderName(newName)) throw ArgumentError('非法文件夹名：$newName');
     final newPath = joinFolderPath(parentFolderPath(path), newName);
     if (newPath == path) return 0;
-    final existing = await AppDatabase.instance.getFileFolders();
+    final existing = {
+      ...await AppDatabase.instance.getFileFolders(),
+      ...await AppDatabase.instance.getLibraryFolders(),
+    };
     if (existing.any((f) => folderIsUnder(f, newPath))) {
       throw ArgumentError('已存在同名文件夹：$newName');
     }
@@ -198,11 +211,12 @@ class LibraryFileService {
     for (final entry in moved.entries) {
       await AppDatabase.instance.moveFilesToFolder(entry.value, entry.key);
     }
+    await AppDatabase.instance.renameLibraryFolderTree(path, newPath);
     return moved.values.fold<int>(0, (s, l) => s + l.length);
   }
 
-  /// 删除文件夹：其中（含子文件夹）的文件上移一层到父文件夹，文件本身不删。
-  /// 返回上移的文件数。
+  /// 删除文件夹：其中（含子文件夹）的文件上移一层到父文件夹，文件本身不删；
+  /// 持久化的文件夹行（含子树）一并删除。返回上移的文件数。
   Future<int> deleteFolder(String path) async {
     if (path.isEmpty) return 0;
     final parent = parentFolderPath(path);
@@ -221,6 +235,7 @@ class LibraryFileService {
     for (final entry in moved.entries) {
       await AppDatabase.instance.moveFilesToFolder(entry.value, entry.key);
     }
+    await AppDatabase.instance.deleteLibraryFolderTree(path);
     return moved.values.fold<int>(0, (s, l) => s + l.length);
   }
 
