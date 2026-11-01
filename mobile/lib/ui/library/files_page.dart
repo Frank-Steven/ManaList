@@ -100,6 +100,12 @@ class FilesPageState extends State<FilesPage> {
   bool _selecting = false;
   final Set<String> _selected = {};
 
+  /// 被选中的文件夹本体（当前层直接子文件夹名，2026-11-01）：
+  /// 空文件夹没有文件可挂在 [_selected] 里，但「选中空文件夹」本身是
+  /// 合法操作（至少可以批量删除它）；非空文件夹被选中时也会登记在这里，
+  /// 批量删除时连同文件夹一起删（其文件已随文件删除走）。
+  final Set<String> _selectedFolders = {};
+
   /// 当前层各直接子文件夹（含后代）的文件列表（文件夹整选用，
   /// reload 时一并加载；文件夹数量少，代价可忽略）。
   Map<String, List<LibraryFile>> _subfolderFiles = {};
@@ -158,7 +164,11 @@ class FilesPageState extends State<FilesPage> {
             for (final files in subFiles.values) ...files.map((f) => f.id),
           };
           _selected.removeWhere((id) => !keep.contains(id));
-          if (_selected.isEmpty) _selecting = false;
+          // 文件夹本体的选择也要随视图对账（改名/删除后可能已不存在）
+          _selectedFolders.removeWhere((n) => !view.folders.contains(n));
+          if (_selected.isEmpty && _selectedFolders.isEmpty) {
+            _selecting = false;
+          }
         }
       });
       // pick 模式：为已选条目补充显示名（底栏 chip 用）
@@ -249,37 +259,62 @@ class FilesPageState extends State<FilesPage> {
     }
     setState(() {
       if (!_selected.remove(f.id)) _selected.add(f.id);
-      if (_selected.isEmpty) _selecting = false;
+      if (_selected.isEmpty && _selectedFolders.isEmpty) _selecting = false;
     });
     widget.onSelectionChanged?.call(_selecting);
   }
 
-  /// 文件夹整选（2026-11-01）：勾选文件夹 = 选中其（含后代）全部文件。
+  /// 文件长按 / 菜单「选择」：进入多选并选中该文件（2026-11-01）。
+  void _startFileSelection(LibraryFile f) {
+    if (widget.pickMode) return;
+    setState(() {
+      _selecting = true;
+      _selected.add(f.id);
+    });
+    widget.onSelectionChanged?.call(true);
+  }
+
+  /// 文件夹勾选态（0 无 / 1 部分 / 2 全部）：空文件夹看本体选择
+  /// （[_selectedFolders]），非空看其（含后代）文件的选中比例。
   int _folderSelectState(String name) {
     final files = _subfolderFiles[name] ?? const [];
-    if (files.isEmpty) return 0;
+    if (files.isEmpty) return _selectedFolders.contains(name) ? 2 : 0;
     final n = files.where((f) => _selected.contains(f.id)).length;
     if (n == 0) return 0;
     return n == files.length ? 2 : 1;
   }
 
-  /// 文件夹长按：进入多选并整选该文件夹（含后代全部文件）——
-  /// 与文件长按进多选同一入口。修复（2026-11-01）：原先文件夹长按弹
-  /// 操作菜单，当本层只有文件夹、没有文件可长按时，根本进不了多选态，
-  /// 文件夹无法被选中。
+  /// 文件夹长按 / 菜单「选择」：进入多选并选中该文件夹——
+  /// 非空 = 整选其（含后代）全部文件；空 = 选中文件夹本体
+  /// （2026-11-01：空文件夹也可选中，至少可随批量删除一起删）。
   void _startFolderSelection(String name) {
     if (widget.pickMode) return;
     final files = _subfolderFiles[name] ?? const [];
     setState(() {
       _selecting = true;
-      _selected.addAll(files.map((f) => f.id));
+      if (files.isEmpty) {
+        _selectedFolders.add(name);
+      } else {
+        _selected.addAll(files.map((f) => f.id));
+      }
     });
     widget.onSelectionChanged?.call(true);
   }
 
   void _toggleSelectFolder(String name) {
     final files = _subfolderFiles[name] ?? const [];
-    if (files.isEmpty) return;
+    // 空文件夹：切换本体选择（pick 模式附件只能是文件，空文件夹不可选）
+    if (files.isEmpty) {
+      if (_pick != null) return;
+      setState(() {
+        if (!_selectedFolders.remove(name)) _selectedFolders.add(name);
+        if (_selected.isEmpty && _selectedFolders.isEmpty) {
+          _selecting = false;
+        }
+      });
+      widget.onSelectionChanged?.call(_selecting);
+      return;
+    }
     final allSelected = files.every((f) => _selected.contains(f.id));
     final pick = _pick;
     if (pick != null) {
@@ -296,7 +331,9 @@ class FilesPageState extends State<FilesPage> {
     setState(() {
       if (allSelected) {
         _selected.removeAll(files.map((f) => f.id));
-        if (_selected.isEmpty) _selecting = false;
+        if (_selected.isEmpty && _selectedFolders.isEmpty) {
+          _selecting = false;
+        }
       } else {
         _selected.addAll(files.map((f) => f.id));
       }
@@ -313,6 +350,7 @@ class FilesPageState extends State<FilesPage> {
     }
     _selecting = false;
     _selected.clear();
+    _selectedFolders.clear();
     if (notify) widget.onSelectionChanged?.call(false);
   }
 
@@ -396,9 +434,11 @@ class FilesPageState extends State<FilesPage> {
   }
 
   /// 批量删除（多选菜单，2026-11-01）：引用检查合并提示，确认后强删。
+  /// 选中的文件夹一并删除（空文件夹直接删，非空文件夹解散、文件上移一层）。
   Future<void> _deleteSelected() async {
     final targets = _selectedFiles;
-    if (targets.isEmpty) return;
+    final folderCount = _selectedFolders.length;
+    if (targets.isEmpty && folderCount == 0) return;
     var noteRefs = 0;
     var anchorRefs = 0;
     for (final f in targets) {
@@ -435,10 +475,24 @@ class FilesPageState extends State<FilesPage> {
     for (final f in targets) {
       await LibraryFileService.instance.delete(f.id, force: true);
     }
+    var folderNote = '';
+    if (folderCount > 0) {
+      var movedUp = 0;
+      for (final name in _selectedFolders) {
+        movedUp += await LibraryFileService.instance
+            .deleteFolder(joinFolderPath(_folder, name));
+      }
+      folderNote = movedUp > 0
+          ? '$folderCount 个文件夹（其中 $movedUp 个文件已上移）'
+          : '$folderCount 个文件夹';
+    }
     if (!mounted) return;
     setState(() => _exitSelection());
     await reload();
-    _toast('已删除 ${targets.length} 个文件');
+    _toast([
+      if (targets.isNotEmpty) '已删除 ${targets.length} 个文件',
+      if (folderNote.isNotEmpty) '已删除 $folderNote',
+    ].join('；'));
   }
 
   // ---- 导入（落到当前文件夹） ----
@@ -634,6 +688,16 @@ class FilesPageState extends State<FilesPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (!widget.pickMode)
+              ListTile(
+                leading: const Icon(Icons.check_circle_outline),
+                title: const Text('选择'),
+                subtitle: const Text('进入多选并选中该文件'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  _startFileSelection(file);
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.open_in_new),
               title: const Text('打开'),
@@ -841,7 +905,7 @@ class FilesPageState extends State<FilesPage> {
             icon: const Icon(Icons.close),
             onPressed: () => setState(_exitSelection),
           ),
-          Text('已选 ${_selected.length} 项'),
+          Text('已选 ${_selected.length + _selectedFolders.length} 项'),
           const Spacer(),
           TextButton(
             onPressed: () {
@@ -859,7 +923,7 @@ class FilesPageState extends State<FilesPage> {
             child: const Text('全选'),
           ),
           TextButton(
-            onPressed: _selected.isEmpty
+            onPressed: _selected.isEmpty && _selectedFolders.isEmpty
                 ? null
                 : () {
                       final pick = _pick;
@@ -867,7 +931,10 @@ class FilesPageState extends State<FilesPage> {
                         pick.clearType(ChatAttachmentType.file);
                         return;
                       }
-                      setState(() => _selected.clear());
+                      setState(() {
+                        _selected.clear();
+                        _selectedFolders.clear();
+                      });
                     },
             child: const Text('取消'),
           ),
@@ -877,25 +944,26 @@ class FilesPageState extends State<FilesPage> {
   }
 
   Widget _buildSelectionBar() {
-    final hasSelection = _selected.isNotEmpty;
+    final hasFiles = _selected.isNotEmpty;
+    final hasSelection = hasFiles || _selectedFolders.isNotEmpty;
     return SelectionActionBar(
       actions: [
         SelectionAction(
           icon: Icons.drive_file_move_outlined,
           tooltip: '移动到文件夹',
-          enabled: hasSelection,
+          enabled: hasFiles,
           onTap: _moveSelected,
         ),
         SelectionAction(
           icon: Icons.download_outlined,
           tooltip: '导出到下载目录',
-          enabled: hasSelection,
+          enabled: hasFiles,
           onTap: _exportSelected,
         ),
         SelectionAction(
           icon: Icons.send_outlined,
           tooltip: '发送给助理',
-          enabled: hasSelection,
+          enabled: hasFiles,
           onTap: _sendSelectedToAssistant,
         ),
         SelectionAction(
@@ -978,17 +1046,8 @@ class FilesPageState extends State<FilesPage> {
           _showActions(file);
         }
       },
-      onLongPress: pickUI
-          ? null
-          : () {
-              if (!_selecting) {
-                setState(() {
-                  _selecting = true;
-                  _selected.add(file.id);
-                });
-                widget.onSelectionChanged?.call(true);
-              }
-            },
+      onLongPress:
+          pickUI ? null : () => _startFileSelection(file),
     );
   }
 
@@ -1121,17 +1180,8 @@ class FilesPageState extends State<FilesPage> {
             _showActions(file);
           }
         },
-        onLongPress: pickUI
-            ? null
-            : () {
-                if (!_selecting) {
-                  setState(() {
-                    _selecting = true;
-                    _selected.add(file.id);
-                  });
-                  widget.onSelectionChanged?.call(true);
-                }
-              },
+        onLongPress:
+            pickUI ? null : () => _startFileSelection(file),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
