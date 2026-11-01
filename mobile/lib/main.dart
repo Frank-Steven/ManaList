@@ -129,6 +129,15 @@ SnackBarThemeData snackBarThemeFor(ColorScheme cs) {
   );
 }
 
+/// AppBar 主题（2026-11-01）：取消「内容滚到 AppBar 下方时变色」——
+/// M3 默认此时按 scrolledUnderElevation(3) 叠加 surfaceTint；
+/// 统一恒为该「滚动后」颜色（滚动前后不再变化）。
+AppBarTheme appBarThemeFor(ColorScheme cs) => AppBarTheme(
+      scrolledUnderElevation: 0,
+      backgroundColor: ElevationOverlay.applySurfaceTint(
+          cs.surface, cs.surfaceTint, 3.0),
+    );
+
 // 主题只算一次（O10）：`ColorScheme.fromSeed` 每次构建都跑一遍 HCT 换算，
 // 切换深浅色时它被重复执行两遍，是主题切换卡顿的固定开销之一。
 final ColorScheme _lightScheme = ColorScheme.fromSeed(seedColor: Colors.indigo);
@@ -138,11 +147,13 @@ final ThemeData _lightTheme = ThemeData(
   useMaterial3: true,
   colorScheme: _lightScheme,
   snackBarTheme: snackBarThemeFor(_lightScheme),
+  appBarTheme: appBarThemeFor(_lightScheme),
 );
 final ThemeData _darkTheme = ThemeData(
   useMaterial3: true,
   colorScheme: _darkScheme,
   snackBarTheme: snackBarThemeFor(_darkScheme),
+  appBarTheme: appBarThemeFor(_darkScheme),
 );
 
 class MsgRepoApp extends StatelessWidget {
