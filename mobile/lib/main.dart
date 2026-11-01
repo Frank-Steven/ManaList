@@ -423,6 +423,9 @@ class _TabVisibilityState extends State<_TabVisibility>
         return Visibility(
           visible: v > 0,
           maintainState: true,
+          // maintainSize 依赖 maintainAnimation（Visibility 断言），
+          // 三者同开才等效 IndexedStack 的保活不占绘制
+          maintainAnimation: true,
           maintainSize: true,
           child: IgnorePointer(
             ignoring: !widget.visible,
