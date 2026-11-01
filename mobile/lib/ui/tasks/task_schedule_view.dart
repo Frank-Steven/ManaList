@@ -338,12 +338,26 @@ class TaskScheduleViewState extends State<TaskScheduleView>
                 _barDragUpdate(-n.overscroll, vp);
               }
             } else if (n is ScrollEndNotification &&
-                _barCtrl.value > 0 &&
-                _barCtrl.value < 1 &&
-                !_barCtrl.isAnimating) {
-              // 展开度停在 (0,1) 且没有吸附动画在进行 = 拖拽松手，必须吸附
-              //（普通列表滚动到底/到顶时展开度是 0 或 1，不会误触发）
-              _barDragEnd(vp);
+                n.metrics.axis == Axis.vertical) {
+              // 轻拨判定覆盖整个面板（2026-11-01：原先只有标题栏 +
+              // 滚到顶后越界两路）：列表/详情任意位置松手时纵向速度超过
+              // 阈值即按方向吸附——向下收起、向上展开，不看列表位置。
+              // dragDetails 只在拖拽发起的滚动结束时存在，普通惯性
+              // 滚动到底的收尾 velocity 已衰减，不会误触发。
+              final dy =
+                  n.dragDetails?.velocity.pixelsPerSecond.dy ?? 0;
+              if (dy > _flingVelocity && _barCtrl.value > 0.001) {
+                _snapBarTo(false);
+              } else if (dy < -_flingVelocity &&
+                  _barCtrl.value < 0.999) {
+                _snapBarTo(true);
+              } else if (_barCtrl.value > 0 &&
+                  _barCtrl.value < 1 &&
+                  !_barCtrl.isAnimating) {
+                // 展开度停在 (0,1) 且没有吸附动画在进行 = 拖拽松手，必须吸附
+                //（普通列表滚动到底/到顶时展开度是 0 或 1，不会误触发）
+                _barDragEnd(vp);
+              }
             }
             return false;
           },
