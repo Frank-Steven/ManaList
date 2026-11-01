@@ -15,6 +15,7 @@ import '../assistant/attachment_pick_controller.dart';
 import '../assistant/send_to_assistant.dart';
 import '../shared/app_icon.dart';
 import '../tasks/task_editor.dart';
+import 'archived_page.dart';
 import 'message_detail_sheet.dart';
 import 'message_widgets.dart';
 import '../../services/app_log.dart';
@@ -518,6 +519,17 @@ class MessagesPageState extends State<MessagesPage> {
     showUndoSnackBar(context, '已归档', onUndone: reload);
     await reload();
   }
+
+  // ---- 归档入口 ----
+
+  Future<void> _openArchived() async {
+    await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const ArchivedMessagesPage()));
+    await reload();
+  }
+
+  /// 库页 AppBar「归档箱」入口（ui-structure §6.1：消息分区时显示）。
+  Future<void> openArchived() => _openArchived();
 
   // ---- 多选模式 ----
 

@@ -93,24 +93,27 @@ class LibraryPageState extends State<LibraryPage>
     if (_tab.index == AppUiState.librarySectionFiles && _filesSelecting) {
       return null;
     }
-    final (tooltip, onPressed) = switch (_tab.index) {
+    final (tooltip, icon, onPressed) = switch (_tab.index) {
       AppUiState.librarySectionNotes => (
           '新建笔记本',
+          Icons.add,
           () => _notesKey.currentState?.createNotebook(),
         ),
       AppUiState.librarySectionMessages => (
           '手动添加',
+          Icons.add,
           () => _messagesKey.currentState?.addManually(),
         ),
       _ => (
-          '导入',
+          '导入文件',
+          Icons.upload_file_outlined,
           () => _filesKey.currentState?.importEntry(),
         ),
     };
     return FloatingActionButton(
       tooltip: tooltip,
       onPressed: onPressed,
-      child: const Icon(Icons.add),
+      child: Icon(icon),
     );
   }
 
@@ -119,6 +122,15 @@ class LibraryPageState extends State<LibraryPage>
     return Scaffold(
       appBar: AppBar(
         title: const Text('库'),
+        actions: [
+          // 分区级操作上收（ui-structure §3）：归档箱仅消息分区显示。
+          if (_tab.index == AppUiState.librarySectionMessages)
+            IconButton(
+              tooltip: '已归档',
+              icon: const Icon(Icons.archive_outlined),
+              onPressed: () => _messagesKey.currentState?.openArchived(),
+            ),
+        ],
         bottom: TabBar(
           controller: _tab,
           tabs: [

@@ -150,11 +150,14 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 拖拽中中心点与手指保持同一相对位置，起手瞬间不跳。
   double _dragGrabDelta = 0;
 
-  /// 标题栏拖拽的计时与累计位移：短促拖拽（< [_tapDragMaxMs]ms
+  /// 标题栏拖拽计时：短促拖拽（< [_tapDragMaxMs]ms）视为点击
+  /// （用户意图是点标题栏切换，手指只是略有滑动）。
   static const _tapDragMaxMs = 2000;
+
+  /// 轻拨（fling）速度阈值：松手时纵向速度超过它即按方向吸附
+  /// （向下 = 收起、向上 = 展开），不再看时长与落点。
+  static const _flingVelocity = 600.0;
   final _dragWatch = Stopwatch();
-  double _dragAccum = 0;
-  double _dragLastGlobalY = 0;
 
   /// 当前面板高度（由展开度插值，永不停留在中间稳定态）。
   double _barHeight(double vp) {
@@ -168,8 +171,6 @@ class TaskScheduleViewState extends State<TaskScheduleView>
     _dragWatch
       ..reset()
       ..start();
-    _dragAccum = 0;
-    _dragLastGlobalY = globalY;
     final box = _splitBox();
     if (box == null) {
       _dragGrabDelta = 0;
@@ -204,8 +205,6 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 标题栏拖拽（有全局坐标）：面板标题栏中心跟随手指移动。
   /// 面板底边固定在视口底部，高度 = 底边 − 手指 + 半标题高（含起手偏差补偿）。
   void _barDragUpdateGlobal(double globalY, double vp) {
-    _dragAccum += (globalY - _dragLastGlobalY).abs();
-    _dragLastGlobalY = globalY;
     final box = _splitBox();
     if (box == null) return;
     final bottom = box.localToGlobal(Offset(0, box.size.height)).dy;
@@ -213,10 +212,19 @@ class TaskScheduleViewState extends State<TaskScheduleView>
         bottom - (globalY + _dragGrabDelta) + _barCollapsedH / 2, vp);
   }
 
-  /// 标题栏拖拽松手：短促拖拽（< [_tapDragMaxMs]ms 且累计位移
-  /// < [_tapDragMaxPx]px）视为点击，直接切换展开/收起；否则按松手位置
-  /// 吸附（见 [_barDragEnd]）。
-  void _barHeaderDragEnd(double vp) {
+  /// 标题栏拖拽松手（[velocityY] = 松手瞬时纵向速度，正 = 向下）：
+  /// ① 轻拨（|速度| > [_flingVelocity]）按方向吸附，向下收起、向上展开；
+  /// ② 短促拖拽（< [_tapDragMaxMs]ms）视为点击，直接切换展开/收起；
+  /// ③ 否则按松手位置吸附（见 [_barDragEnd]）。
+  void _barHeaderDragEnd(double vp, double velocityY) {
+    if (velocityY > _flingVelocity) {
+      _snapBarTo(false);
+      return;
+    }
+    if (velocityY < -_flingVelocity) {
+      _snapBarTo(true);
+      return;
+    }
     if (_dragWatch.elapsedMilliseconds < _tapDragMaxMs) {
       _snapBarTo(!_barExpanded);
       return;
@@ -319,8 +327,14 @@ class TaskScheduleViewState extends State<TaskScheduleView>
             if (n is OverscrollNotification &&
                 n.overscroll < 0 &&
                 n.metrics.axis == Axis.vertical) {
-              // 顶部继续下拉且面板还有高度可让：overscroll 为负，累减展开度
-              if (_barCtrl.value > 0.001) {
+              // 列表滚到顶后向下的快速甩动（轻拨）：直接收起整个面板。
+              // 拖拽中 velocity 恒为 0，只有惯性滚到边界的甩动才带速度
+              //（滚动方向约定：手指向下 = 负速度）。
+              if (n.velocity < -_flingVelocity &&
+                  _barCtrl.value > 0.001) {
+                _snapBarTo(false);
+              } else if (_barCtrl.value > 0.001) {
+                // 顶部继续下拉且面板还有高度可让：overscroll 为负，累减展开度
                 _barDragUpdate(-n.overscroll, vp);
               }
             } else if (n is ScrollEndNotification &&
@@ -956,7 +970,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
       onVerticalDragUpdate: draggable
           ? (d) => _barDragUpdateGlobal(d.globalPosition.dy, vp)
           : null,
-      onVerticalDragEnd: draggable ? (d) => _barHeaderDragEnd(vp) : null,
+      onVerticalDragEnd: draggable
+          ? (d) => _barHeaderDragEnd(vp, d.primaryVelocity ?? 0)
+          : null,
       // 手势被抢走（系统手势/多指）也要吸附回稳定态，不留中间高度。
       // 取消不是用户主动松手，按位置吸附（不做短拖拽=点击判定）
       onVerticalDragCancel: draggable ? () => _barDragEnd(vp) : null,
