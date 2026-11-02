@@ -2,6 +2,7 @@ import { createProviderForModel } from "./ai/factory.js";
 import type { AIProvider } from "./ai/provider.js";
 import type { Config } from "./config.js";
 import {
+  configuredVision,
   resolveVisionSupport,
   visionAllowsImages,
   type VisionSupport,
@@ -101,7 +102,9 @@ export class ModelManager {
     const out: ModelListEntry[] = [];
     for (const m of this.config.models) {
       const p = await this.probe(m.id);
-      const support = resolveVisionSupport(m.model, m.vision ?? null);
+      // B12：与 /v1/chat 门禁共用同一归一（旧 false 无 explicit = 未配置），
+      // 否则上报 disabled 会让手机端直接不发图，端到端仍看不到图片。
+      const support = resolveVisionSupport(m.model, configuredVision(m));
       out.push({
         ...m,
         reachable: p.ok,

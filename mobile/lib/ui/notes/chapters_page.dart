@@ -59,7 +59,7 @@ class _ChaptersPageState extends State<ChaptersPage> {
   }
 
   Future<void> _openNotes(Chapter chapter) async {
-    await Navigator.of(context).push(
+    final pickConfirmed = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
           builder: (_) => NotesListPage(
                 chapter: chapter,
@@ -67,6 +67,13 @@ class _ChaptersPageState extends State<ChaptersPage> {
                 pickController: widget.pickController,
               )),
     );
+    // B13：pick 模式下深层页的「确认」= 带着选择回到附件选择页。
+    // 本层只是中间路由（NotesPage 不是路由，它在选择页的 TabBarView 里），
+    // 所以原样上抛，让选择页的底部「已选 + 确认」栏重新可见。
+    if (pickConfirmed == true && mounted) {
+      Navigator.of(context).pop(true);
+      return;
+    }
     await _reload();
   }
 
@@ -330,28 +337,73 @@ class _NotesListPageState extends State<NotesListPage> {
     });
   }
 
+  /// B13：pick 模式的本地确认栏（已选笔记数 + 确认）。
+  ///
+  /// 只负责**带着选择回到附件选择页**（选择存在 [AttachmentPickController] 里，
+  /// 跨路由不丢），真正把附件交回对话的确认仍由附件选择页统一执行——
+  /// 与消息/文件分区「底部条由选择页统一提供」的约定一致，不在深层复制一套提交逻辑。
+  Widget _buildPickConfirmBar(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return SafeArea(
+      top: false,
+      child: Container(
+        decoration: BoxDecoration(
+          color: cs.surfaceContainerLow,
+          border: Border(
+              top: BorderSide(color: cs.outlineVariant, width: 0.5)),
+        ),
+        padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                _selected.isEmpty
+                    ? '未选择笔记'
+                    : '已选 ${_selected.length} 项笔记',
+                style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant),
+              ),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: Text('确认（${_selected.length}）'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        leading: _selecting
+        // B13：pick 模式下选择存在控制器里，返回不应清空——给明确的返回箭头
+        // （原来这里被「×（退出多选）」占据，按它等于丢选择，系统返回又没有箭头）。
+        leading: widget.pickMode
             ? IconButton(
-                tooltip: '退出',
-                icon: const Icon(Icons.close),
-                onPressed: () {
-                  final pick = _pick;
-                  if (pick != null) {
-                    pick.clearType(ChatAttachmentType.note);
-                    setState(() => _selecting = false);
-                    return;
-                  }
-                  setState(() {
-                    _selecting = false;
-                    _selected.clear();
-                  });
-                },
+                tooltip: '返回（已选保留）',
+                icon: const Icon(Icons.arrow_back),
+                onPressed: () => Navigator.of(context).pop(),
               )
-            : null,
+            : _selecting
+                ? IconButton(
+                    tooltip: '退出',
+                    icon: const Icon(Icons.close),
+                    onPressed: () {
+                      final pick = _pick;
+                      if (pick != null) {
+                        pick.clearType(ChatAttachmentType.note);
+                        setState(() => _selecting = false);
+                        return;
+                      }
+                      setState(() {
+                        _selecting = false;
+                        _selected.clear();
+                      });
+                    },
+                  )
+                : null,
         title: Text(_selecting ? '已选 ${_selected.length} 项' : widget.chapter.name),
         actions: [
           if (!_selecting)
@@ -417,19 +469,23 @@ class _NotesListPageState extends State<NotesListPage> {
                 );
               },
             ),
-      // pick 模式：底部操作条由附件选择页统一提供（已选附件 + 确认）
-      bottomNavigationBar: _selecting && !widget.pickMode
-          ? SelectionActionBar(
-              actions: [
-                SelectionAction(
-                  icon: Icons.send_outlined,
-                  tooltip: '发送给助理',
-                  enabled: _selected.isNotEmpty,
-                  onTap: _sendSelectedToAssistant,
-                ),
-              ],
-            )
-          : null,
+      // B13：pick 模式下本页是独立路由，附件选择页的「已选 + 确认」栏在上一层
+      // 看不到，所以这里补一个确认入口（把选择带回选择页，由它统一确认并返回结果）；
+      // 普通模式仍只有多选态的「发送给助理」，行为不变。
+      bottomNavigationBar: widget.pickMode
+          ? _buildPickConfirmBar(context)
+          : _selecting
+              ? SelectionActionBar(
+                  actions: [
+                    SelectionAction(
+                      icon: Icons.send_outlined,
+                      tooltip: '发送给助理',
+                      enabled: _selected.isNotEmpty,
+                      onTap: _sendSelectedToAssistant,
+                    ),
+                  ],
+                )
+              : null,
     );
   }
 }

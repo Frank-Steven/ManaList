@@ -6,7 +6,11 @@ import { GateBusyError, GatePool } from "./limit.js";
 import { readSharedJson } from "./registry.js";
 import type { ModelManager } from "./models.js";
 import type { ProviderChatMessage } from "./ai/provider.js";
-import { resolveVisionSupport, visionAllowsImages } from "./model-capabilities.js";
+import {
+  configuredVision,
+  resolveVisionSupport,
+  visionAllowsImages,
+} from "./model-capabilities.js";
 import type { ChatEvent, ChatRequest } from "./types.js";
 
 export interface ServerOptions {
@@ -211,9 +215,10 @@ export function createServer(opts: ServerOptions): http.Server {
         // B10/B11：desktop 侧独立解析该模型的能力（模型名 + 配置的 vision 三态），
         // 未确认/关闭时丢弃图片，避免把 image parts 发给不支持的端点。
         const modelConfig = opts.models.modelFor(modelId);
+        // B12：不能直接用 modelConfig.vision —— 旧配置的 false 是「默认值」而不是用户意图。
         const visionSupport = resolveVisionSupport(
           modelConfig?.model ?? "",
-          modelConfig?.vision ?? null,
+          configuredVision(modelConfig),
         );
         try {
           await provider.chat(buildProviderMessages(body, visionAllowsImages(visionSupport)), {

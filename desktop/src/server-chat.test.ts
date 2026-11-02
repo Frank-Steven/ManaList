@@ -222,3 +222,80 @@ test("旧 POST /v1/process 已删除 → 404", async () => {
   });
   assert.equal(res.status, 404);
 });
+
+// ---- B12：桌面旧 vision 配置兼容（真实 HTTP + mock 上游）----
+//
+// 旧配置把默认值直接写成 vision:false，于是「未配置」被当成「用户关闭」，
+// 已知支持视觉的模型（deepseek-flash 等）图片被误剥。这组用例从 /v1/chat 入口
+// 一路到 provider 出口证明：旧 false 的已知模型重新发图、旧 true 保留、显式 false 严格关闭。
+test("B12 旧 vision 配置：true 保留 / false 无 explicit 走能力表 / 显式 false 关闭", async () => {
+  const saved = config;
+  config = {
+    ...config,
+    models: [
+      // 旧 true、无 visionExplicit、模型名未知 → 仍应发图
+      { id: "legacy-true", name: "LegacyTrue", provider: "mock", baseUrl: "", model: "some-unknown-model", vision: true },
+      // 旧 false、无 visionExplicit + 已知视觉模型 → 按未配置走能力表 → 发图（B12 核心）
+      { id: "legacy-false", name: "LegacyFalse", provider: "mock", baseUrl: "", model: "deepseek-flash", vision: false },
+      // 显式关闭 → 严格不发图
+      { id: "explicit-off", name: "ExplicitOff", provider: "mock", baseUrl: "", model: "deepseek-flash", vision: false, visionExplicit: true },
+      // 未配置 + 未知模型 → 安全默认不发图
+      { id: "unknown-auto", name: "UnknownAuto", provider: "mock", baseUrl: "", model: "gpt-4o" },
+    ],
+    defaultModelId: "legacy-true",
+  };
+  await fetch(`${base}/v1/models/reload`, { method: "POST", headers: auth() });
+
+  const replyOf = async (modelConfigId: string): Promise<string> => {
+    const res = await fetch(`${base}/v1/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...auth() },
+      body: JSON.stringify({
+        conversationId: `c-${modelConfigId}`,
+        modelConfigId,
+        messages: [{ role: "user", content: "这张图里有什么" }],
+        attachments: [
+          {
+            type: "file",
+            id: "f1",
+            content: "[#file:照片.png]（image/png）",
+            mimeType: "image/png",
+            dataBase64: "aGVsbG8=",
+          },
+        ],
+        stream: true,
+      }),
+    });
+    assert.equal(res.status, 200);
+    const events = await readSse(res);
+    return events
+      .filter((e) => e.type === "token_delta")
+      .map((t) => (t as { delta: string }).delta)
+      .join("");
+  };
+
+  assert.match(
+    await replyOf("legacy-true"),
+    /含 1 张图片/,
+    "旧 vision:true（无 explicit）即使模型名未知也必须发图",
+  );
+  assert.match(
+    await replyOf("legacy-false"),
+    /含 1 张图片/,
+    "B12 核心：旧 vision:false（无 explicit）+ 已知视觉模型 → 走能力表支持并发图",
+  );
+  assert.doesNotMatch(
+    await replyOf("explicit-off"),
+    /含 \d+ 张图片/,
+    "显式 visionExplicit:true + false 必须严格关闭",
+  );
+  assert.doesNotMatch(
+    await replyOf("unknown-auto"),
+    /含 \d+ 张图片/,
+    "未配置 + 未知模型保持安全默认（不发图）",
+  );
+
+  // 复原配置，避免影响其它用例顺序
+  config = saved;
+  await fetch(`${base}/v1/models/reload`, { method: "POST", headers: auth() });
+});
