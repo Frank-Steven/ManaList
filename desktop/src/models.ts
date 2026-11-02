@@ -1,6 +1,11 @@
 import { createProviderForModel } from "./ai/factory.js";
 import type { AIProvider } from "./ai/provider.js";
 import type { Config } from "./config.js";
+import {
+  resolveVisionSupport,
+  visionAllowsImages,
+  type VisionSupport,
+} from "./model-capabilities.js";
 import type { ModelConfig } from "./types.js";
 
 export interface ModelProbeResult {
@@ -12,6 +17,10 @@ export interface ModelProbeResult {
 export interface ModelListEntry extends ModelConfig {
   reachable: boolean | null; // null = 尚未探测
   checkedAt: number | null;
+  /** 视觉能力三态（B11）：按模型名 + 配置的 vision 解析，供手机端如实显示。 */
+  visionStatus: VisionSupport;
+  /** 有效结论（= visionStatus 为 supported），兼容只认布尔的旧客户端。 */
+  visionEffective: boolean;
 }
 
 const PROBE_TTL_MS = 30_000;
@@ -92,7 +101,14 @@ export class ModelManager {
     const out: ModelListEntry[] = [];
     for (const m of this.config.models) {
       const p = await this.probe(m.id);
-      out.push({ ...m, reachable: p.ok, checkedAt: p.checkedAt });
+      const support = resolveVisionSupport(m.model, m.vision ?? null);
+      out.push({
+        ...m,
+        reachable: p.ok,
+        checkedAt: p.checkedAt,
+        visionStatus: support,
+        visionEffective: visionAllowsImages(support),
+      });
     }
     return out;
   }

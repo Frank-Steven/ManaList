@@ -49,9 +49,13 @@ class AiEndpoint {
   final String model;
   final bool isDesktop;
 
-  /// 该端点的模型是否支持图像输入（多模态）；true 时图片附件以
-  /// content parts 内联发送，false 时只给文字声明（避免端点报错）。
-  final bool vision;
+  /// 图像输入（多模态）三态（B11）：null = 未配置（按模型能力表推断），
+  /// true = 支持，false = 用户显式关闭。
+  ///
+  /// 旧版本把缺省值写死成 false，无法区分「用户关闭」与「从未配置」，导致
+  /// DeepSeek V4.1 Flash 1017 这类实际支持视觉的端点被误判为不支持。判定统一走
+  /// services/model_capabilities.dart 的 resolveVisionSupport。
+  final bool? vision;
 
   const AiEndpoint({
     required this.id,
@@ -60,17 +64,30 @@ class AiEndpoint {
     this.apiKey = '',
     this.model = '',
     this.isDesktop = false,
-    this.vision = false,
+    this.vision,
   });
 
-  factory AiEndpoint.fromJson(Map<String, dynamic> json) => AiEndpoint(
-        id: json['id'] as String,
-        name: json['name'] as String? ?? '',
-        baseUrl: json['baseUrl'] as String? ?? '',
-        apiKey: json['apiKey'] as String? ?? '',
-        model: json['model'] as String? ?? '',
-        vision: json['vision'] as bool? ?? false,
-      );
+  factory AiEndpoint.fromJson(Map<String, dynamic> json) {
+    // 兼容旧配置（B11）：旧版本 toJson 无条件写 vision（缺省 false），所以
+    // 「false 且没有 visionExplicit 标记」无法区分用户关闭与从未配置 → 视为未配置，
+    // 交给模型能力表推断；旧配置里存过 true 的保留为显式开启；
+    // 新配置总会带 visionExplicit: true，此后 false 才是「用户显式关闭」。
+    final rawVision = json['vision'];
+    final explicit = json['visionExplicit'] == true;
+    final bool? vision = switch (rawVision) {
+      true => true,
+      false => explicit ? false : null,
+      _ => null,
+    };
+    return AiEndpoint(
+      id: json['id'] as String,
+      name: json['name'] as String? ?? '',
+      baseUrl: json['baseUrl'] as String? ?? '',
+      apiKey: json['apiKey'] as String? ?? '',
+      model: json['model'] as String? ?? '',
+      vision: vision,
+    );
+  }
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -78,15 +95,19 @@ class AiEndpoint {
         'baseUrl': baseUrl,
         'apiKey': apiKey,
         'model': model,
-        'vision': vision,
+        // 只有用户显式选择时才落盘，并带 visionExplicit 标记；
+        // 未配置（null）时不写这两个键，读回来仍是 null。
+        if (vision != null) 'vision': vision,
+        if (vision != null) 'visionExplicit': true,
       };
 
+  /// [vision] 用闭包以便把值设回 null（恢复「未配置」），与 Task.copyWith 同一范式。
   AiEndpoint copyWith({
     String? name,
     String? baseUrl,
     String? apiKey,
     String? model,
-    bool? vision,
+    bool? Function()? vision,
   }) =>
       AiEndpoint(
         id: id,
@@ -95,7 +116,7 @@ class AiEndpoint {
         apiKey: apiKey ?? this.apiKey,
         model: model ?? this.model,
         isDesktop: isDesktop,
-        vision: vision ?? this.vision,
+        vision: vision != null ? vision() : this.vision,
       );
 }
 

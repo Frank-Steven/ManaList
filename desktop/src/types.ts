@@ -114,6 +114,14 @@ export interface ModelConfig {
   model: string;
   /** API key 所在环境变量名，不直接存密钥 */
   apiKeyEnv?: string;
-  /** 模型是否支持图像输入（多模态）；缺省 false */
-  vision?: boolean;
+  /**
+   * 图像输入（多模态）三态（B11，语义见 model-capabilities.ts）：
+   * true = 支持；false = 用户显式关闭；null/缺省 = 未配置（按模型能力表推断）。
+   *
+   * 兼容旧配置：旧实现可能对「从未配置」的项写下 false（且无 visionExplicit 标记），
+   * 这种值无法区分用户意图，读取方应按「未配置」处理。
+   */
+  vision?: boolean | null;
+  /** 用户显式选择过视觉能力时为 true；此后 vision:false 才代表「用户关闭」。 */
+  visionExplicit?: boolean;
 }

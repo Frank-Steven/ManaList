@@ -332,4 +332,115 @@ void main() {
       expect(d.endAt, DateTime(2026, 10, 25, 18, 0));
     });
   });
+
+  // ---- A01：回复/查询/疑问类消息不得误建任务（2026-11-02 真机反例） ----
+
+  group('A01：回复/查询类误建兜底', () {
+    /// 让本轮所有消息都回同一批草稿（构造真机反例用）。
+    void replyWith(List<Map<String, dynamic>> drafts) {
+      triage.subCallOverride = (messages, modelConfigId) async* {
+        final userContent = messages.last.content;
+        final ids = [
+          for (final m
+              in RegExp(r'"messageId":"([^"]+)"').allMatches(userContent))
+            m.group(1)!,
+        ];
+        yield ChatTokenDelta(jsonEncode([
+          for (final id in ids)
+            {
+              'messageId': id,
+              'priority': 'green',
+              'reason': '被问时间',
+              'taskDrafts': drafts,
+            },
+        ]));
+        yield const ChatDone();
+      };
+    }
+
+    List<ChangeProposal> tasksOf(List<ChangeProposal> all) =>
+        all.where((p) => p.tool == ToolNames.taskCreate).toList();
+
+    test('真机反例：「帮我看下明天的会几点开始」→ 丢弃「查会议时间回张三」', () async {
+      await insertMessage(db, 'm-ask', '帮我看下明天的会几点开始');
+      replyWith([
+        {'title': '查会议时间回张三', 'kind': 'point', 'priority': 'normal'},
+      ]);
+
+      final summary = await runTriage();
+      final all = await appDb.getProposals();
+
+      expect(tasksOf(all), isEmpty, reason: 'A01：纯查询/疑问不得建任务');
+      expect(summary, contains('丢弃 1 条非行动草稿'));
+      // 消息本身仍照常分类（优先级提案不受影响）
+      expect(all.where((p) => p.tool == ToolNames.messageSetPriority),
+          isNotEmpty);
+    });
+
+    test('「回复张三」无时间无交付物 → 丢弃', () async {
+      await insertMessage(db, 'm-reply', '张三：明天几点到？');
+      replyWith([
+        {'title': '回复张三', 'kind': 'point', 'priority': 'normal'},
+      ]);
+
+      final summary = await runTriage();
+      expect(tasksOf(await appDb.getProposals()), isEmpty);
+      expect(summary, contains('丢弃 1 条'));
+    });
+
+    test('「明晚8点前把表发我」→ 明确时间仍建任务（不误杀）', () async {
+      await insertMessage(db, 'm-do', '明晚8点前把表发我');
+      replyWith([
+        {
+          'title': '给张三发表',
+          'kind': 'point',
+          'startAt': '2026-11-03T20:00',
+          'priority': 'important',
+        },
+      ]);
+
+      final summary = await runTriage();
+      final tasks = tasksOf(await appDb.getProposals());
+      expect(tasks, hasLength(1), reason: '明确时间的事项必须保留草稿');
+      expect(tasks.single.payload['title'], '给张三发表');
+      expect(tasks.single.payload['startAt'], '2026-11-03T20:00');
+      expect(summary, isNot(contains('丢弃')), reason: '本轮没有需要丢弃的草稿');
+    });
+
+    test('支付回执 / 闲聊 → 不误建任务', () async {
+      await insertMessage(db, 'm-pay', '您账户发生快捷支付扣款人民币42.76元');
+      await insertMessage(db, 'm-chat', '哈哈今晚吃啥，随便');
+      // 默认 fakeSubCall 对这两条不给草稿
+      final summary = await runTriage();
+
+      expect(tasksOf(await appDb.getProposals()), isEmpty);
+      expect(summary, isNot(contains('丢弃')));
+    });
+
+    test('shouldDropTriageTaskDraft 纯函数边界（时间/交付物豁免、普通待办不误伤）', () {
+      TriageTaskDraft d(String title, {String? description, DateTime? startAt}) =>
+          TriageTaskDraft(
+            title: title,
+            description: description,
+            kind: 'point',
+            startAt: startAt,
+            priority: 'normal',
+          );
+
+      expect(shouldDropTriageTaskDraft(d('回复张三')), isTrue);
+      expect(shouldDropTriageTaskDraft(d('查会议时间回张三')), isTrue);
+      expect(
+          shouldDropTriageTaskDraft(
+              d('回复张三', startAt: DateTime(2026, 11, 3, 20))),
+          isFalse,
+          reason: '有明确时间 → 保留');
+      expect(
+          shouldDropTriageTaskDraft(d('回复张三', description: '顺带把报名表交了')),
+          isFalse,
+          reason: '有明确交付物 → 保留');
+      expect(shouldDropTriageTaskDraft(d('交周报')), isFalse,
+          reason: '普通待办不能被误伤');
+      expect(shouldDropTriageTaskDraft(d('买菜')), isFalse);
+    });
+  });
 }

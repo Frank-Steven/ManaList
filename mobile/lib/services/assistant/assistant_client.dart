@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../ai_client.dart';
+import '../model_capabilities.dart';
 import 'models.dart';
 
 /// 组装远程（OpenAI 兼容）通道的消息序列（纯函数，便于单测）：
@@ -67,8 +68,12 @@ class DesktopModelEntry {
   /// 连通性探测结果；null = 尚未探测。
   final bool? reachable;
 
-  /// 是否支持图像输入（多模态，model-config.schema 的 vision，缺省 false）。
-  final bool vision;
+  /// 视觉能力三态（B11）：优先取 desktop 上报的 effective `visionStatus`，
+  /// 老版本 desktop 没有该字段时回退到 `vision` 布尔值（true=支持，其余=未确认）。
+  final VisionSupport visionSupport;
+
+  /// 兼容字段：旧调用方仍可读「是否支持」的布尔结论。
+  bool get vision => visionSupport == VisionSupport.supported;
 
   const DesktopModelEntry({
     required this.id,
@@ -76,18 +81,26 @@ class DesktopModelEntry {
     required this.provider,
     required this.model,
     this.reachable,
-    this.vision = false,
-  });
+    VisionSupport? visionSupport,
+  }) : visionSupport = visionSupport ?? VisionSupport.unknown;
 
-  factory DesktopModelEntry.fromJson(Map<String, dynamic> json) =>
-      DesktopModelEntry(
-        id: json['id'] as String,
-        name: json['name'] as String? ?? json['id'] as String,
-        provider: json['provider'] as String? ?? ModelProvider.openaiCompat,
-        model: json['model'] as String? ?? '',
-        reachable: json['reachable'] as bool?,
-        vision: json['vision'] as bool? ?? false,
-      );
+  factory DesktopModelEntry.fromJson(Map<String, dynamic> json) {
+    // desktop 新版本上报 visionStatus；旧版本只有 vision 布尔。
+    // 旧布尔 false 无法区分「用户关闭」与「未配置」，故只把 true 当成支持，
+    // 其余留给 unknown（不冒充支持，也不谎报关闭）。
+    final status = parseVisionSupport(json['visionStatus'] as String?) ??
+        (json['vision'] == true
+            ? VisionSupport.supported
+            : VisionSupport.unknown);
+    return DesktopModelEntry(
+      id: json['id'] as String,
+      name: json['name'] as String? ?? json['id'] as String,
+      provider: json['provider'] as String? ?? ModelProvider.openaiCompat,
+      model: json['model'] as String? ?? '',
+      reachable: json['reachable'] as bool?,
+      visionSupport: status,
+    );
+  }
 }
 
 /// 助理对话通道（design-v3 §3.6/§5.4、details §2.4）：
@@ -176,13 +189,20 @@ class AssistantClient {
   /// 2. 电脑端在线 → /v1/models 中目标模型（[modelConfigId] ?? 默认模型）的
   ///    vision（结果缓存 60s）；
   /// 3. 离线 → 默认远程端点的 vision。
-  /// 探测失败按 false 处理：不附带图像，但不阻断对话。
+  ///
+  /// B11：端点/模型的 vision 只是「用户意图」，最终是否支持由
+  /// [resolveVisionSupport] 结合已知模型能力表判定（未配置 + 已知模型 → 支持；
+  /// 显式 false → 关闭；未知模型 → 不冒充支持）。
+  /// 探测失败仍按不支持处理：不附带图像，但不阻断对话。
   Future<bool> isVisionCapable(String? modelConfigId) async {
     final ai = AiClient.instance;
     try {
       if (modelConfigId != null) {
         for (final e in await ai.getRemoteEndpoints()) {
-          if (e.id == modelConfigId) return e.vision;
+          if (e.id == modelConfigId) {
+            return visionAllowsImages(
+                resolveVisionSupport(model: e.model, configured: e.vision));
+          }
         }
       }
       if (await ai.isDesktopOnline()) {
@@ -197,12 +217,14 @@ class AssistantClient {
         final cache = _modelsCache!;
         final targetId = modelConfigId ?? cache.defaultModelId;
         for (final m in cache.models) {
-          if (m.id == targetId) return m.vision;
+          if (m.id == targetId) return visionAllowsImages(m.visionSupport);
         }
         return false;
       }
       final endpoint = await ai.defaultRemoteEndpoint();
-      return endpoint?.vision ?? false;
+      if (endpoint == null) return false;
+      return visionAllowsImages(
+          resolveVisionSupport(model: endpoint.model, configured: endpoint.vision));
     } catch (_) {
       // 离线抖动 / 模型列表拉取失败等：按不支持处理
       return false;
@@ -352,7 +374,9 @@ class AssistantClient {
       'temperature': 0,
       'stream': true,
       'messages': buildRemoteMessages(messages,
-          attachments: attachments, vision: endpoint.vision),
+          attachments: attachments,
+          vision: visionAllowsImages(
+              resolveVisionSupport(model: endpoint.model, configured: endpoint.vision))),
     });
 
     final client = _client;

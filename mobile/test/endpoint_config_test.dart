@@ -94,4 +94,60 @@ void main() {
           reason: '删默认接口时清默认指针');
     });
   });
+
+  // ---- B11：visual 三态的序列化与旧配置兼容 ----
+
+  group('vision 三态（B11）', () {
+    AiEndpoint make({bool? vision}) => AiEndpoint(
+          id: 'e1',
+          name: '远程A',
+          baseUrl: 'https://a.example.com/v1',
+          model: 'deepseek-v4.1-flash',
+          vision: vision,
+        );
+
+    test('未配置：toJson 不写 vision/visionExplicit，读回仍是 null', () {
+      final row = make().toJson();
+      expect(row.containsKey('vision'), isFalse);
+      expect(row.containsKey('visionExplicit'), isFalse);
+      expect(AiEndpoint.fromJson(row).vision, isNull);
+    });
+
+    test('旧配置 vision:false（无 visionExplicit）→ 视为未配置，交给能力表', () {
+      final restored = AiEndpoint.fromJson({
+        'id': 'e1',
+        'name': 'A',
+        'baseUrl': 'https://a.example.com/v1',
+        'model': 'deepseek-v4.1-flash',
+        'vision': false,
+      });
+      expect(restored.vision, isNull,
+          reason: '旧版本无条件写 false，无法区分用户意图，不能当成显式关闭');
+    });
+
+    test('旧配置 vision:true → 保留显式开启', () {
+      final restored = AiEndpoint.fromJson({
+        'id': 'e1',
+        'name': 'A',
+        'baseUrl': 'https://a.example.com/v1',
+        'vision': true,
+      });
+      expect(restored.vision, isTrue);
+    });
+
+    test('新配置显式关闭（visionExplicit:true + false）→ 往返保留 false', () {
+      final e = make(vision: false);
+      final row = e.toJson();
+      expect(row['vision'], isFalse);
+      expect(row['visionExplicit'], isTrue);
+      expect(AiEndpoint.fromJson(row).vision, isFalse);
+    });
+
+    test('copyWith 闭包可把显式关闭改回未配置（自动）', () {
+      final off = make(vision: false);
+      expect(off.copyWith(vision: () => null).vision, isNull);
+      expect(off.copyWith(vision: () => true).vision, isTrue);
+      expect(off.copyWith(name: 'B').vision, isFalse, reason: '不改 vision 时保持原值');
+    });
+  });
 }

@@ -180,6 +180,33 @@ List<TriageTaskDraft> parseTriageTaskDrafts(dynamic single, dynamic multi) {
   return out;
 }
 
+/// A01：回复/查询/疑问类标题（「回复张三」「查会议时间回张三」这类模板化短语）。
+///
+/// 注意：**不要把裸「回」当前缀** —— 那会把「回家路上买菜」这类真实待办误杀；
+/// 单字「回」只在后接明确动作词（回一下/回个话/回消息/回邮件/回电话）时才算模板。
+final RegExp _replyQueryTitleRe = RegExp(
+    r'^(回复|答复|回覆|回一下|回个话|回个消息|回消息|回邮件|回电话|查|查询|查找|问|询问|确认|了解|看下|问下)');
+
+/// A01：明确的交付动作（有交付物时，即便标题像查询/回复也保留草稿）。
+final RegExp _deliverableRe =
+    RegExp(r'(发|发送|交|提交|上传|带|准备|整理|填写|填|报名|打印|拍照|拍|寄|转账|付款|缴费|缴)');
+
+/// A01：这条任务草稿是否应当丢弃（模型仍把「问一句」写成任务时的兜底）。
+///
+/// 真机反例：「帮我看下明天的会几点开始」被建成「查会议时间回张三」。
+/// 规则（最小收紧，只在**没有明确时间**时生效）：
+/// - 有 startAt/endAt → 保留（「明晚8点前把表发我」这类明确时间事项）；
+/// - 标题不命中回复/查询模板 → 保留（不扩大到普通待办）；
+/// - 命中模板但标题/描述里有明确交付物（发/交/提交/报名…）→ 保留；
+/// - 其余（纯「回复X」「查…回X」）→ 丢弃。
+bool shouldDropTriageTaskDraft(TriageTaskDraft draft) {
+  if (draft.startAt != null || draft.endAt != null) return false;
+  final title = draft.title.trim();
+  if (title.isEmpty) return true;
+  if (!_replyQueryTitleRe.hasMatch(title)) return false;
+  return !_deliverableRe.hasMatch('$title ${draft.description ?? ''}');
+}
+
 /// 解析批量评估输出：取首个 [ 到末个 ] 的 JSON 数组，按 messageId 建 map。
 /// 容忍 markdown 围栏/前后缀文字；数组中缺 messageId 或 id 不在批次内的
 /// 元素忽略；完全没有合法数组时抛 AiException（整批报错）。
@@ -251,6 +278,10 @@ String buildTriageSystemPrompt() {
       '  · 纯告知、营销、广告、验证码、物流泛通知（“预计明天送达”这类无动作的）。\n'
       '- **禁止把消息标题换个说法抄成任务**：「回复<某人/某群>」「更新<某应用>」「留意<某事>」这类模板化短语不是任务，\n'
       '  除非消息里给了明确的时间或交付物。\n'
+      '- **回复/查询/疑问类消息默认不给草稿**：如「帮我看下明天的会几点开始」「张三问我明天几点到」——\n'
+      '  既没有明确时间、也没有明确交付物时，一律空数组 []。用户只是问一句/被问一句，不是待办。\n'
+      '- **禁止「回复/查…回」模板标题**：title 以「回复/查/查询/问/确认」开头且不含明确时间与交付物 → 必须丢弃；\n'
+      '  例：「回复张三」「查会议时间回张三」不合格。明确约定的才保留，如「明晚8点前把表发我」→「给张三发表」。\n'
       '- title 不超过 20 个字符（中文按 2 字符计），超长的细节放入 description。\n'
       '- kind=point 时点任务只需 startAt；kind=range 时段任务需要 startAt 和 endAt；'
       '没有明确时间的可执行事项省略 startAt/endAt（不定时任务）。\n'
@@ -365,6 +396,8 @@ class InboxTriage {
 
     var seq = 0;
     var created = 0;
+    // A01：被兜底丢弃的非行动草稿数（回复/查询模板、无时间无交付物）。
+    var droppedDrafts = 0;
     Future<void> addProposal(
         String tool, Map<String, dynamic> payload, String summary) async {
       final id = '${idPrefix}_t${seq++}';
@@ -426,6 +459,12 @@ class InboxTriage {
         }
         await proposePriority(m, r.priority, r.reason);
         for (final d in r.taskDrafts) {
+          // A01：无时间/无交付物的「回复X」「查…回X」草稿一律不落提案
+          //（提示词已收紧，这里是不依赖模型服从的确定性兜底）。
+          if (shouldDropTriageTaskDraft(d)) {
+            droppedDrafts++;
+            continue;
+          }
           await addProposal(
             ToolNames.taskCreate,
             {
@@ -447,6 +486,7 @@ class InboxTriage {
     final buf = StringBuffer('inbox.triage 完成：范围内 ${messages.length} 条消息');
     if (junkHits > 0) buf.write('，其中 $junkHits 条命中垃圾规则（未调模型）');
     if (evalFailed > 0) buf.write('，$evalFailed 条评估失败');
+    if (droppedDrafts > 0) buf.write('，丢弃 $droppedDrafts 条非行动草稿');
     buf.write(created > 0
         ? '。产生 $created 条提案，请到待确认区审批。'
         : '，未产生提案。');

@@ -22,7 +22,10 @@ let config: Config = {
   host: "127.0.0.1",
   port: 0,
   models: [
-    { id: "mock-1", name: "Mock", provider: "mock", baseUrl: "", model: "mock-chat" },
+    // B11/B10：图片门禁按模型能力判定，mock-chat 不在已知视觉模型表里，
+    // 这里显式声明 vision: true —— 本文件的「图片附件 → content parts」用例
+    // 测的正是「显式支持时才内联图片」的语义，而不是放宽门禁。
+    { id: "mock-1", name: "Mock", provider: "mock", baseUrl: "", model: "mock-chat", vision: true },
     { id: "dead", name: "Dead", provider: "openai-compat", baseUrl: "http://127.0.0.1:9/v1", model: "x" },
   ],
   defaultModelId: "mock-1",

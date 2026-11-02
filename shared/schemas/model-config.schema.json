@@ -32,8 +32,18 @@
       "description": "API key 所在环境变量名（desktop 侧远程端点用），不直接存密钥。可选"
     },
     "vision": {
+      "type": ["boolean", "null"],
+      "description": "图像输入（多模态）能力，三态语义的唯一事实源。true = 支持（图片按 OpenAI image_url 内容块内联发送）；false = 用户显式关闭（永不发送图片）；null 或字段缺省 = 未配置，由模型能力表推断（已知支持视觉的模型自动按支持处理，未知模型按未确认处理且不发送图片）。兼容旧配置：旧实现可能对从未配置的项写下 false 且无 visionExplicit 标记，这类值无法区分用户意图，读取方应视为未配置。可选",
+      "default": null
+    },
+    "visionExplicit": {
       "type": "boolean",
-      "description": "模型是否支持图像输入（多模态）。true 时手机端会把图片附件内联进请求（OpenAI image_url 内容块）；缺省 false。可选"
+      "description": "用户是否显式选择过视觉能力。true 时 vision 的布尔值才代表用户意图（false = 用户关闭）；缺省/false 表示 vision 可能是历史默认值，读取方应结合能力表判断。与 vision 成对写入，旧配置没有该字段时按「未配置」兼容。可选"
+    },
+    "visionStatus": {
+      "type": "string",
+      "enum": ["supported", "disabled", "unknown"],
+      "description": "只读上报字段（不属于配置）：GET /v1/models 条目上由 desktop 按「模型名 + vision 三态」计算出的能力结论，供手机端如实显示「支持 / 已关闭 / 未确认」。配置侧写入会被忽略。可选"
     }
   }
 }

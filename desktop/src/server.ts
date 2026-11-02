@@ -6,6 +6,7 @@ import { GateBusyError, GatePool } from "./limit.js";
 import { readSharedJson } from "./registry.js";
 import type { ModelManager } from "./models.js";
 import type { ProviderChatMessage } from "./ai/provider.js";
+import { resolveVisionSupport, visionAllowsImages } from "./model-capabilities.js";
 import type { ChatEvent, ChatRequest } from "./types.js";
 
 export interface ServerOptions {
@@ -46,13 +47,19 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
  *  1. 顶层 attachments（手机端已展开正文、自带 [#note:标题] 引用头）拼成一条上下文消息——
  *     图片附件（带 dataBase64）按 OpenAI content parts 内联（image_url，data URL）；
  *  2. OpenAI 端点对 tool 角色要求 tool_calls 字段，本地小模型链路用不上——折叠为带前缀的 user 消息。
+ *
+ * B10：desktop 必须**自己**按模型能力门禁图片（[vision]），不能只依赖手机端剥离——
+ * 手机端版本可能滞后、或请求来自其它客户端。
  */
-function buildProviderMessages(body: ChatRequest): ProviderChatMessage[] {
+export function buildProviderMessages(
+  body: ChatRequest,
+  vision: boolean,
+): ProviderChatMessage[] {
   const out: ProviderChatMessage[] = [];
   if (body.attachments && body.attachments.length > 0) {
     const blocks = body.attachments.map((a) => a.content).join("\n\n");
     const images = body.attachments.filter(
-      (a) => typeof a.dataBase64 === "string" && a.dataBase64.length > 0,
+      (a) => vision && typeof a.dataBase64 === "string" && a.dataBase64.length > 0,
     );
     const intro = `以下是与本次对话相关的库内容（供引用定位）：\n\n${blocks}`;
     if (images.length === 0) {
@@ -201,8 +208,15 @@ export function createServer(opts: ServerOptions): http.Server {
             // 客户端已断开：忽略写入错误
           }
         };
+        // B10/B11：desktop 侧独立解析该模型的能力（模型名 + 配置的 vision 三态），
+        // 未确认/关闭时丢弃图片，避免把 image parts 发给不支持的端点。
+        const modelConfig = opts.models.modelFor(modelId);
+        const visionSupport = resolveVisionSupport(
+          modelConfig?.model ?? "",
+          modelConfig?.vision ?? null,
+        );
         try {
-          await provider.chat(buildProviderMessages(body), {
+          await provider.chat(buildProviderMessages(body, visionAllowsImages(visionSupport)), {
             onToken: (delta) => send({ type: "token_delta", delta }),
           });
           send({ type: "done" });

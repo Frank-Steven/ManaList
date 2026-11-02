@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../services/ai_client.dart';
 import '../../services/assistant/assistant_client.dart';
+import '../../services/model_capabilities.dart';
 
 /// 模型配置（design-v3 §5.5）：
 /// - 电脑端（置顶只读）：连接状态/配对 + GET /v1/models 上报的模型列表；
@@ -103,7 +104,7 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
     final apiKeyController =
         TextEditingController(text: existing?.apiKey ?? '');
     final modelController = TextEditingController(text: existing?.model ?? '');
-    var vision = existing?.vision ?? false;
+    bool? vision = existing?.vision; // null = 自动（按模型能力推断）
     final saved = await showDialog<AiEndpoint>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -133,14 +134,31 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
                 TextField(
                   controller: modelController,
                   decoration: const InputDecoration(labelText: '模型'),
+                  onChanged: (_) => setDialogState(() {}),
                 ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('支持图像输入'),
-                  subtitle: const Text('多模态模型；开启后图片附件随对话发送',
-                      style: TextStyle(fontSize: 12)),
+                // B11：三态而不是开关——
+                // 「自动」交给模型能力表（已知视觉模型自动支持），
+                // 「关闭」才是用户显式覆盖；未知模型显示「未确认」且不发送图片。
+                DropdownButton<bool?>(
+                  isExpanded: true,
                   value: vision,
+                  items: const [
+                    DropdownMenuItem(
+                        value: null, child: Text('自动（按模型能力推断）')),
+                    DropdownMenuItem(value: true, child: Text('支持（发送图片）')),
+                    DropdownMenuItem(
+                        value: false, child: Text('关闭（不发送图片）')),
+                  ],
                   onChanged: (v) => setDialogState(() => vision = v),
+                ),
+                const SizedBox(height: 4),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    visionSupportLabel(resolveVisionSupport(
+                        model: modelController.text, configured: vision)),
+                    style: const TextStyle(fontSize: 12),
+                  ),
                 ),
               ],
             ),
@@ -173,7 +191,7 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
                     baseUrl: baseUrl,
                     apiKey: apiKeyController.text.trim(),
                     model: modelController.text.trim(),
-                    vision: vision,
+                    vision: () => vision,
                   ),
                 );
               },
@@ -364,7 +382,7 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
       title: Text(
           '${m.name}${m.id == _desktopDefaultModelId ? '（默认）' : ''}${selected && widget.selectionMode ? ' ✓' : ''}'),
       subtitle: Text(
-        '${m.model} · ${reachable == null ? '未探测' : reachable ? '可达' : '不可达'}${m.vision ? ' · 视觉' : ''}',
+        '${m.model} · ${reachable == null ? '未探测' : reachable ? '可达' : '不可达'}${visionSupportBadge(m.visionSupport)}',
         style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
       ),
       onTap: widget.selectionMode ? () => _select(m.id) : null,
@@ -382,7 +400,9 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
               size: 20)
           : Icon(Icons.cloud_outlined, color: cs.onSurfaceVariant),
       title: Text('${e.name}${selected && widget.selectionMode ? ' ✓' : ''}'),
-      subtitle: Text('${e.baseUrl} · ${e.model}${e.vision ? ' · 视觉' : ''}',
+      subtitle: Text(
+          '${e.baseUrl} · ${e.model}'
+          '${visionSupportBadge(resolveVisionSupport(model: e.model, configured: e.vision))}',
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
