@@ -262,6 +262,9 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   void didUpdateWidget(TaskScheduleView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.granularity == widget.granularity) return;
+    // B14：换粒度 = 新视图尚未上报，清掉「已上报」标记，
+    // 让新粒度首帧仍能播种兜底窗口（B01），不受旧粒度标记影响。
+    _windowReportedGranularity = null;
     if (_pendingJump) {
       // _jumpToTask 主动换粒度：选中/详情保留，滚动由 _jumpToTask 自己安排
       _pendingJump = false;
@@ -677,6 +680,8 @@ class TaskScheduleViewState extends State<TaskScheduleView>
 
   /// 可视窗口变化：记录精确可视范围（底部面板/标题用）+ 增量加载。
   void _onWindowChanged(int startMs, int endMs) {
+    // B14：记下这次上报属于哪个粒度 —— 同粒度此后不得再用整日推算覆盖。
+    _windowReportedGranularity = widget.granularity;
     setState(() {
       _visStartMs = startMs;
       _visEndMs = endMs;
@@ -690,7 +695,18 @@ class TaskScheduleViewState extends State<TaskScheduleView>
   /// 这里按当前粒度与锚点推算一个合理的默认窗口，视图上报后再被真实值覆盖。
   String _windowSeedKey = '';
 
+  /// B14（2026-11-02）：最近一次**真实窗口上报**所属的粒度（null = 还没有过）。
+  ///
+  /// 同一粒度一旦上报过真实窗口，就不得再因 anchor/中心日变化用「anchor 当天整日」
+  /// 覆盖它：日视图窗口跨午夜时可视中心会落到次日，anchor 换日会再次触发播种，
+  /// 把刚上报的 22:30–01:30 覆盖成「次日 00:00–24:00」，于是前一日 20:00–23:00
+  /// 的任务从底部面板消失（2026-10-21 真机 B14）。
+  /// 粒度切换后本值不等于新粒度，新粒度首帧仍会正常播种（B01 兜底保留）。
+  int? _windowReportedGranularity;
+
   void _maybeSeedWindow() {
+    // B14：本粒度已有真实上报 → 不播种、不覆盖（否则会把真实窗口改回整日推算）。
+    if (_windowReportedGranularity == widget.granularity) return;
     final key =
         '${widget.granularity}|${_anchor.year}-${_anchor.month}-${_anchor.day}';
     if (_visStartMs != null && _windowSeedKey == key) return;
