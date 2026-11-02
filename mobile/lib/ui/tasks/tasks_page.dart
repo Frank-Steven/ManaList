@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../services/app_ui_state.dart';
+import '../../services/database.dart';
 import 'task_list_view.dart';
 import 'task_schedule_view.dart';
 
@@ -45,6 +46,13 @@ class TasksPageState extends State<TasksPage>
   /// 列表视图处于多选态时隐藏 FAB（避免遮挡底部批量操作条）。
   bool _listSelecting = false;
 
+  /// F14：定位消费代际（latest-wins）。
+  ///
+  /// [AppUiState] 的通知可能连着来（用户快速点两条关联待办）：旧的消费流程
+  /// 若在 await getTaskById / focusTask 里慢了一拍，回到此处时**不得**再切视图
+  /// 或定位，否则会覆盖新请求的结果。
+  int _focusSeq = 0;
+
   @override
   void initState() {
     super.initState();
@@ -52,13 +60,42 @@ class TasksPageState extends State<TasksPage>
     _scheduleBuilt = _mode != 0;
     _tab = TabController(length: 5, vsync: this, initialIndex: _mode);
     _tab.addListener(_onTabChanged);
+    // F14：消息详情「关联待办」点击要定位到具体任务。请求经 AppUiState 传进来，
+    // 消费动作放在本页（任务页是任务列表的宿主）。
+    AppUiState.instance.addListener(_onUiStateChanged);
+    // 首次进入本页时可能已有未消费的定位请求（切 tab 才创建本页的情况）：
+    // 首帧后再补一次消费，避免请求因 initState 早于通知而丢失。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _consumeTaskFocus());
   }
 
   @override
   void dispose() {
+    AppUiState.instance.removeListener(_onUiStateChanged);
     _tab.removeListener(_onTabChanged);
     _tab.dispose();
     super.dispose();
+  }
+
+  void _onUiStateChanged() {
+    // 变化可能来自视图/分区记忆等任何 notify，只在真有定位请求时才动作。
+    if (AppUiState.instance.pendingTaskFocusId == null) return;
+    _consumeTaskFocus();
+  }
+
+  /// F14：消费「定位到某任务」请求。
+  ///
+  /// 任务页负责切到「列表」视图（各尺度页签能覆盖定时/不定时/已完成/已归档），
+  /// 行定位（顶部对齐）与约 1 秒临时高亮由 [TaskListViewState.focusTask] 完成。
+  /// 任务已不存在时只完成切页，静默放弃（用户仍看到任务页）。
+  Future<void> _consumeTaskFocus() async {
+    final taskId = AppUiState.instance.takeTaskFocus();
+    if (taskId == null || !mounted) return;
+    final token = ++_focusSeq;
+    final task = await AppDatabase.instance.getTaskById(taskId);
+    // 期间又来了更新的请求（或页面已销毁）：本次整体作废 —— 不切视图、不定位。
+    if (!mounted || token != _focusSeq || task == null) return;
+    if (_mode != 0) _switchMode(0);
+    await _listKey.currentState?.focusTask(task);
   }
 
   void _onTabChanged() {

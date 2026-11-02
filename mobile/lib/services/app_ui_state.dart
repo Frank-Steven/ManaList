@@ -47,10 +47,19 @@ class AppUiState extends ChangeNotifier {
   /// 任务页当前视图：0=列表 1=日 2=月 3=年 4=年度。
   int _tasksViewMode = 0;
 
+  /// F14：跨页定位请求（消息详情「关联待办」→ 任务页定位到该任务）。
+  ///
+  /// 只存任务 id、由任务页**消费一次**后清空：与上面的 tab/分区/视图记忆同一处
+  /// 状态源，不另起一套导航机制（避免「谁负责切页、谁负责定位」两处漂移）。
+  String? _pendingTaskFocusId;
+
   int get tabIndex => _tabIndex;
   bool get inForeground => _inForeground;
   int get librarySection => _librarySection;
   int get tasksViewMode => _tasksViewMode;
+
+  /// 待消费的定位任务 id（null = 无请求）。
+  String? get pendingTaskFocusId => _pendingTaskFocusId;
 
   /// 用户此刻正看着消息页（前台 + 库 tab + 消息分区）。
   bool get messagesVisible =>
@@ -104,6 +113,26 @@ class AppUiState extends ChangeNotifier {
       _persist(librarySectionPrefsKey, section);
     }
     if (changed) notifyListeners();
+  }
+
+  /// F14：请求「切到任务页并定位到某任务」。切 tab 由调用方负责
+  /// （通常紧跟 [setTab]）；任务页会监听并消费这个请求。
+  void requestTaskFocus(String taskId) {
+    if (taskId.isEmpty) return;
+    _pendingTaskFocusId = taskId;
+    notifyListeners();
+  }
+
+  /// 取走待消费的定位请求：返回任务 id 并清空（任务页只消费一次）。
+  String? takeTaskFocus() {
+    final id = _pendingTaskFocusId;
+    _pendingTaskFocusId = null;
+    return id;
+  }
+
+  /// 丢弃未消费的定位请求（测试复位用；不通知监听者）。
+  void clearTaskFocus() {
+    _pendingTaskFocusId = null;
   }
 
   void setForeground(bool value) {

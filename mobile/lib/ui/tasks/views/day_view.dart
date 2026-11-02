@@ -569,9 +569,6 @@ class _DayLayout {
   final int labelStride;
   final List<_DayItem> items;
   final Map<String, DayNameSlot> nameSlots;
-  /// R1-A：标签分组与「组 → 槽位」映射（唯一一次贪心的结果）
-  final List<LabelGroup> groups;
-  final Map<String, DayNameSlot> groupSlots;
   final List<_HitRegion> hitRegions;
   final Map<String, Task> originals;
   final Map<String, (double, double)> spans; // taskId -> (绝对起, 绝对止)
@@ -596,8 +593,6 @@ class _DayLayout {
     required this.labelStride,
     required this.items,
     required this.nameSlots,
-    required this.groups,
-    required this.groupSlots,
     required this.hitRegions,
     required this.originals,
     required this.spans,
@@ -785,10 +780,6 @@ class _DayLayout {
       );
     }
 
-    // R01：节点不再合并 → 不再构造 LabelGroup；保留字段以兼容绘制/比较代码
-    const groups = <LabelGroup>[];
-    const groupSlots = <String, DayNameSlot>{};
-
     // 命中区域：子任务在前（与父同 y 叠加时优先命中子任务）
     for (final it in [
       ...items.where((i) => i.isSubtask),
@@ -843,8 +834,6 @@ class _DayLayout {
       labelStride: labelStride,
       items: items,
       nameSlots: nameSlots,
-        groups: groups,
-        groupSlots: groupSlots,
       hitRegions: hitRegions,
       originals: originals,
       spans: spans,
@@ -1132,10 +1121,9 @@ class _DayPainter extends CustomPainter {
         a.nowMin != b.nowMin) {
       return true;
     }
-    // 布局每帧都会重建（items/groups 都是新 List），所以不能比 identical，
-    // 要比内容 —— 否则等于恒 true，等于没优化（code-writer 2026-10-20 指出）。
+    // 布局每帧都会重建（items 是新 List），所以不能比 identical，要比内容 ——
+    // 否则等于恒 true，等于没优化（code-writer 2026-10-20 指出）。
     if (!_sameItems(a.items, b.items)) return true;
-    if (!_sameGroups(a.groups, b.groups)) return true;
     return false;
   }
 
@@ -1156,19 +1144,4 @@ class _DayPainter extends CustomPainter {
     }
     return true;
   }
-
-  static bool _sameGroups(List<LabelGroup> a, List<LabelGroup> b) {
-    if (a.length != b.length) return false;
-    for (var i = 0; i < a.length; i++) {
-      final x = a[i];
-      final y = b[i];
-      if (x.id != y.id ||
-          x.title != y.title ||
-          x.startAxis != y.startAxis ||
-          x.endAxis != y.endAxis ||
-          x.taskIds.length != y.taskIds.length) {
-        return false;
-      }
-    }
-    return true;
-  }}
+}

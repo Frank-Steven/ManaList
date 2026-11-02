@@ -210,9 +210,14 @@ class _MessageDetailState extends State<_MessageDetail> {
     return file.uri.pathSegments.last;
   }
 
-  void _jumpToTasks() {
+  /// F14：跳任务页并**定位到该任务**（切 tab → 投递定位请求 →
+  /// 任务页切列表视图、滚动顶部对齐 + 约 1 秒临时高亮）。
+  void _jumpToTask(Task t) {
     Navigator.of(context).pop();
+    // 先切页：任务页若尚未创建，壳层在这一帧懒构建它；请求留在 AppUiState，
+    // 任务页首帧补消费（未消费的请求不会被丢弃）。
     AppUiState.instance.setTab(AppUiState.tasksTabIndex);
+    AppUiState.instance.requestTaskFocus(t.id);
   }
 
   /// 长按选段「添加任务锚点」（design-v3 §3.4）：选/建任务 →
@@ -363,7 +368,7 @@ class _MessageDetailState extends State<_MessageDetail> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
       child: InkWell(
-        onTap: _jumpToTasks,
+        onTap: () => _jumpToTask(t),
         child: Row(
           children: [
             Icon(

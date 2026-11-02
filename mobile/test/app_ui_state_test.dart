@@ -17,6 +17,7 @@ void main() {
     AppUiState.instance.setLibrarySection(AppUiState.librarySectionMessages);
     AppUiState.instance.setTasksViewMode(0);
     AppUiState.instance.setForeground(true);
+    AppUiState.instance.clearTaskFocus();
     MessageBadges.instance.setPending(0);
   });
 
@@ -94,6 +95,49 @@ void main() {
     await s.restore();
     expect(s.librarySection, AppUiState.librarySectionMessages);
     expect(s.tasksViewMode, 0);
+  });
+
+  test('F14 定位请求：投递唤醒任务页，且只能被取走一次', () {
+    final s = AppUiState.instance;
+    var notified = 0;
+    void listener() => notified++;
+    s.addListener(listener);
+    addTearDown(() => s.removeListener(listener));
+
+    expect(s.pendingTaskFocusId, isNull, reason: '初始无定位请求');
+
+    s.requestTaskFocus('t1');
+    expect(s.pendingTaskFocusId, 't1');
+    expect(notified, 1, reason: '投递请求要唤醒任务页（它监听同一个 AppUiState）');
+
+    expect(s.takeTaskFocus(), 't1');
+    expect(s.pendingTaskFocusId, isNull, reason: '消费一次即清空');
+    expect(s.takeTaskFocus(), isNull, reason: '重复消费返回 null（幂等）');
+  });
+
+  test('F14 定位请求：空 id 忽略；clearTaskFocus 丢弃未消费请求', () {
+    final s = AppUiState.instance;
+    s.requestTaskFocus('');
+    expect(s.pendingTaskFocusId, isNull, reason: '空 id 不产生请求');
+
+    s.requestTaskFocus('t2');
+    expect(s.pendingTaskFocusId, 't2');
+    s.clearTaskFocus();
+    expect(s.pendingTaskFocusId, isNull);
+    expect(s.takeTaskFocus(), isNull);
+  });
+
+  test('F14 定位请求与 tab/视图记忆互不干扰', () {
+    final s = AppUiState.instance;
+    s.setTasksViewMode(2);
+    s.requestTaskFocus('t3');
+
+    expect(s.pendingTaskFocusId, 't3');
+    expect(s.tasksViewMode, 2, reason: '投递定位请求不改任务页视图记忆');
+
+    s.setTab(AppUiState.tasksTabIndex);
+    expect(s.tabIndex, AppUiState.tasksTabIndex);
+    expect(s.pendingTaskFocusId, 't3', reason: '切页不消费定位请求（由任务页消费）');
   });
 
   test('角标：负数归零，同值不重复通知', () {

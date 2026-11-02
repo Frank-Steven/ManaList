@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../models/message.dart';
@@ -86,6 +88,19 @@ class TaskListViewState extends State<TaskListView> {
   String? _selectedTaskId;
   final Map<String, GlobalKey> _rowKeys = {};
 
+  /// F14：临时高亮定位的任务 id（约 1 秒后清除）。
+  ///
+  /// 与 [_selectedTaskId] 分开放：后者是「详情面板跳转选中」的既有语义，
+  /// 外部跳转只额外刷一次色带，不改既有的选中/详情行为。
+  String? _flashTaskId;
+  Timer? _flashTimer;
+
+  /// F14：定位请求代际（latest-wins）。
+  ///
+  /// 每次 [focusTask] 自增；reload 之后以及每个延迟帧/重试回调里都比对代际，
+  /// 过期请求**不得**再切页签、滚动或挂高亮 —— 否则慢的旧请求会覆盖新请求。
+  int _focusGeneration = 0;
+
   /// 详情模式下展示的任务（v2.5：内嵌 TaskDetailPanel，非空时替换 PageView）。
   Task? _detailTask;
 
@@ -96,6 +111,19 @@ class TaskListViewState extends State<TaskListView> {
   final PageController _pageController = PageController(initialPage: 0);
   final ScrollController _tabScrollController = ScrollController();
 
+  /// F14：各页签列表自己的滚动控制器（外部定位用）。
+  ///
+  /// 每页签一个：PageView 翻页瞬间相邻页可能同时挂载，共用同一个控制器会
+  /// 触发「ScrollController attached to multiple scroll views」。
+  final Map<int, ScrollController> _listControllers = {};
+
+  /// 行高估算值（只用于「把懒构建的目标行拉进构建范围」的粗定位；
+  /// 精确顶对齐随后由 Scrollable.ensureVisible 完成）。故意估小一点。
+  static const double _kEstimatedRowHeight = 56;
+
+  /// 行 context 找不到时向下小步推进的最大重试次数（懒构建列表）。
+  static const int _kMaxLocateAttempts = 6;
+
   @override
   void initState() {
     super.initState();
@@ -104,6 +132,10 @@ class TaskListViewState extends State<TaskListView> {
 
   @override
   void dispose() {
+    _flashTimer?.cancel();
+    for (final c in _listControllers.values) {
+      c.dispose();
+    }
     _pageController.dispose();
     _tabScrollController.dispose();
     super.dispose();
@@ -246,6 +278,18 @@ class TaskListViewState extends State<TaskListView> {
     final rows = _visibleRows(_tabTasks(tab), byParent);
     _tabRows[tab] = rows;
     return rows;
+  }
+
+  /// 某页签列表的滚动控制器（懒创建）。
+  ScrollController _controllerForTab(int tab) =>
+      _listControllers.putIfAbsent(tab, () => ScrollController());
+
+  /// 已挂载且已完成首帧布局的位置（否则 maxScrollExtent 会断言失败）。
+  ScrollPosition? _readyPosition(int tab) {
+    final ctrl = _controllerForTab(tab);
+    if (!ctrl.hasClients) return null;
+    final pos = ctrl.position;
+    return pos.hasContentDimensions ? pos : null;
   }
 
   void _showUndoSnack(String label) {
@@ -531,17 +575,137 @@ class TaskListViewState extends State<TaskListView> {
       if (t.parentId != null) _collapsedParents.remove(t.parentId);
       _invalidateRows();
     });
-    _pageController.jumpToPage(tab);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final ctx = _rowKeys[t.id]?.currentContext;
-      if (ctx != null) {
+    // B09：页签值 → PageView 页码必须按 [_tabOrder] 换算（列表页按展示顺序排页，
+    // 页下标 ≠ 页签值；与 F14 [focusTask] 同一套换算）。
+    // 等一帧再跳：详情模式刚被退出，此刻 PageView 还没按新页签重建，
+    // 同步跳只会作用在即将卸载的旧 PageView 上（新 PageView 又回到第 0 页）。
+    _afterFrames(1, () {
+      if (!mounted) return;
+      final page = _tabOrder.indexOf(tab);
+      if (page >= 0 && _pageController.hasClients) {
+        _pageController.jumpToPage(page);
+      }
+      // 再等两帧：目标页里的列表完成构建/布局后才拿得到行 context。
+      _afterFrames(2, () {
+        if (!mounted) return;
+        final ctx = _rowKeys[t.id]?.currentContext;
+        if (ctx == null) return;
         Scrollable.ensureVisible(
           ctx,
           duration: const Duration(milliseconds: 300),
           curve: Curves.easeOut,
           alignment: 0.3,
         );
+      });
+    });
+  }
+
+  /// F14：外部请求定位到某任务（消息详情「关联待办」点击的落点）。
+  ///
+  /// 与 [_jumpToTask]（详情面板里点父/子任务）的区别：
+  /// - 页签 → PageView 页码按 [_tabOrder] 换算（列表页按展示顺序排页，
+  ///   页下标 ≠ 页签值）；
+  /// - 滚动**顶部对齐**（alignment: 0）；
+  /// - 只做约 1 秒的临时高亮，不动 [_selectedTaskId] 的既有选中语义。
+  ///
+  /// 目标行找不到（任务已删/被上限截断）时，仍已切到对应页签，静默结束。
+  Future<void> focusTask(Task task,
+      {Duration flashFor = const Duration(seconds: 1)}) async {
+    if (!mounted) return;
+    final token = ++_focusGeneration;
+    // 从消息页跳来时本页数据可能落后（他处刚改过状态/标题），先刷新再定位。
+    await reload();
+    // reload 期间可能又来了新请求：代际变了就整段作废，绝不覆盖新请求。
+    if (!mounted || token != _focusGeneration) return;
+
+    final tab = _tabForTask(task);
+    setState(() {
+      _tab = tab;
+      _detailTask = null; // 退出内嵌详情，露出列表
+      if (task.parentId != null) _collapsedParents.remove(task.parentId);
+      _invalidateRows(); // 折叠态变了 → 可见行重算
+      _flashTaskId = task.id;
+    });
+
+    _flashTimer?.cancel();
+    _flashTimer = Timer(flashFor, () {
+      if (!mounted) return;
+      setState(() => _flashTaskId = null);
+    });
+
+    _afterFrames(1, () {
+      if (!mounted || token != _focusGeneration) return; // 过期：不换页
+      final page = _tabOrder.indexOf(tab);
+      if (page >= 0 && _pageController.hasClients) {
+        _pageController.jumpToPage(page);
       }
+      // 换页后等一帧：新页签里的 ListView 才挂上滚动控制器。
+      _afterFrames(1, () {
+        if (!mounted || token != _focusGeneration) return;
+        _locateRow(tab, task.id, token);
+      });
+    });
+  }
+
+  /// F14：把目标行粗略滚进构建范围，再交给 [_alignRowTop] 顶对齐。
+  ///
+  /// 列表是 ListView.builder 懒构建：目标行远在视口外时根本没有 RenderObject，
+  /// [_rowKeys] 拿不到 context，直接 ensureVisible 会**静默失效**（表现为点击
+  /// 关联待办后只切了页签、列表仍停在顶部、目标行看不见）。这里先按估算
+  /// 行高把列表滚到目标附近，让它进入构建/缓存区。
+  void _locateRow(int tab, String taskId, int token, [int attempt = 0]) {
+    if (!mounted || token != _focusGeneration) return; // 过期请求：不滚动
+    final index = _rowsFor(tab).indexWhere((t) => t.id == taskId);
+    if (index < 0) return; // 行不在本页签：无从定位
+    final pos = _readyPosition(tab);
+    if (pos == null) {
+      // 列表还没挂载 / 还没完成布局：下一帧再试（有界）
+      if (attempt < _kMaxLocateAttempts) {
+        _afterFrames(1, () => _locateRow(tab, taskId, token, attempt + 1));
+      }
+      return;
+    }
+    // 故意少滚两行：让目标落在视口**下方**（会进入缓存区被构建），
+    // 而不是滚过头跑到视口上方被裁掉。
+    final lead = index - 2 < 0 ? 0 : index - 2;
+    final target =
+        (lead * _kEstimatedRowHeight).clamp(0.0, pos.maxScrollExtent).toDouble();
+    if ((pos.pixels - target).abs() > 1) pos.jumpTo(target);
+    _afterFrames(1, () => _alignRowTop(tab, taskId, token));
+  }
+
+  /// 目标行顶对齐；行还没被懒构建时向下小步推进（有界），不静默放弃。
+  void _alignRowTop(int tab, String taskId, int token, [int attempt = 0]) {
+    if (!mounted || token != _focusGeneration) return; // 过期请求：不再顶对齐
+    final ctx = _rowKeys[taskId]?.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(
+        ctx,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+        alignment: 0.0, // 顶部对齐：目标行贴住列表视口顶部
+      );
+      return;
+    }
+    final pos = _readyPosition(tab);
+    if (pos == null || attempt >= _kMaxLocateAttempts) return;
+    final next = (pos.pixels + _kEstimatedRowHeight * 3)
+        .clamp(0.0, pos.maxScrollExtent)
+        .toDouble();
+    if ((next - pos.pixels).abs() < 0.5) return; // 已到底：行确实不在本列表
+    pos.jumpTo(next);
+    _afterFrames(1, () => _alignRowTop(tab, taskId, token, attempt + 1));
+  }
+
+  /// 等 [frames] 帧再执行（首帧换页、次帧布局；与甘特视图 _afterTwoFrames 同法）。
+  void _afterFrames(int frames, VoidCallback fn) {
+    if (frames <= 0) {
+      fn();
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _afterFrames(frames - 1, fn);
     });
   }
 
@@ -718,13 +882,13 @@ class TaskListViewState extends State<TaskListView> {
     final byParent = _tabByParent[tab] ?? const <String, List<Task>>{};
     switch (tab) {
       case 7:
-        return _taskListView(rows, byParent, done: true);
+        return _taskListView(rows, byParent, tab: tab, done: true);
       case 8:
-        return _taskListView(rows, byParent, archived: true);
+        return _taskListView(rows, byParent, tab: tab, archived: true);
       case 9:
-        return _taskListView(rows, byParent, mixed: true);
+        return _taskListView(rows, byParent, tab: tab, mixed: true);
       default:
-        return _taskListView(rows, byParent);
+        return _taskListView(rows, byParent, tab: tab);
     }
   }
 
@@ -775,7 +939,7 @@ class TaskListViewState extends State<TaskListView> {
         task.parentId != null && byParent.containsKey(task.parentId);
     final children = byParent[task.id] ?? const <Task>[];
     final progress = _progress[task.id];
-    return TaskTile(
+    final tile = TaskTile(
       key: keyed ? _rowKeys.putIfAbsent(task.id, () => GlobalKey()) : null,
       task: task,
       archived: archived,
@@ -814,12 +978,25 @@ class TaskListViewState extends State<TaskListView> {
           ? null
           : () => _showSourceMessage(task.sourceMessageId!),
     );
+    if (task.id != _flashTaskId) return tile;
+    // F14 临时高亮：TaskTile 根容器背景是透明色，外层刷一条浅色带即可见；
+    // 固定 key 让回归测试能直接断言「出现 → 约 1 秒后消失」。
+    return Container(
+      key: ValueKey('task-row-flash-${task.id}'),
+      color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.16),
+      child: tile,
+    );
   }
 
   Widget _taskListView(List<Task> rows, Map<String, List<Task>> byParent,
-      {bool done = false, bool archived = false, bool mixed = false}) {
+      {required int tab,
+      bool done = false,
+      bool archived = false,
+      bool mixed = false}) {
+    final controller = _controllerForTab(tab);
     if (rows.isEmpty) {
       return ListView(
+        controller: controller,
         physics: const AlwaysScrollableScrollPhysics(),
         children: const [
           SizedBox(height: 120),
@@ -828,6 +1005,7 @@ class TaskListViewState extends State<TaskListView> {
       );
     }
     return ListView.builder(
+      controller: controller,
       physics: const AlwaysScrollableScrollPhysics(),
       itemCount: rows.length + 1,
       itemBuilder: (context, i) {
