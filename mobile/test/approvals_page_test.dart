@@ -103,6 +103,9 @@ void main() {
       // 两条都在「全部」下可见；A 默认勾选
       expect(find.text('通过所选（1）'), findsOneWidget);
       expect(find.textContaining('标为 junk'), findsWidgets);
+      // 同一 batch 成一组：无筛选时组头按组内总数
+      expect(find.text('测试对话 · 2 项'), findsOneWidget,
+          reason: '无筛选：组头计数 = 组内总数');
 
       // 切到「任务」chip：A 不可见 → 选择集合清掉 A，计数归 0
       await tester.tap(find.widgetWithText(FilterChip, '任务'));
@@ -115,6 +118,11 @@ void main() {
       expect(find.textContaining('标为 junk'), findsNothing,
           reason: '消息标记卡片已被筛选隐藏');
       expect(find.textContaining('买菜'), findsWidgets);
+      // B16 残余修复：组头计数也要跟着可见集合走（否则会「写 2 项、只列 1 条」）
+      expect(find.text('测试对话 · 1 项'), findsOneWidget,
+          reason: '筛选后组头计数应等于可见集合大小');
+      expect(find.text('测试对话 · 2 项'), findsNothing,
+          reason: '筛选后不得再显示组内总数');
     });
   });
 }

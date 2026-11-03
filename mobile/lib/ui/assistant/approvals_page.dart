@@ -159,11 +159,16 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
           SnackBar(content: Text(text), duration: const Duration(seconds: 2)));
   }
 
-  String _groupTitle(ProposalBatch g) {
+  /// 组头文案：对话标题 + **当前可见**提案数（B16 残余修复）。
+  ///
+  /// [visibleCount] 必须是 filterByCategory 之后的集合大小：筛选后组头数字要与
+  /// 实际显示的行数一致，否则会出现「组头写 3 项、下面只列出 1 条」的脱节。
+  /// 无筛选时 visibleCount == g.proposals.length，显示与原来完全相同。
+  String _groupTitle(ProposalBatch g, int visibleCount) {
     final convTitle = g.conversationId != null
         ? _conversationTitles[g.conversationId] ?? '已删除对话'
         : '未知来源';
-    return '$convTitle · ${g.proposals.length} 项';
+    return '$convTitle · $visibleCount 项';
   }
 
   @override
@@ -254,7 +259,7 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
           dense: true,
           leading: Icon(collapsed ? Icons.expand_more : Icons.expand_less,
               size: 20),
-          title: Text(_groupTitle(g),
+          title: Text(_groupTitle(g, visible.length),
               maxLines: 1, overflow: TextOverflow.ellipsis),
           trailing: TextButton(
             // B16：busy 期间禁用组头全选/清空。
