@@ -8,9 +8,8 @@ import { createServer } from "./server.js";
 import { ModelManager, type ModelListEntry } from "./models.js";
 import {
   adbPath,
-  deviceState,
   ensureReverse,
-  listDevices,
+  scanDevices,
   type DeviceInfo,
   type DeviceState,
 } from "./adb.js";
@@ -279,7 +278,10 @@ async function tick(): Promise<void> {
       changed = true;
     }
   } else {
-    const dev = await deviceState();
+    // O07（2026-11-03）：一次 adb devices -l 同时拿到状态与设备列表，
+    // 原先是 deviceState() + listDevices() 各自 spawn 一个 adb 进程。
+    const scan = await scanDevices();
+    const dev = scan.state;
     if (dev !== devState) {
       changed = true;
       if (dev === "unauthorized") notify("手机已连接但未授权——请在手机弹窗中允许 USB 调试。");
@@ -287,8 +289,7 @@ async function tick(): Promise<void> {
     }
     devState = dev;
     if (dev === "ok") {
-      const devices = await listDevices();
-      const current = devices[0] ?? null;
+      const current = scan.devices[0] ?? null;
       if (current?.serial !== device?.serial) {
         device = current;
         changed = true;

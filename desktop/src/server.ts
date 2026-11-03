@@ -205,12 +205,37 @@ export function createServer(opts: ServerOptions): http.Server {
         });
         // 立即冲刷响应头：首 token 可能耗时数秒，客户端对建立连接有超时限制
         res.flushHeaders();
-        const send = (event: ChatEvent) => {
+        // O07（2026-11-03）：合并 SSE 写入，但**不合并帧**。
+        // 每个事件仍是独立的一段 `data: {...}\n\n`（客户端按行解析，语义不变），
+        // 只是把窗口内的多帧攒成一次 res.write —— 省掉每 token 一次 Writable/socket 写入。
+        const kWriteBatchMs = 16;
+        let pendingFrames = "";
+        let batchTimer: NodeJS.Timeout | null = null;
+        const flushFrames = () => {
+          if (batchTimer) {
+            clearTimeout(batchTimer);
+            batchTimer = null;
+          }
+          if (!pendingFrames) return;
+          const chunk = pendingFrames;
+          pendingFrames = "";
           try {
-            res.write(`data: ${JSON.stringify(event)}\n\n`);
+            res.write(chunk);
           } catch {
             // 客户端已断开：忽略写入错误
           }
+        };
+        // 断开后别让定时器继续持有缓冲
+        res.on("close", () => {
+          if (batchTimer) {
+            clearTimeout(batchTimer);
+            batchTimer = null;
+          }
+          pendingFrames = "";
+        });
+        const send = (event: ChatEvent) => {
+          pendingFrames += `data: ${JSON.stringify(event)}\n\n`;
+          if (!batchTimer) batchTimer = setTimeout(flushFrames, kWriteBatchMs);
         };
         // B10/B11：desktop 侧独立解析该模型的能力（模型名 + 配置的 vision 三态），
         // 未确认/关闭时丢弃图片，避免把 image parts 发给不支持的端点。
@@ -230,6 +255,8 @@ export function createServer(opts: ServerOptions): http.Server {
           send({ type: "error", error: String(err) });
           console.log(`[chat] 失败：${modelId}：${String(err)}`);
         }
+        // 收尾前强制冲刷：done/error 不等 16ms 窗口（且已按序追加在缓冲末尾）
+        flushFrames();
         res.end();
         return;
       }

@@ -52,35 +52,52 @@ async function adb(args: string[]): Promise<string> {
   return stdout;
 }
 
+/** 一次 `adb devices -l` 的完整扫描结果（O07：状态与设备列表同源）。 */
+export interface DeviceScan {
+  state: DeviceState;
+  devices: DeviceInfo[];
+}
+
+/**
+ * 单次 `adb devices -l` 同时得到连接状态与设备列表（O07，2026-11-03）。
+ *
+ * 原先看护 tick 每个 5s 周期先 deviceState()（`adb devices`）再 listDevices()
+ * （`adb devices -l`）——同一份信息 spawn 两次 adb 进程。`-l` 的输出包含 plain
+ * `devices` 的全部内容并附 model 字段，因此一次 `-l` 足够同时算出两者。
+ * 解析失败 / 无 adb 时按 absent + 空列表返回（与原 deviceState/listDevices 一致）。
+ */
+export async function scanDevices(): Promise<DeviceScan> {
+  let out: string;
+  try {
+    out = await adb(["devices", "-l"]);
+  } catch {
+    return { state: "absent", devices: [] };
+  }
+  let state: DeviceState | null = null;
+  const devices: DeviceInfo[] = [];
+  for (const line of out.trim().split("\n").slice(1)) {
+    const isDevice = line.includes("\tdevice");
+    const isUnauthorized = line.includes("unauthorized");
+    // 首个可判定的行决定 state（与原 deviceState 的「先命中先返回」一致）
+    if (state === null) {
+      if (isDevice) state = "ok";
+      else if (isUnauthorized) state = "unauthorized";
+    }
+    if (!isDevice) continue;
+    const serial = line.split("\t")[0]!.trim();
+    const modelMatch = /\bmodel:([^\s]+)/.exec(line);
+    devices.push({ serial, model: modelMatch?.[1] ?? "未知型号" });
+  }
+  return { state: state ?? "absent", devices };
+}
+
 /** 已授权设备列表（含型号/序列号）；adb 缺失或无设备时返回空数组。 */
 export async function listDevices(): Promise<DeviceInfo[]> {
-  try {
-    const out = await adb(["devices", "-l"]);
-    const devices: DeviceInfo[] = [];
-    for (const line of out.trim().split("\n").slice(1)) {
-      if (!line.includes("\tdevice")) continue;
-      const serial = line.split("\t")[0]!.trim();
-      const modelMatch = /\bmodel:([^\s]+)/.exec(line);
-      devices.push({ serial, model: modelMatch?.[1] ?? "未知型号" });
-    }
-    return devices;
-  } catch {
-    return [];
-  }
+  return (await scanDevices()).devices;
 }
 
 export async function deviceState(): Promise<DeviceState> {
-  try {
-    const out = await adb(["devices"]);
-    const lines = out.trim().split("\n").slice(1);
-    for (const line of lines) {
-      if (line.includes("\tdevice")) return "ok";
-      if (line.includes("unauthorized")) return "unauthorized";
-    }
-    return "absent";
-  } catch {
-    return "absent";
-  }
+  return (await scanDevices()).state;
 }
 
 export async function reverseEstablished(port: number): Promise<boolean> {
