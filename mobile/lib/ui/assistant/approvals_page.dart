@@ -52,6 +52,13 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
     if (!mounted) return;
     setState(() {
       _pending = pending;
+      // B16：当前 chip 类别若已不在 pending 里（批次被拒/通过完），回退到
+      // 「全部」——否则列表空、chip 消失，而 AppBar 仍显示 N。
+      if (_categoryFilter != null &&
+          !pending.any((p) =>
+              ProposalService.toolCategory(p.tool) == _categoryFilter)) {
+        _categoryFilter = null;
+      }
       _history = all
           .where((p) => p.status != ProposalStatus.pending)
           .toList()
@@ -62,41 +69,80 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
     });
   }
 
+  /// B16：当前过滤器下**可见**的 pending 提案。
+  ///
+  /// 底部计数与「通过所选/拒绝所选」只作用于它 —— 此前直接用 `_pending`，
+  /// 切换工具类型 chip 后会继续对看不见的条目计数/执行（筛选态与选择态脱节）。
+  List<ChangeProposal> get _visiblePending => filterByCategory(
+        _pending,
+        _categoryFilter,
+        categoryOf: ProposalService.toolCategory,
+      );
+
+  /// B16：当前可见且被选中的提案（批量动作的实际目标）。
+  List<ChangeProposal> get _selectedVisible =>
+      _visiblePending.where((p) => _selected.contains(p.id)).toList();
+
   Future<void> _approve(ChangeProposal p) async {
     setState(() => _busy = true);
-    final exec = await ProposalExecutor.instance.approve(p.id);
-    if (mounted && !exec.ok) _toast(exec.message);
-    await _reload();
-    if (mounted) setState(() => _busy = false);
+    try {
+      final exec = await ProposalExecutor.instance.approve(p.id);
+      if (mounted && !exec.ok) _toast(exec.message);
+      await _reload();
+    } catch (e) {
+      // B16：异常时给可见反馈，且必须复位 _busy（此前会永久卡死操作条）。
+      if (mounted) _toast('操作失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _reject(ChangeProposal p) async {
-    await ProposalExecutor.instance.reject(p.id);
-    await _reload();
+    setState(() => _busy = true);
+    try {
+      await ProposalExecutor.instance.reject(p.id);
+      await _reload();
+    } catch (e) {
+      if (mounted) _toast('操作失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _approveSelected() async {
-    final targets =
-        _pending.where((p) => _selected.contains(p.id)).toList();
+    // B16：目标 = 当前可见且被选中的集合（筛选态之外的条目不参与批量动作）。
+    final targets = _selectedVisible;
     if (targets.isEmpty) return;
     setState(() => _busy = true);
-    var failed = 0;
-    for (final p in targets) {
-      final exec = await ProposalExecutor.instance.approve(p.id);
-      if (!exec.ok) failed++;
+    try {
+      var failed = 0;
+      for (final p in targets) {
+        final exec = await ProposalExecutor.instance.approve(p.id);
+        if (!exec.ok) failed++;
+      }
+      if (mounted && failed > 0) _toast('$failed 条执行失败，详见历史区');
+      await _reload();
+    } catch (e) {
+      if (mounted) _toast('操作失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
-    if (mounted && failed > 0) _toast('$failed 条执行失败，详见历史区');
-    await _reload();
-    if (mounted) setState(() => _busy = false);
   }
 
   Future<void> _rejectSelected() async {
-    final targets =
-        _pending.where((p) => _selected.contains(p.id)).toList();
-    for (final p in targets) {
-      await ProposalExecutor.instance.reject(p.id);
+    final targets = _selectedVisible;
+    if (targets.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      for (final p in targets) {
+        await ProposalExecutor.instance.reject(p.id);
+      }
+      await _reload();
+    } catch (e) {
+      if (mounted) _toast('操作失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
-    await _reload();
   }
 
   Future<void> _undo(ChangeProposal p) async {
@@ -146,10 +192,24 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
               ],
             ),
           ),
-          _buildActionBar(cs),
+          // B16：没有待确认项时整条隐藏，不留死按钮。
+          if (_pending.isNotEmpty) _buildActionBar(cs),
         ],
       ),
     );
+  }
+
+  /// B16：切换工具类型 chip。
+  ///
+  /// 除了改 filter，还要把「切走后不可见」的已选项从选择集合移除 ——
+  /// 保证底部计数与批量动作永远只覆盖当前可见集合，
+  /// 避免「选了 3 条 → 切到别的类别 → 按钮仍说 3 条却只执行 0 条」的脱节。
+  void _onFilterChanged(String cat) {
+    setState(() {
+      _categoryFilter = _categoryFilter == cat ? null : cat;
+      final visibleIds = _visiblePending.map((p) => p.id).toSet();
+      _selected.removeWhere((id) => !visibleIds.contains(id));
+    });
   }
 
   Widget _buildFilterChips(ColorScheme cs) {
@@ -169,8 +229,8 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
               child: FilterChip(
                 label: Text(kToolCategoryLabels[cat] ?? cat),
                 selected: _categoryFilter == cat,
-                onSelected: (v) =>
-                    setState(() => _categoryFilter = v ? cat : null),
+                onSelected:
+                    _busy ? null : (v) => _onFilterChanged(cat),
               ),
             ),
         ],
@@ -197,19 +257,22 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
           title: Text(_groupTitle(g),
               maxLines: 1, overflow: TextOverflow.ellipsis),
           trailing: TextButton(
-            onPressed: () {
-              setState(() {
-                if (selectedInGroup == visible.length) {
-                  for (final p in visible) {
-                    _selected.remove(p.id);
-                  }
-                } else {
-                  for (final p in visible) {
-                    _selected.add(p.id);
-                  }
-                }
-              });
-            },
+            // B16：busy 期间禁用组头全选/清空。
+            onPressed: _busy
+                ? null
+                : () {
+                    setState(() {
+                      if (selectedInGroup == visible.length) {
+                        for (final p in visible) {
+                          _selected.remove(p.id);
+                        }
+                      } else {
+                        for (final p in visible) {
+                          _selected.add(p.id);
+                        }
+                      }
+                    });
+                  },
             child: Text(
                 selectedInGroup == visible.length ? '清空' : '全选',
                 style: const TextStyle(fontSize: 12)),
@@ -230,8 +293,11 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
       children: [
         Checkbox(
           value: _selected.contains(p.id),
-          onChanged: (v) => setState(() =>
-              v == true ? _selected.add(p.id) : _selected.remove(p.id)),
+          // B16：busy 期间禁用勾选，避免批量执行与选择态交叉。
+          onChanged: _busy
+              ? null
+              : (v) => setState(() =>
+                    v == true ? _selected.add(p.id) : _selected.remove(p.id)),
         ),
         Expanded(
           child: ProposalCard(
@@ -272,7 +338,10 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
   }
 
   Widget _buildActionBar(ColorScheme cs) {
-    final n = _selected.length;
+    // B16：0 待确认项 → 不渲染；计数只算「当前可见且被选中」，
+    // 与 _approveSelected/_rejectSelected 的目标集合严格一致。
+    if (_pending.isEmpty) return const SizedBox.shrink();
+    final n = _selectedVisible.length;
     return SafeArea(
       top: false,
       child: Container(
