@@ -1411,8 +1411,8 @@ class _ConversationGroupHeader extends StatelessWidget {
   }
 }
 
-/// 应用图标堆叠（2026-11-01 应用筛选按钮）：最多 3 个 16px 图标
-/// 依次右移层叠，整体宽 16 + 10×(n-1)。
+/// 应用图标堆叠（2026-11-01 应用筛选按钮）：最多 3 个 16px 圆形容器
+/// 依次右移层叠，整体宽 16 + 10×(n-1)；图标本身裁成圆（B17②，2026-11-03）。
 class _StackedAppIcons extends StatelessWidget {
   final List<SourceApp> sources;
 
@@ -1433,16 +1433,22 @@ class _StackedAppIcons extends StatelessWidget {
           for (var i = 0; i < sources.length; i++)
             Positioned(
               left: 10.0 * i,
+              // B17②（2026-11-03）：源图标是圆角方形（AppIcon 内部 ClipRRect，
+              // radius = size*0.22），直接叠进圆形描边会在四角露出弓形 + 近白描边。
+              // 这里把图标本身裁成圆，并内缩 1px 让描边只当层叠分隔线。
+              // 不改 AppIcon 的全局形状（其它 5 处调用按原样保留圆角方形）。
               child: Container(
+                padding: const EdgeInsets.all(1),
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  // 描边让层叠图标彼此可辨
-                  border: Border.all(color: cs.surface, width: 1.5),
+                  border: Border.all(color: cs.surface, width: 1),
                 ),
-                child: AppIcon(
-                  packageName: sources[i].packageName,
-                  appName: sources[i].displayName,
-                  size: 16,
+                child: ClipOval(
+                  child: AppIcon(
+                    packageName: sources[i].packageName,
+                    appName: sources[i].displayName,
+                    size: 14,
+                  ),
                 ),
               ),
             ),
