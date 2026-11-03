@@ -2,11 +2,14 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../../models/conversation.dart';
 import '../../services/assistant/assistant_service.dart';
 import '../../services/assistant/models.dart';
+import '../../services/app_log.dart';
 import '../../services/database.dart';
+import '../../services/library_file_service.dart';
 import '../library/files_page.dart' show libraryFileIcon;
 import 'approvals_page.dart';
 import 'attachment_picker.dart';
@@ -14,6 +17,20 @@ import 'model_picker.dart';
 import 'widgets/attachment_cards.dart';
 import 'widgets/proposal_card.dart';
 import 'widgets/streaming_blocks.dart';
+
+/// F03（2026-11-03）：从相册批量加截图的单批上限。
+const int maxScreenshotsPerBatch = 6;
+
+/// F03：超出上限时只取前 [maxScreenshotsPerBatch] 张（纯函数，便于单测）。
+List<T> clampScreenshotBatch<T>(List<T> picked) =>
+    picked.length <= maxScreenshotsPerBatch
+        ? List<T>.of(picked)
+        : picked.sublist(0, maxScreenshotsPerBatch);
+
+/// F03 Step2：截图整理约定 + 敏感信息提示（纯函数，测试断言关键片段）。
+String screenshotsConventionHint() =>
+    '每张截图单独成条：能确定时间的出待办（task.create），纯信息出笔记（note.create），'
+    '不跨图合并。截图可能含敏感信息，远程模型会离开设备。';
 
 /// 对话页（design-v3 §5.1；2026-11-01 流式渲染改版 + 多 Agent 并行）：
 /// 用户消息发送后立即上屏；Agent 回复分段流式渲染——
@@ -188,6 +205,81 @@ class _ChatPageState extends State<ChatPage> {
       await AppDatabase.instance
           .setConversationDraftAttachments(_conversation.id, picked);
     }
+  }
+
+  /// F03 Step1（2026-11-03）：从相册多选截图 → 逐张复制进 attachment_store，
+  /// 元数据写入 files 表，再加入当前对话的草稿附件。
+  ///
+  /// 约束：单批最多 [maxScreenshotsPerBatch] 张（超出部分提示分批添加）；
+  /// 逐张失败不阻塞其它图，失败数与超限数都会通过 SnackBar 可见反馈。
+  Future<void> _pickScreenshots() async {
+    if (_busy) return;
+    List<XFile> picked;
+    try {
+      picked = await ImagePicker().pickMultiImage();
+    } catch (e, st) {
+      AppLog.instance.warn('chat.pickScreenshots', e, st);
+      _showSnack('无法打开相册，请改用「附件」入口选图');
+      return;
+    }
+    if (picked.isEmpty) return; // 用户取消
+    final batch = clampScreenshotBatch(picked);
+    final overflow = picked.length - batch.length;
+    final added = <ChatAttachment>[];
+    var failed = 0;
+    for (final x in batch) {
+      final file = await LibraryFileService.instance.importFromPath(
+        x.path,
+        name: x.name,
+        mimeType: x.mimeType,
+      );
+      if (file == null) {
+        failed++;
+        continue;
+      }
+      added.add(ChatAttachment(type: ChatAttachmentType.file, id: file.id));
+    }
+    if (!mounted) return;
+    if (added.isEmpty) {
+      _showSnack('截图导入失败，请重试或改用「附件」入口');
+      return;
+    }
+    setState(() => _pendingAttachments = [..._pendingAttachments, ...added]);
+    await AppDatabase.instance
+        .setConversationDraftAttachments(_conversation.id, _pendingAttachments);
+    await _resolveAttachmentMeta();
+    if (!mounted) return;
+    final parts = <String>['已加入 ${added.length} 张截图'];
+    if (overflow > 0) {
+      parts.add('单次最多 $maxScreenshotsPerBatch 张，其余 $overflow 张请分批添加');
+    }
+    if (failed > 0) parts.add('$failed 张导入失败');
+    _showSnack(parts.join('；'));
+  }
+
+  void _showSnack(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// 草稿里是否含图片附件（决定是否显示 F03 的截图约定/敏感信息提示）。
+  bool get _hasScreenshotAttachments => _pendingAttachments.any((a) {
+        final f = _metaOf(a)?.file;
+        return f != null && (f.mimeType ?? '').startsWith('image/');
+      });
+
+  Widget _buildScreenshotsHint(ColorScheme cs) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      color: cs.surfaceContainerHigh,
+      child: Text(
+        screenshotsConventionHint(),
+        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+      ),
+    );
   }
 
   Future<void> _switchModel() async {
@@ -580,6 +672,8 @@ class _ChatPageState extends State<ChatPage> {
               ],
             ),
           ),
+          // F03 Step2（2026-11-03）：草稿含图片时显示「单张成条 + 敏感信息离设备」提示。
+          if (_hasScreenshotAttachments) _buildScreenshotsHint(cs),
           if (_pendingAttachments.isNotEmpty) _buildAttachmentBar(cs),
           _buildInputBar(cs),
         ],
@@ -891,6 +985,14 @@ class _ChatPageState extends State<ChatPage> {
                       icon: Icon(Icons.attach_file,
                           size: 20, color: cs.onSurfaceVariant),
                       onPressed: _busy ? null : _pickAttachments,
+                    ),
+                    // F03 Step1（2026-11-03）：相册多选截图，逐张入库后进草稿附件。
+                    IconButton(
+                      tooltip: '从相册选截图（每批最多 $maxScreenshotsPerBatch 张）',
+                      visualDensity: VisualDensity.compact,
+                      icon: Icon(Icons.photo_library_outlined,
+                          size: 20, color: cs.onSurfaceVariant),
+                      onPressed: _busy ? null : _pickScreenshots,
                     ),
                     Expanded(
                       child: TextField(
