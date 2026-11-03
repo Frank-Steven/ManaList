@@ -58,10 +58,13 @@ class ProposalService {
   /// 处理一个解析完成的工具块。
   ///
   /// [batchId] = 产出该块的 assistant chat_message id。
+  /// [selectedMessageIds]（B15）：本回合用户选中的消息 id，原样转发给
+  /// inbox.triage —— 有选中时 triage 只处理这些消息，未选消息不得产提案。
   Future<ProposalOutcome> handleToolBlock({
     required String conversationId,
     required String batchId,
     required ParsedToolBlock block,
+    List<String>? selectedMessageIds,
   }) async {
     if (!block.ok) {
       return ProposalValidationFailure(block.parseError ?? '工具块解析失败');
@@ -80,6 +83,15 @@ class ProposalService {
     final error = await validate(tool, args);
     if (error != null) return ProposalValidationFailure(error);
 
+    // B15 收尾（2026-11-03）：本回合有选中集合时，任何「目标消息不在选中集合内」
+    // 的单条提案一律拒绝 —— 否则模型可经 library.search 拿到未选消息 id 后，
+    // 绕过 inbox.triage 的范围限制直接对未选消息下单。无选中集合时原行为不变。
+    final outOfSelection = _outOfSelectionTarget(tool, args, selectedMessageIds);
+    if (outOfSelection != null) {
+      return ProposalValidationFailure(
+          '只能处理本回合选中的消息（$outOfSelection 不在选中范围内）');
+    }
+
     if (spec.kind == ToolKind.read) {
       // inbox.triage 是提案生成器（details §4）：只读执行免审批，
       // 产出全部落待确认区（同一 batch_id），对话中回汇总文本。
@@ -89,6 +101,7 @@ class ProposalService {
           batchId: batchId,
           idPrefix: proposalIdFor(batchId, block.index),
           args: args,
+          selectedMessageIds: selectedMessageIds,
         );
         return ReadToolResult(summary);
       }
@@ -114,6 +127,27 @@ class ProposalService {
     );
     await db.insertProposal(proposal);
     return ProposalCreated(proposal);
+  }
+
+  /// B15 收尾：返回「目标消息 id 不在选中集合内」的那个 id（null = 不拦）。
+  ///
+  /// 仅对「写工具 + 目标是一条消息」生效：
+  /// - `message.set_priority` 的 `messageId`（优先级提案）；
+  /// - `anchor.create` 在 `targetType=message` 时的 `targetId`
+  ///   （锚点会把 marker 写进该消息正文，等同于改这条消息）。
+  /// 目标不是消息、或本回合没有选中集合时返回 null —— 保持原行为不变。
+  static String? _outOfSelectionTarget(
+      String tool, Map<String, dynamic> args, List<String>? allowed) {
+    if (allowed == null || allowed.isEmpty) return null;
+    String? target;
+    if (tool == ToolNames.messageSetPriority) {
+      target = args['messageId'] as String?;
+    } else if (tool == ToolNames.anchorCreate &&
+        args['targetType'] == AnchorTargetType.message) {
+      target = args['targetId'] as String?;
+    }
+    if (target == null) return null;
+    return allowed.contains(target) ? null : target;
   }
 
   // ---- 校验器（每工具一份手写，details §2.3） ----

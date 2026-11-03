@@ -133,6 +133,21 @@ class ChatAttachment {
       };
 }
 
+/// B15（2026-11-03）：从对话附件里取出「用户选中的消息 id」。
+///
+/// 只保留 `type == message` 的库实体引用（笔记/文件附件不参与消息范围），
+/// 去重并保持原顺序 —— triage 的候选范围以此为准。
+List<String> selectedMessageIdsOf(Iterable<ChatAttachment> attachments) {
+  final out = <String>[];
+  final seen = <String>{};
+  for (final a in attachments) {
+    if (a.type != ChatAttachmentType.message) continue;
+    if (a.id.isEmpty) continue;
+    if (seen.add(a.id)) out.add(a.id);
+  }
+  return out;
+}
+
 /// 对话消息（chat_messages 表 / chat-request messages[]）。
 class ChatMessageModel {
   final String role;

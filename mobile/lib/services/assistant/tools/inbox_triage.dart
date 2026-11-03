@@ -374,20 +374,34 @@ class InboxTriage {
   ///
   /// [batchId] = 调用它的 assistant 消息 id（同回合提案为一组）；
   /// [idPrefix] = 去重键前缀（重放同回合时命中主键跳过）。
+  /// [selectedMessageIds]（B15）：本回合用户**选中**的消息 id（来自对话附件的
+  /// message 引用）。非空时 triage 的范围**就是**这个集合 —— 不受 `scope.status`
+  /// 过滤（选中的已处理消息也应处理），也不受 `scope.limit` 截断（否则选中项
+  /// 会被静默丢掉）。为空/未传则保持原行为：按 scope 查全库 pending。
   Future<String> run({
     required String conversationId,
     required String batchId,
     required String idPrefix,
     required Map<String, dynamic> args,
+    List<String>? selectedMessageIds,
   }) async {
     final db = AppDatabase.instance;
     final scope = (args['scope'] as Map).cast<String, dynamic>();
     final status = scope['status'] as String? ?? MessageStatus.pending;
     final limit = (scope['limit'] as num?)?.toInt() ?? kTriageMaxLimit;
 
-    final messages = await db.getMessages(status: status, limit: limit);
+    final selected = selectedMessageIds ?? const <String>[];
+    final List<Message> messages;
+    if (selected.isEmpty) {
+      messages = await db.getMessages(status: status, limit: limit);
+    } else {
+      // B15：范围 = 选中集合本身（未选消息一律不进 triage）。
+      messages = await db.getMessagesByIds(selected);
+    }
     if (messages.isEmpty) {
-      return '范围内没有 $status 消息，未产生提案。';
+      return selected.isEmpty
+          ? '范围内没有 $status 消息，未产生提案。'
+          : '选中的 ${selected.length} 条消息已不存在，未产生提案。';
     }
 
     // 子调用沿用当前对话绑定的模型配置（details §4-2）

@@ -5,6 +5,8 @@ import 'package:msgrepo_mobile/models/conversation.dart';
 import 'package:msgrepo_mobile/models/message.dart';
 import 'package:msgrepo_mobile/services/ai_client.dart';
 import 'package:msgrepo_mobile/services/assistant/models.dart';
+import 'package:msgrepo_mobile/services/assistant/proposal_service.dart';
+import 'package:msgrepo_mobile/services/assistant/tool_parser.dart';
 import 'package:msgrepo_mobile/services/assistant/tool_spec.dart';
 import 'package:msgrepo_mobile/services/assistant/tools/inbox_triage.dart';
 import 'package:msgrepo_mobile/services/database.dart';
@@ -32,6 +34,9 @@ void main() {
   /// 调用次数记录在 [calls]；[failOnCall]（1 起计）指定的调用发 ChatError。
   int calls = 0;
   int failOnCall = -1;
+
+  /// 最近一次子调用送进模型的 user content（B15 断言「未选消息没进 triage」用）。
+  String lastUserContent = '';
   Stream<ChatEvent> fakeSubCall(
       List<ChatMessageModel> messages, String? modelConfigId) async* {
     calls++;
@@ -40,6 +45,7 @@ void main() {
       return;
     }
     final userContent = messages.last.content;
+    lastUserContent = userContent;
     final ids = [
       for (final m in RegExp(r'"messageId":"([^"]+)"').allMatches(userContent))
         m.group(1)!,
@@ -74,6 +80,7 @@ void main() {
         Conversation(id: convId, title: '测试对话', createdAt: now, updatedAt: now));
     calls = 0;
     failOnCall = -1;
+    lastUserContent = '';
     triage.subCallOverride = fakeSubCall;
   });
 
@@ -215,6 +222,111 @@ void main() {
       final summary = await runTriage();
       expect(summary, contains('未产生提案'));
       expect(await appDb.getProposals(), isEmpty);
+    });
+  });
+
+  group('B15 只处理选定消息（选中集合 = triage 范围）', () {
+    /// 取本次 triage 真正送进模型的消息 id（假流的 user content 里带 messageId）。
+    Set<String> sentIds() => {
+          for (final m in RegExp(r'"messageId":"([^"]+)"')
+              .allMatches(lastUserContent))
+            m.group(1)!,
+        };
+
+    test('有选中集合时：未选消息不进 triage、不产生提案', () async {
+      await insertMessage(db, 'm-sel1', '普通消息一');
+      await insertMessage(db, 'm-sel2', '普通消息二');
+      await insertMessage(db, 'm-other1', '未选消息一');
+      await insertMessage(db, 'm-other2', '未选消息二');
+
+      final summary = await triage.run(
+        conversationId: convId,
+        batchId: 'amsg-sel',
+        idPrefix: 'amsg-sel_b0',
+        args: {
+          'scope': {'status': 'pending', 'limit': 50}
+        },
+        selectedMessageIds: const ['m-sel1', 'm-sel2'],
+      );
+
+      final proposals = await appDb.getProposals();
+      expect(proposals, isNotEmpty);
+      final touched = {for (final p in proposals) p.payload['messageId']};
+      expect(touched, {'m-sel1', 'm-sel2'},
+          reason: '未选消息不得产生提案（B15 核心）');
+      expect(sentIds(), {'m-sel1', 'm-sel2'}, reason: '未选消息不得进入 triage 子调用');
+      expect(summary, contains('2 条消息'), reason: '汇总口径应等于选中范围');
+    });
+
+    test('未传 / 空选中集合：保持原「全量 pending」行为不变', () async {
+      await insertMessage(db, 'm1', '普通消息一');
+      await insertMessage(db, 'm2', '普通消息二');
+      final summary = await runTriage();
+      expect(summary, contains('2 条消息'));
+      expect(
+          {for (final p in await appDb.getProposals()) p.payload['messageId']},
+          {'m1', 'm2'});
+    });
+
+    test('选中即范围：已处理（非 pending）的选中消息同样会被处理', () async {
+      await insertMessage(db, 'm-done', '已处理过的消息');
+      await insertMessage(db, 'm-pending', '待处理消息');
+      await db.update('messages', {'status': 'processed'},
+          where: 'id = ?', whereArgs: ['m-done']);
+
+      await triage.run(
+        conversationId: convId,
+        batchId: 'amsg-mixed',
+        idPrefix: 'amsg-mixed_b0',
+        args: {
+          'scope': {'status': 'pending', 'limit': 50}
+        },
+        selectedMessageIds: const ['m-done', 'm-pending'],
+      );
+
+      expect(
+          {for (final p in await appDb.getProposals()) p.payload['messageId']},
+          {'m-done', 'm-pending'},
+          reason: '范围由选中集合决定，status 只用于未选中的默认范围');
+    });
+
+    test('ProposalService.handleToolBlock 把选中集合转发给 triage', () async {
+      await insertMessage(db, 'm-sel1', '普通消息一');
+      await insertMessage(db, 'm-other1', '未选消息一');
+
+      const block = ParsedToolBlock(
+        index: 0,
+        tool: ToolNames.inboxTriage,
+        args: {
+          'scope': {'status': 'pending', 'limit': 50}
+        },
+        raw: '{}',
+      );
+      final outcome = await ProposalService.instance.handleToolBlock(
+        conversationId: convId,
+        batchId: 'amsg-fwd',
+        block: block,
+        selectedMessageIds: const ['m-sel1'],
+      );
+
+      expect(outcome, isA<ReadToolResult>());
+      final mine =
+          (await appDb.getProposals()).where((p) => p.batchId == 'amsg-fwd');
+      expect({for (final p in mine) p.payload['messageId']}, {'m-sel1'},
+          reason: '转发丢失会导致未选消息也被处理');
+    });
+
+    test('selectedMessageIdsOf：只取 message 类型附件，去重保序', () {
+      expect(
+          selectedMessageIdsOf(const [
+            ChatAttachment(type: ChatAttachmentType.message, id: 'a'),
+            ChatAttachment(type: ChatAttachmentType.note, id: 'n1'),
+            ChatAttachment(type: ChatAttachmentType.message, id: 'b'),
+            ChatAttachment(type: ChatAttachmentType.message, id: 'a'),
+            ChatAttachment(type: ChatAttachmentType.file, id: 'f1'),
+          ]),
+          ['a', 'b']);
+      expect(selectedMessageIdsOf(const []), isEmpty);
     });
   });
 

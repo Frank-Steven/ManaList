@@ -461,6 +461,10 @@ class AssistantService {
     final expanded =
         await expandAttachments(handle.attachments, visionCapable: vision);
 
+    // B15：本回合用户**选中**的消息（附件里的 message 引用）= inbox.triage 范围。
+    // 未选中的消息不进 triage、不产提案。
+    final selectedMessageIds = selectedMessageIdsOf(handle.attachments);
+
     final thinkParser = ThinkTagParser();
     final parser = ToolBlockParser();
     final visible = StringBuffer();
@@ -479,6 +483,7 @@ class AssistantService {
         conversationId: conversation.id,
         batchId: assistantMsg.id,
         block: block,
+        selectedMessageIds: selectedMessageIds,
       );
       switch (outcome) {
         case ProposalCreated():

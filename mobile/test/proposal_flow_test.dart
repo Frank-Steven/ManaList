@@ -368,4 +368,76 @@ void main() {
       expect((await appDb.getActiveTasks()).length, 1, reason: '不会执行两次');
     });
   });
+
+  group('B15 收尾：单条写工具的选中范围守卫', () {
+    test('selectedMessageIds 之外的 message.set_priority 被拒、不落库', () async {
+      await insertMessage(db, 'm-sel', '选中的消息');
+      await insertMessage(db, 'm-other', '未选中的消息');
+
+      final outcome = await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'amsg-guard1',
+        block: block(0, 'message.set_priority',
+            {'messageId': 'm-other', 'priority': 'junk'}),
+        selectedMessageIds: const ['m-sel'],
+      );
+
+      expect(outcome, isA<ProposalValidationFailure>(),
+          reason: '未选消息不得生成单条提案（B15 收尾：library.search 拿 id 的窄路径）');
+      expect((outcome as ProposalValidationFailure).reason, contains('m-other'));
+      expect(await appDb.getProposals(), isEmpty, reason: '被拒的提案不得落库');
+    });
+
+    test('选中的 messageId 照常落提案（守卫不误伤）', () async {
+      await insertMessage(db, 'm-sel', '选中的消息');
+
+      final outcome = await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'amsg-guard2',
+        block: block(0, 'message.set_priority',
+            {'messageId': 'm-sel', 'priority': 'junk'}),
+        selectedMessageIds: const ['m-sel'],
+      );
+
+      expect(outcome, isA<ProposalCreated>());
+      expect(await appDb.getProposals(), hasLength(1));
+    });
+
+    test('无选中集合：未选消息的单条提案照常落库（原行为不变）', () async {
+      await insertMessage(db, 'm-any', '任意消息');
+
+      final outcome = await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'amsg-guard3',
+        block: block(0, 'message.set_priority',
+            {'messageId': 'm-any', 'priority': 'junk'}),
+      );
+
+      expect(outcome, isA<ProposalCreated>(),
+          reason: '没有选中集合时不得改变既有行为');
+      expect(await appDb.getProposals(), hasLength(1));
+    });
+
+    test('anchor.create 目标为未选消息同样被拒（marker 会写进该消息正文）', () async {
+      await insertMessage(db, 'm-sel', '选中的消息');
+      await insertMessage(db, 'm-other', '未选中的消息');
+      await insertTask(db, 't1', title: '任务一');
+
+      final outcome = await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'amsg-guard4',
+        block: block(0, 'anchor.create', {
+          'targetType': 'message',
+          'targetId': 'm-other',
+          'taskId': 't1',
+          'anchorText': '消息',
+        }),
+        selectedMessageIds: const ['m-sel'],
+      );
+
+      expect(outcome, isA<ProposalValidationFailure>(),
+          reason: '对未选消息建锚点等同于改它的正文');
+      expect(await appDb.getProposals(), isEmpty);
+    });
+  });
 }
