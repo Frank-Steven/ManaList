@@ -8,6 +8,8 @@ import '../../models/conversation.dart';
 import '../../services/assistant/assistant_service.dart';
 import '../../services/assistant/models.dart';
 import '../../services/app_log.dart';
+import '../../services/ai_client.dart';
+import '../../services/assistant/assistant_client.dart';
 import '../../services/database.dart';
 import '../../services/library_file_service.dart';
 import '../library/files_page.dart' show libraryFileIcon;
@@ -93,6 +95,10 @@ class _ChatPageState extends State<ChatPage> {
   List<ChatAttachment> _pendingAttachments = [];
   late Conversation _conversation;
 
+  /// task-50（2026-11-03）：`modelConfigId` 解析后的可读名称。
+  /// null = 还在解析；解析失败/已失效会写成「模型配置已失效」，绝不回退显示 id。
+  String? _modelDisplayName;
+
   bool get _busy => _turn != null;
 
   @override
@@ -100,6 +106,8 @@ class _ChatPageState extends State<ChatPage> {
     super.initState();
     _conversation = widget.conversation;
     _reload();
+    // task-50：模型名称异步解析，不阻塞首帧
+    unawaited(_refreshModelDisplayName());
     // 多 Agent 并行：离开页面回合不死，回来时重新接上在途回合
     final active =
         AssistantService.instance.turnOf(widget.conversation.id);
@@ -130,13 +138,67 @@ class _ChatPageState extends State<ChatPage> {
       _messages = messages;
       _proposalsByBatch = byBatch;
       if (conv != null) {
+        final prevModelId = _conversation.modelConfigId;
         _conversation = conv;
+        // task-50：模型被切换时先清掉旧名称，避免短暂显示上一个接口名
+        if (conv.modelConfigId != prevModelId) _modelDisplayName = null;
         // 草稿附件是附件 bar 的唯一事实源（库页「发送给助理」会追加到这里）
         _pendingAttachments = conv.draftAttachments;
       }
     });
     await _resolveAttachmentMeta();
     _scrollToBottom();
+    // task-50：模型可能被切换过，重新解析显示名（异步，不影响列表渲染）
+    unawaited(_refreshModelDisplayName());
+  }
+
+  /// task-50（2026-11-03）：把 `modelConfigId` 解析成可读名称。
+  ///
+  /// 顺序：① 本地远程接口（`AiEndpoint.id == id` → `name`）；
+  /// ② 桌面在线时 `/v1/models`（`DesktopModelEntry.id == id` → `name`）；
+  /// ③ 都找不到 → 「模型配置已失效」。**任何情况下都不显示 id/指纹**。
+  Future<void> _refreshModelDisplayName() async {
+    final id = _conversation.modelConfigId;
+    if (id == null || id.isEmpty) {
+      if (!mounted) return;
+      setState(() => _modelDisplayName = '默认模型');
+      return;
+    }
+    String? name;
+    try {
+      for (final e in await AiClient.instance.getRemoteEndpoints()) {
+        if (e.id == id) {
+          name = e.name;
+          break;
+        }
+      }
+      if ((name == null || name.trim().isEmpty) &&
+          await AiClient.instance.isDesktopOnline()) {
+        final result = await AssistantClient.instance.getDesktopModels();
+        for (final m in result.models) {
+          if (m.id == id) {
+            name = m.name;
+            break;
+          }
+        }
+      }
+    } catch (e, st) {
+      // 解析失败按「未解析出来」处理：不阻塞、不回退显示 id
+      AppLog.instance.warn('chat.model-name', e, st);
+    }
+    if (!mounted) return;
+    final trimmed = name?.trim();
+    setState(() => _modelDisplayName =
+        (trimmed != null && trimmed.isNotEmpty) ? trimmed : '模型配置已失效');
+  }
+
+  /// AppBar 右侧的模型文案：解析中先显示占位，**绝不闪现 id**。
+  String get _modelLabel {
+    if (_conversation.modelConfigId == null ||
+        _conversation.modelConfigId!.isEmpty) {
+      return '默认模型';
+    }
+    return _modelDisplayName ?? '加载中…';
   }
 
   /// 解析消息/草稿附件的展示元数据（标题/图标/文件实体）。
@@ -649,12 +711,11 @@ class _ChatPageState extends State<ChatPage> {
           TextButton(
             onPressed: _busy ? null : _switchModel,
             child: Text(
-              _conversation.modelConfigId == null
-                  ? '默认模型'
-                  : _conversation.modelConfigId!.length > 12
-                      ? '${_conversation.modelConfigId!.substring(0, 12)}…'
-                      : _conversation.modelConfigId!,
+              // task-50：显示接口名称，找不到显示「模型配置已失效」，不显示 id
+              _modelLabel,
               style: const TextStyle(fontSize: 12),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ),
         ],
