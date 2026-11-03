@@ -1411,8 +1411,11 @@ class _ConversationGroupHeader extends StatelessWidget {
   }
 }
 
-/// 应用图标堆叠（2026-11-01 应用筛选按钮）：最多 3 个 16px 圆形容器
-/// 依次右移层叠，整体宽 16 + 10×(n-1)；图标本身裁成圆（B17②，2026-11-03）。
+/// 应用图标堆叠（2026-11-01 应用筛选按钮；B17② 方案 B，2026-11-03）：
+/// 最多 3 个 16px 圆形图标依次右移层叠，整体宽 16 + 10×(n-1)。
+/// 图标本身用 ClipOval 裁圆，**不画描边、不加背景色/阴影**；相邻图标靠
+/// 10px 叠压本身区分 —— 任何圆环描边都会与圆角方形源图之间露出白环。
+/// 不改 AppIcon 的全局形状（其它调用仍为圆角方形）。
 class _StackedAppIcons extends StatelessWidget {
   final List<SourceApp> sources;
 
@@ -1433,22 +1436,13 @@ class _StackedAppIcons extends StatelessWidget {
           for (var i = 0; i < sources.length; i++)
             Positioned(
               left: 10.0 * i,
-              // B17②（2026-11-03）：源图标是圆角方形（AppIcon 内部 ClipRRect，
-              // radius = size*0.22），直接叠进圆形描边会在四角露出弓形 + 近白描边。
-              // 这里把图标本身裁成圆，并内缩 1px 让描边只当层叠分隔线。
-              // 不改 AppIcon 的全局形状（其它 5 处调用按原样保留圆角方形）。
-              child: Container(
-                padding: const EdgeInsets.all(1),
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(color: cs.surface, width: 1),
-                ),
-                child: ClipOval(
-                  child: AppIcon(
-                    packageName: sources[i].packageName,
-                    appName: sources[i].displayName,
-                    size: 14,
-                  ),
+              // B17② 方案 B：直接裁圆，不加 border / padding / 背景 / 阴影；
+              // 层叠关系由 10px 重叠本身表达，避免任何新白环。
+              child: ClipOval(
+                child: AppIcon(
+                  packageName: sources[i].packageName,
+                  appName: sources[i].displayName,
+                  size: 16,
                 ),
               ),
             ),
