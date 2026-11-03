@@ -37,6 +37,60 @@ void main() {
     });
   });
 
+  group('按厂商官方文档扩充的白名单（2026-11-03）', () {
+    // 只列官方明确声明支持图像/多模态的型号
+    const vendorModels = <String>[
+      'qwen3.7-plus',
+      'qwen3.7-plus-2026-05-26',
+      'qwen3.5-flash',
+      'glm-5.3-flash',
+      'kimi-k3.1-pro',
+      'kimi-k3.1-pro-highspeed',
+      'doubao-seed-2-1-pro-260915',
+      'doubao-seed-2-1-lite-260915',
+      'doubao-seed-2-1-turbo-260628',
+      'doubao-seed-evolving',
+      'ernie-5.0',
+      'ernie-5.0-thinking-preview',
+      'ernie-5.0-thinking-latest',
+    ];
+
+    test('官方明确多模态的型号全部识别为支持', () {
+      for (final m in vendorModels) {
+        expect(isKnownVisionModel(m), isTrue, reason: '$m 应在白名单');
+        expect(resolveVisionSupport(model: m), VisionSupport.supported,
+            reason: '$m 未配置时应自动支持');
+        expect(visionAllowsImages(resolveVisionSupport(model: m)), isTrue);
+      }
+    });
+
+    test('大小写与 provider 前缀同样命中（沿用既有归一化）', () {
+      expect(resolveVisionSupport(model: 'Qwen3.7-Plus'),
+          VisionSupport.supported);
+      expect(resolveVisionSupport(model: 'dashscope/qwen3.5-flash'),
+          VisionSupport.supported);
+      expect(
+          resolveVisionSupport(model: 'volcengine-ark/doubao-seed-evolving'),
+          VisionSupport.supported);
+      expect(resolveVisionSupport(model: 'anthropic/kimi-k3.1-pro'),
+          VisionSupport.supported,
+          reason: '前缀只做机械剥离，不参与判定');
+    });
+
+    test('官方未明确多模态的型号仍为 unknown（不猜）', () {
+      for (final m in [
+        'qwen-plus',
+        'glm-5.3',
+        'glm-5.2',
+        'ernie-4.5-turbo-128k',
+        'doubao-seed-2-0-pro-260215',
+      ]) {
+        expect(isKnownVisionModel(m), isFalse, reason: '$m 不应进白名单');
+        expect(resolveVisionSupport(model: m), VisionSupport.unknown);
+      }
+    });
+  });
+
   group('显式值优先', () {
     test('显式 false 是用户关闭，已知模型也不破例', () {
       expect(resolveVisionSupport(model: 'deepseek-flash', configured: false),

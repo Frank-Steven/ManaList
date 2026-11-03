@@ -10,12 +10,40 @@ import type { ModelConfig } from "./types.js";
 
 export type VisionSupport = "supported" | "disabled" | "unknown";
 
-/** 已知支持图像输入的模型/别名（保守列举，不猜测其它模型）。 */
+/**
+ * 已知支持图像输入（多模态）的模型/别名（保守列举，不猜测其它模型）。
+ *
+ * 依据各厂商官方文档（2026-11-03 核实）按厂商分组列举。
+ * **故意不加**官方未明确声明多模态的型号（qwen-plus、glm-5.3、glm-5.2、
+ * ernie-4.5-turbo-128k 等）：白名单宁可少，也不能让图片发到不支持的端点。
+ *
+ * 手机端 mobile/lib/services/model_capabilities.dart 的 knownVisionModels
+ * 必须与本集合一致。
+ */
 export const knownVisionModels: ReadonlySet<string> = new Set([
+  // ---- DeepSeek（真机实测：V4.1 Flash 1017 支持；1017 是内部代号别名） ----
   "deepseek-flash",
   "deepseek-v4.1-flash",
   "deepseek-v4.1-flash-1017",
   "1017",
+  // ---- 通义千问 / 阿里云百炼 ----
+  "qwen3.7-plus",
+  "qwen3.7-plus-2026-05-26",
+  "qwen3.5-flash",
+  // ---- 智谱 ----
+  "glm-5.3-flash",
+  // ---- 月之暗面 / Kimi ----
+  "kimi-k3.1-pro",
+  "kimi-k3.1-pro-highspeed",
+  // ---- 豆包 / 火山方舟 ----
+  "doubao-seed-2-1-pro-260915",
+  "doubao-seed-2-1-lite-260915",
+  "doubao-seed-2-1-turbo-260628",
+  "doubao-seed-evolving",
+  // ---- 百度千帆 ----
+  "ernie-5.0",
+  "ernie-5.0-thinking-preview",
+  "ernie-5.0-thinking-latest",
 ]);
 
 /** 归一化模型标识：小写、去首尾空白、去掉 provider 前缀（deepseek/deepseek-flash）。 */

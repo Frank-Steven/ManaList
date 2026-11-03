@@ -36,6 +36,54 @@ test("别名与大小写/前缀命中", () => {
   assert.equal(resolveVisionSupport("deepseek/deepseek-flash"), "supported");
 });
 
+// 按厂商官方文档扩充的白名单（2026-11-03）：两端集合必须一致
+const vendorVisionModels = [
+  "qwen3.7-plus",
+  "qwen3.7-plus-2026-05-26",
+  "qwen3.5-flash",
+  "glm-5.3-flash",
+  "kimi-k3.1-pro",
+  "kimi-k3.1-pro-highspeed",
+  "doubao-seed-2-1-pro-260915",
+  "doubao-seed-2-1-lite-260915",
+  "doubao-seed-2-1-turbo-260628",
+  "doubao-seed-evolving",
+  "ernie-5.0",
+  "ernie-5.0-thinking-preview",
+  "ernie-5.0-thinking-latest",
+];
+
+test("厂商文档补充的模型：全部 supported", () => {
+  for (const m of vendorVisionModels) {
+    assert.equal(isKnownVisionModel(m), true, m);
+    assert.equal(resolveVisionSupport(m), "supported", m);
+    assert.equal(visionAllowsImages(resolveVisionSupport(m)), true, m);
+  }
+});
+
+test("厂商文档补充的模型：大小写与前缀同样命中", () => {
+  assert.equal(resolveVisionSupport("Qwen3.7-Plus"), "supported");
+  assert.equal(resolveVisionSupport("dashscope/qwen3.5-flash"), "supported");
+  assert.equal(
+    resolveVisionSupport("volcengine-ark/doubao-seed-evolving"),
+    "supported",
+  );
+  assert.equal(resolveVisionSupport("anthropic/kimi-k3.1-pro"), "supported");
+});
+
+test("官方未明确多模态的型号仍为 unknown（不猜）", () => {
+  for (const m of [
+    "qwen-plus",
+    "glm-5.3",
+    "glm-5.2",
+    "ernie-4.5-turbo-128k",
+    "doubao-seed-2-0-pro-260215",
+  ]) {
+    assert.equal(isKnownVisionModel(m), false, m);
+    assert.equal(resolveVisionSupport(m), "unknown", m);
+  }
+});
+
 test("显式关闭优先：已知模型也不破例", () => {
   assert.equal(resolveVisionSupport("deepseek-flash", false), "disabled");
   assert.equal(visionAllowsImages("disabled"), false);
