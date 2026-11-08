@@ -12,8 +12,10 @@ import '../assistant/attachment_pick_controller.dart';
 import '../assistant/send_to_assistant.dart';
 import '../messages/message_widgets.dart' show SelectionAction, SelectionActionBar;
 import '../notes/notes_page.dart' show promptNameDialog;
+import '../shared/back_to_top.dart';
 import 'file_thumbnail.dart';
 import 'folder_tree.dart';
+import '../shared/skeleton_list.dart';
 
 /// 按 mime 给文件分区/附件选择器共用的行首图标（唯一事实源）。
 /// mime 缺失（旧数据）时按扩展名兜底推断。
@@ -1052,9 +1054,10 @@ class FilesPageState extends State<FilesPage> {
   }
 
   /// 卡片模式（grid）：文件夹大卡 + 文件缩略图卡，点击行为与列表一致。
-  Widget _buildGrid() {
+  Widget _buildGrid({ScrollController? scrollController}) {
     final itemCount = _view.folders.length + _view.files.length;
     return GridView.builder(
+      controller: scrollController,
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.all(12),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -1246,7 +1249,9 @@ class FilesPageState extends State<FilesPage> {
           const Divider(height: 1),
           Expanded(
             child: _loading
-                ? const Center(child: CircularProgressIndicator())
+                // F4 §3.3-10：骨架屏替代转圈（延迟出现，防闪）
+                ? const DeferredSkeletonList(
+                    loading: true, child: SizedBox.shrink())
                 : itemCount == 0
                     ? Center(
                         child: Text(
@@ -1255,21 +1260,26 @@ class FilesPageState extends State<FilesPage> {
                       )
                     : RefreshIndicator(
                         onRefresh: reload,
-                        child: _viewMode == 'grid'
-                            ? _buildGrid()
-                            : ListView.builder(
-                                physics:
-                                    const AlwaysScrollableScrollPhysics(),
-                                itemCount: itemCount,
-                                itemBuilder: (context, index) {
-                                  if (index < _view.folders.length) {
-                                    return _buildFolderTile(
-                                        _view.folders[index]);
-                                  }
-                                  return _buildFileTile(_view.files[
-                                      index - _view.folders.length]);
-                                },
-                              ),
+                        // F3 §3.2-7：滚动 >3 屏后右下角出「回顶」小 FAB
+                        child: ScrollableWithBackToTop(
+                          scrollableBuilder: (controller) => _viewMode ==
+                                  'grid'
+                              ? _buildGrid(scrollController: controller)
+                              : ListView.builder(
+                                  controller: controller,
+                                  physics:
+                                      const AlwaysScrollableScrollPhysics(),
+                                  itemCount: itemCount,
+                                  itemBuilder: (context, index) {
+                                    if (index < _view.folders.length) {
+                                      return _buildFolderTile(
+                                          _view.folders[index]);
+                                    }
+                                    return _buildFileTile(_view.files[
+                                        index - _view.folders.length]);
+                                  },
+                                ),
+                        ),
                       ),
           ),
           // pick 模式：底部操作条由附件选择页统一提供（已选附件 + 确认）

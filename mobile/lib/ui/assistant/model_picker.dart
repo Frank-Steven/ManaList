@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../services/ai_client.dart';
 import '../../services/assistant/assistant_client.dart';
@@ -153,7 +154,11 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
+            onPressed: () {
+              // F3 §3.1-4：破坏性操作确认 = 一次重振
+              HapticFeedback.heavyImpact();
+              Navigator.of(context).pop(true);
+            },
             child: const Text('删除'),
           ),
         ],
@@ -428,10 +433,12 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
             ),
     );
     if (widget.selectionMode) return tile;
-    // 管理模式：左滑删除（confirmDismiss 弹确认，列出绑定对话数）
+    // 管理模式：左滑删除（confirmDismiss 弹确认，列出绑定对话数；
+    // F3 §3.1-3：触发距离 40% 行宽，可回弹）
     return Dismissible(
       key: ValueKey('endpoint:${e.id}'),
       direction: DismissDirection.endToStart,
+      dismissThresholds: const {DismissDirection.endToStart: 0.4},
       confirmDismiss: (_) => _confirmDelete(e),
       onDismissed: (_) => _deleteEndpointConfirmed(e),
       background: Container(

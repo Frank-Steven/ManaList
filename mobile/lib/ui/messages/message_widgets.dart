@@ -242,7 +242,9 @@ class SwipeAction {
   });
 }
 
-/// 左滑块状菜单（设计 §5.1，v2.1 重做）：基于 flutter_slidable。
+/// 块状滑出菜单（设计 §5.1，v2.1 重做；2026-11-08 F3 手势统一：右滑 = 积极
+/// 动作「归档/取出/移出垃圾」，左滑 = 消极/管理「垃圾/删除/任务」）：基于
+/// flutter_slidable。
 /// - 轻扫 ≥40dp 或快速甩动即展开，松手吸附全展/全关（openThreshold 压到
 ///   40dp 以内；甩动由库的 OpeningGesture 直接展开）；
 /// - 展开后点动作块必触发（动作块由库渲染在行内容之外的独立层）；
@@ -250,6 +252,11 @@ class SwipeAction {
 /// - 不设 groupTag / SlidableAutoCloseBehavior：多行各自独立展开，互不干扰。
 class SwipeActionRow extends StatefulWidget {
   final Widget child;
+
+  /// 右滑（行首）露出的积极动作（ux-fixes §3.1-2）。
+  final List<SwipeAction> startActions;
+
+  /// 左滑（行尾）露出的消极/管理动作。
   final List<SwipeAction> actions;
   final bool swipeEnabled;
   final VoidCallback? onTap;
@@ -258,6 +265,7 @@ class SwipeActionRow extends StatefulWidget {
   const SwipeActionRow({
     super.key,
     required this.child,
+    this.startActions = const [],
     this.actions = const [],
     this.swipeEnabled = true,
     this.onTap,
@@ -292,7 +300,8 @@ class _SwipeActionRowState extends State<SwipeActionRow>
 
   @override
   Widget build(BuildContext context) {
-    final canSwipe = widget.swipeEnabled && widget.actions.isNotEmpty;
+    final canSwipe = widget.swipeEnabled &&
+        (widget.actions.isNotEmpty || widget.startActions.isNotEmpty);
     final content = GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: _handleTap,
@@ -303,47 +312,53 @@ class _SwipeActionRowState extends State<SwipeActionRow>
     final width = MediaQuery.sizeOf(context).width;
     return Slidable(
       controller: _controller,
-      endActionPane: ActionPane(
-        motion: const BehindMotion(),
-        extentRatio:
-            (widget.actions.length * _actionWidth / width).clamp(0.1, 1.0),
-        openThreshold: (_openThresholdDp / width).clamp(0.05, 0.9),
-        children: [
-          for (final a in widget.actions)
-            CustomSlidableAction(
-              backgroundColor: Colors.transparent,
-              padding: EdgeInsets.zero,
-              onPressed: (_) => a.onTap(),
-              child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
-                child: Container(
-                  width: double.infinity,
-                  height: double.infinity,
-                  decoration: BoxDecoration(
-                    color: a.color,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(a.icon, color: Colors.white, size: 20),
-                      const SizedBox(height: 4),
-                      Text(
-                        a.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                            color: Colors.white, fontSize: 11),
-                      ),
-                    ],
-                  ),
+      startActionPane: widget.startActions.isEmpty
+          ? null
+          : _buildPane(widget.startActions, width),
+      endActionPane: widget.actions.isEmpty
+          ? null
+          : _buildPane(widget.actions, width),
+      child: content,
+    );
+  }
+
+  ActionPane _buildPane(List<SwipeAction> actions, double width) {
+    return ActionPane(
+      motion: const BehindMotion(),
+      extentRatio: (actions.length * _actionWidth / width).clamp(0.1, 1.0),
+      openThreshold: (_openThresholdDp / width).clamp(0.05, 0.9),
+      children: [
+        for (final a in actions)
+          CustomSlidableAction(
+            backgroundColor: Colors.transparent,
+            padding: EdgeInsets.zero,
+            onPressed: (_) => a.onTap(),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+              child: Container(
+                width: double.infinity,
+                height: double.infinity,
+                decoration: BoxDecoration(
+                  color: a.color,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(a.icon, color: Colors.white, size: 20),
+                    const SizedBox(height: 4),
+                    Text(
+                      a.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white, fontSize: 11),
+                    ),
+                  ],
                 ),
               ),
             ),
-        ],
-      ),
-      child: content,
+          ),
+      ],
     );
   }
 }
@@ -359,6 +374,11 @@ class MessageTile extends StatefulWidget {
   final bool selecting;
   final bool selected;
   final bool swipeEnabled;
+
+  /// 右滑露出的积极动作（归档/取出/移出垃圾，ux-fixes §3.1-2）。
+  final List<SwipeAction> startActions;
+
+  /// 左滑露出的消极/管理动作（垃圾/删除/任务）。
   final List<SwipeAction> actions;
 
   /// 嵌套模式（2026-11-01 嵌套卡片列表）：不作为独立卡片渲染
@@ -383,6 +403,7 @@ class MessageTile extends StatefulWidget {
     this.selecting = false,
     this.selected = false,
     this.swipeEnabled = true,
+    this.startActions = const [],
     this.actions = const [],
     this.embedded = false,
     this.linkedTaskDone = false,
@@ -437,7 +458,7 @@ class _MessageTileState extends State<MessageTile> {
             child: Text(
               '${widget.linkedTaskCount}',
               style: TextStyle(
-                  fontSize: 9,
+                  fontSize: 10,
                   height: 1.2,
                   color: cs.onPrimary,
                   fontWeight: FontWeight.w600),
@@ -492,6 +513,7 @@ class _MessageTileState extends State<MessageTile> {
     final sourceStyle = TextStyle(fontSize: 11, color: cs.outline);
 
     final body = SwipeActionRow(
+      startActions: widget.startActions,
       actions: widget.actions,
       swipeEnabled: widget.swipeEnabled && !widget.selecting,
       onTap: _handleTap,

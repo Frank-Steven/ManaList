@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/message.dart';
 import '../../models/task.dart';
@@ -17,6 +18,8 @@ Future<void> toggleTaskDoneWithUndo(
 }) async {
   final db = AppDatabase.instance;
   final completing = task.status != TaskStatus.done;
+  // F3 §3.1-4：任务完成 = 中振；恢复（消极反向）不振
+  if (completing) HapticFeedback.mediumImpact();
   final msgId = task.sourceMessageId;
   final oldMsgStatus =
       msgId == null ? null : (await db.getMessageById(msgId))?.status;

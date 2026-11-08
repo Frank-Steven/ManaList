@@ -101,7 +101,12 @@ class _AttachmentPickerPageState extends State<AttachmentPickerPage>
                 const SizedBox(width: 8),
                 FilledButton(
                   onPressed: _confirm,
-                  child: Text('确认（${_pick.length}）'),
+                  // F4 §3.3-13：计数变化位次滚动而非硬跳
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 150),
+                    child: Text('确认（${_pick.length}）',
+                        key: ValueKey(_pick.length)),
+                  ),
                 ),
               ],
             ),
@@ -114,23 +119,32 @@ class _AttachmentPickerPageState extends State<AttachmentPickerPage>
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('选择附件'),
-        bottom: TabBar(
-          controller: _tab,
-          tabs: const [Tab(text: '消息'), Tab(text: '笔记'), Tab(text: '文件')],
+    // F4 §3.5-19：返回 = 确认所选（与「确认」按钮同效），消除
+    // 「选了半天下滑返回全丢」
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        _confirm();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('选择附件'),
+          bottom: TabBar(
+            controller: _tab,
+            tabs: const [Tab(text: '消息'), Tab(text: '笔记'), Tab(text: '文件')],
+          ),
         ),
+        body: TabBarView(
+          controller: _tab,
+          children: [
+            MessagesPage(pickMode: true, pickController: _pick),
+            NotesPage(pickMode: true, pickController: _pick),
+            FilesPage(pickMode: true, pickController: _pick),
+          ],
+        ),
+        bottomNavigationBar: _buildSelectionBar(cs),
       ),
-      body: TabBarView(
-        controller: _tab,
-        children: [
-          MessagesPage(pickMode: true, pickController: _pick),
-          NotesPage(pickMode: true, pickController: _pick),
-          FilesPage(pickMode: true, pickController: _pick),
-        ],
-      ),
-      bottomNavigationBar: _buildSelectionBar(cs),
     );
   }
 }

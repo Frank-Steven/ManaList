@@ -204,6 +204,8 @@ class AnchoredMarkdownBodyState extends State<AnchoredMarkdownBody> {
           borderRadius: BorderRadius.circular(8),
           child: Image.file(
             file,
+            // F4 §3.3-12：内联预览图限制解码尺寸（消息流宽 ~360dp × 3x）
+            cacheWidth: 1080,
             errorBuilder: (_, __, ___) =>
                 Text('[图片已不可用: ${f.name}]',
                     style: TextStyle(color: cs.onSurfaceVariant)),

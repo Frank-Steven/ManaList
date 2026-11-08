@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/conversation.dart';
 import '../../services/ai_client.dart';
@@ -248,7 +249,11 @@ class ConversationsPageState extends State<ConversationsPage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
+            onPressed: () {
+              // F3 §3.1-4：破坏性操作确认 = 一次重振
+              HapticFeedback.heavyImpact();
+              Navigator.of(context).pop(true);
+            },
             child: const Text('删除'),
           ),
         ],
@@ -401,7 +406,10 @@ class ConversationsPageState extends State<ConversationsPage> {
             IconButton(
               tooltip: '待确认区',
               icon: Badge(
-                label: Text('$totalPending'),
+                label: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 150),
+                  child: Text('$totalPending', key: ValueKey(totalPending)),
+                ),
                 isLabelVisible: totalPending > 0,
                 child: const Icon(Icons.fact_check_outlined),
               ),
@@ -474,7 +482,12 @@ class ConversationsPageState extends State<ConversationsPage> {
   Widget _buildTile(Conversation c, ColorScheme cs) {
     return Dismissible(
       key: ValueKey('conv:${c.id}'),
-      // 右滑 = 置顶/取消置顶（确认后弹回，不删条目）；左滑 = 删除（确认 dialog）
+      // 右滑 = 置顶/取消置顶（确认后弹回，不删条目）；左滑 = 删除（确认 dialog）。
+      // F3 §3.1-3：触发距离标定为行宽 40%，途中可回弹取消
+      dismissThresholds: const {
+        DismissDirection.startToEnd: 0.4,
+        DismissDirection.endToStart: 0.4,
+      },
       confirmDismiss: (direction) async {
         if (direction == DismissDirection.startToEnd) {
           await _togglePin(c);

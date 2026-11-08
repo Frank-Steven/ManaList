@@ -131,7 +131,12 @@ class ProposalCard extends StatelessWidget {
         ],
       ),
       trailing: _pending && onGoToApprovals != null
-          ? TextButton(onPressed: onGoToApprovals, child: const Text('去审批'))
+          ? TextButton(
+              style: TextButton.styleFrom(
+                  minimumSize: const Size(64, 48),
+                  tapTargetSize: MaterialTapTargetSize.padded),
+              onPressed: onGoToApprovals,
+              child: const Text('去审批'))
           : null,
     );
   }
@@ -185,11 +190,26 @@ class ProposalCard extends StatelessWidget {
             ),
           ),
           if (_pending) ...[
-            TextButton(onPressed: onApprove, child: const Text('通过')),
-            TextButton(onPressed: onReject, child: const Text('拒绝')),
+            TextButton(
+                style: TextButton.styleFrom(
+                    minimumSize: const Size(64, 48),
+                    tapTargetSize: MaterialTapTargetSize.padded),
+                onPressed: onApprove,
+                child: const Text('通过')),
+            TextButton(
+                style: TextButton.styleFrom(
+                    minimumSize: const Size(64, 48),
+                    tapTargetSize: MaterialTapTargetSize.padded),
+                onPressed: onReject,
+                child: const Text('拒绝')),
           ] else if (proposal.status == ProposalStatus.applied &&
               onUndo != null)
-            TextButton(onPressed: onUndo, child: const Text('撤销')),
+            TextButton(
+                style: TextButton.styleFrom(
+                    minimumSize: const Size(64, 48),
+                    tapTargetSize: MaterialTapTargetSize.padded),
+                onPressed: onUndo,
+                child: const Text('撤销')),
         ],
       ),
     );

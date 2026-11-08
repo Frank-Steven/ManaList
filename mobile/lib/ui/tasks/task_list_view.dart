@@ -12,6 +12,7 @@ import '../shared/segmented_selector.dart';
 import 'task_detail_panel.dart';
 import 'task_editor.dart';
 import 'task_tile.dart';
+import '../shared/skeleton_list.dart';
 
 /// 任务页·列表视图（原待办页 TodosPage，v3 阶段 4 迁入并更名；设计 §3，v2.3；
 /// v2.5 内嵌详情）：顶部尺度页签（含计数徽标）+ PageView 滑动翻页。
@@ -848,13 +849,9 @@ class TaskListViewState extends State<TaskListView> {
             child: RefreshIndicator(
               onRefresh: reload,
               child: _loading
-                  ? ListView(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      children: const [
-                        SizedBox(height: 160),
-                        Center(child: CircularProgressIndicator()),
-                      ],
-                    )
+                  // F4 §3.3-10：骨架屏替代转圈（延迟出现，防闪）
+                  ? const DeferredSkeletonList(
+                      loading: true, child: SizedBox.shrink())
                   : _detailTask != null
                       ? _buildDetailMode(_detailTask!)
                       : PageView(

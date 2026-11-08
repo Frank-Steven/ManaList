@@ -4,8 +4,9 @@ import '../../models/message.dart';
 import '../../services/database.dart';
 import '../../services/undo_service.dart';
 import 'message_widgets.dart';
+import '../shared/skeleton_list.dart';
 
-/// 已归档消息页（设计 §5.1）：左滑 = 取出/删除，多选批量同上。
+/// 已归档消息页（设计 §5.1；F3 手势统一：右滑 = 取出，左滑 = 删除），多选批量同上。
 class ArchivedMessagesPage extends StatefulWidget {
   const ArchivedMessagesPage({super.key});
 
@@ -64,7 +65,8 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
     await reload();
   }
 
-  List<SwipeAction> _actionsFor(Message m) {
+  /// 右滑（积极）：取出归档。
+  List<SwipeAction> _startActionsFor(Message m) {
     final cs = Theme.of(context).colorScheme;
     return [
       SwipeAction(
@@ -73,6 +75,13 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
         color: cs.primary,
         onTap: () => _unarchive([m]),
       ),
+    ];
+  }
+
+  /// 左滑（消极）：删除。
+  List<SwipeAction> _actionsFor(Message m) {
+    final cs = Theme.of(context).colorScheme;
+    return [
       SwipeAction(
         icon: Icons.delete_outline,
         label: '删除',
@@ -142,17 +151,34 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
           Expanded(
             child: RefreshIndicator(
               onRefresh: reload,
-              child: _messages.isEmpty
-                  ? ListView(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      children: [
-                        const SizedBox(height: 120),
-                        Center(
-                            child:
-                                Text(_loading ? '加载中…' : '暂无归档消息')),
-                      ],
-                    )
-                  : ListView.builder(
+              child: _loading && _messages.isEmpty
+                  ? const DeferredSkeletonList(
+                      loading: true, child: SizedBox.shrink())
+                  : _messages.isEmpty
+                      ? ListView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: [
+                            const SizedBox(height: 120),
+                            Center(
+                              child: Column(
+                                children: [
+                                  Icon(Icons.archive_outlined,
+                                      size: 48, color: Theme.of(context)
+                                          .colorScheme.onSurfaceVariant),
+                                  const SizedBox(height: 12),
+                                  const Text('暂无归档消息'),
+                                  const SizedBox(height: 4),
+                                  Text('右滑消息归档后，会出现在这里',
+                                      style: TextStyle(
+                                          fontSize: 12,
+                                          color: Theme.of(context)
+                                              .colorScheme.onSurfaceVariant)),
+                                ],
+                              ),
+                            ),
+                          ],
+                        )
+                      : ListView.builder(
                       physics: const AlwaysScrollableScrollPhysics(),
                       itemCount: _messages.length,
                       itemBuilder: (context, i) {
@@ -162,6 +188,7 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
                           message: m,
                           selecting: _selecting,
                           selected: _selected.contains(m.id),
+                          startActions: _startActionsFor(m),
                           actions: _actionsFor(m),
                           onTap: () {
                             if (_selecting) _toggleSelect(m);

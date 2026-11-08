@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../services/assistant/approvals_grouping.dart';
 import '../../services/assistant/models.dart';
@@ -84,6 +85,8 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
       _visiblePending.where((p) => _selected.contains(p.id)).toList();
 
   Future<void> _approve(ChangeProposal p) async {
+    // F3 §3.1-4：审批通过 = 中振；拒绝不振
+    HapticFeedback.mediumImpact();
     setState(() => _busy = true);
     try {
       final exec = await ProposalExecutor.instance.approve(p.id);

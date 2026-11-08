@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/message.dart';
 import '../../models/task.dart';
@@ -10,6 +11,7 @@ import '../../services/assistant/models.dart';
 import '../../services/database.dart';
 import '../../services/notification_bridge.dart';
 import '../../services/undo_service.dart';
+import '../shared/back_to_top.dart';
 import '../add_message_page.dart';
 import '../assistant/attachment_pick_controller.dart';
 import '../assistant/send_to_assistant.dart';
@@ -23,6 +25,7 @@ import '../../services/app_name_service.dart';
 import '../../services/app_icon_service.dart';
 import '../../services/app_ui_state.dart';
 import '../../services/fold_markers.dart';
+import '../shared/skeleton_list.dart';
 
 /// v2 消息主列表页（设计 §5.1）：分组吸顶列表 + Chip 筛选行 + 左滑块状菜单
 /// + 多选批量操作。归档消息在独立页面（ArchivedMessagesPage）。
@@ -608,25 +611,35 @@ class MessagesPageState extends State<MessagesPage> {
     if (targets.isNotEmpty) await op(targets);
   }
 
-  // ---- 左滑菜单（按行状态，设计 §5.1）----
+  // ---- 滑动菜单（按行状态，设计 §5.1；F3 手势统一：右滑积极/左滑消极）----
 
-  List<SwipeAction> _actionsFor(Message m) {
+  /// 右滑（积极）：归档、移出垃圾。
+  List<SwipeAction> _startActionsFor(Message m) {
     final cs = Theme.of(context).colorScheme;
     final isJunk = m.priority == MessagePriority.junk;
-    if (isJunk) {
-      return [
+    return [
+      if (isJunk)
         SwipeAction(
           icon: Icons.restore,
           label: '移出垃圾',
           color: cs.primary,
           onTap: () => _unjunk([m]),
         ),
-        SwipeAction(
-          icon: Icons.archive_outlined,
-          label: '归档',
-          color: cs.secondary,
-          onTap: () => _archive([m]),
-        ),
+      SwipeAction(
+        icon: Icons.archive_outlined,
+        label: '归档',
+        color: cs.secondary,
+        onTap: () => _archive([m]),
+      ),
+    ];
+  }
+
+  /// 左滑（消极/管理）：任务建/撤、标记垃圾、删除。
+  List<SwipeAction> _actionsFor(Message m) {
+    final cs = Theme.of(context).colorScheme;
+    final isJunk = m.priority == MessagePriority.junk;
+    if (isJunk) {
+      return [
         SwipeAction(
           icon: Icons.delete_forever_outlined,
           label: '删除',
@@ -655,12 +668,6 @@ class MessagesPageState extends State<MessagesPage> {
         label: '标记垃圾',
         color: cs.outline,
         onTap: () => _markJunk([m]),
-      ),
-      SwipeAction(
-        icon: Icons.archive_outlined,
-        label: '归档',
-        color: cs.secondary,
-        onTap: () => _archive([m]),
       ),
     ];
   }
@@ -731,13 +738,17 @@ class MessagesPageState extends State<MessagesPage> {
                 child: _IconChip(
                   tooltip: messageGroupLabel(key),
                   selected: _groupFilter.contains(key),
-                  onTap: () => setState(() {
-                    if (_groupFilter.contains(key)) {
-                      _groupFilter.remove(key);
-                    } else {
-                      _groupFilter.add(key);
-                    }
-                  }),
+                  onTap: () {
+                    // F3 §3.1-4：选择切换 = 轻振
+                    HapticFeedback.selectionClick();
+                    setState(() {
+                      if (_groupFilter.contains(key)) {
+                        _groupFilter.remove(key);
+                      } else {
+                        _groupFilter.add(key);
+                      }
+                    });
+                  },
                   child: Icon(messageGroupIcon(key), size: 18),
                 ),
               ),
@@ -901,6 +912,7 @@ class MessagesPageState extends State<MessagesPage> {
       linkedTaskPriority: _linkedTaskPriority(m),
       linkedTaskCount: _linkedTaskIds(m).length,
       actions: pickUI ? const [] : _actionsFor(m),
+      startActions: pickUI ? const [] : _startActionsFor(m),
       onTap: () {
         if (pickUI || _selecting) {
           _toggleSelect(m);
@@ -993,19 +1005,36 @@ class MessagesPageState extends State<MessagesPage> {
   /// 卡片内消息行间用发丝分隔线，「显示更多」收在卡片底部。
   /// 组头不再吸顶（卡片是一个整体，吸顶会切断卡片视觉）；
   /// 展开/折叠与整组选择的能力不变。
-  Widget _buildList() {
+  Widget _buildList({ScrollController? scrollController}) {
     final sources = _sourceGroups;
     if (sources.isEmpty) {
+      // 引导式空态（§3.3-11）：加载期由外层骨架屏接管，这里只管真空态
+      final cs = Theme.of(context).colorScheme;
       return ListView(
+        controller: scrollController,
         physics: const AlwaysScrollableScrollPhysics(),
         children: [
           const SizedBox(height: 120),
-          Center(child: Text(_loading ? '加载中…' : '暂无消息')),
+          Center(
+            child: Column(
+              children: [
+                Icon(Icons.inbox_outlined,
+                    size: 48, color: cs.onSurfaceVariant),
+                const SizedBox(height: 12),
+                const Text('暂无消息'),
+                const SizedBox(height: 4),
+                Text('通知采集开启后，新消息会出现在这里；下拉可刷新',
+                    style:
+                        TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+              ],
+            ),
+          ),
         ],
       );
     }
     final selectable = _selecting || widget.pickMode;
     return ListView.builder(
+      controller: scrollController,
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.only(bottom: 80),
       itemCount: sources.length,
@@ -1186,7 +1215,14 @@ class MessagesPageState extends State<MessagesPage> {
           Expanded(
             child: RefreshIndicator(
               onRefresh: reload,
-              child: _buildList(),
+              // F3 §3.2-7：滚动 >3 屏后右下角出「回顶」小 FAB；
+              // F4 §3.3-10：加载期骨架屏
+              child: ScrollableWithBackToTop(
+                scrollableBuilder: (controller) => DeferredSkeletonList(
+                  loading: _loading && _sourceGroups.isEmpty,
+                  child: _buildList(scrollController: controller),
+                ),
+              ),
             ),
           ),
           // pick 模式：底部操作条由附件选择页统一提供（已选附件 + 确认）
@@ -1511,31 +1547,40 @@ class _IconChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    // F3 §3.1-1：视觉保持 36，命中区扩到 48×48（透明外圈）
     return Tooltip(
       message: tooltip,
-      child: Material(
-        color:
-            selected ? cs.secondaryContainer : cs.surfaceContainerHighest,
-        shape: StadiumBorder(
-          side: selected
-              ? BorderSide.none
-              : BorderSide(color: cs.outlineVariant),
-        ),
-        child: InkWell(
-          customBorder: const StadiumBorder(),
-          onTap: onTap,
-          child: Container(
-            height: 36,
-            width: wide ? null : 36,
-            padding: wide ? const EdgeInsets.symmetric(horizontal: 10) : null,
-            child: IconTheme.merge(
-              data: IconThemeData(
-                size: 18,
-                color: selected
-                    ? cs.onSecondaryContainer
-                    : cs.onSurfaceVariant,
+      child: InkWell(
+        customBorder: const StadiumBorder(),
+        onTap: onTap,
+        child: SizedBox(
+          height: 48,
+          width: wide ? null : 48,
+          child: Center(
+            child: Material(
+              color: selected
+                  ? cs.secondaryContainer
+                  : cs.surfaceContainerHighest,
+              shape: StadiumBorder(
+                side: selected
+                    ? BorderSide.none
+                    : BorderSide(color: cs.outlineVariant),
               ),
-              child: Center(child: child),
+              child: Container(
+                height: 36,
+                width: wide ? null : 36,
+                padding:
+                    wide ? const EdgeInsets.symmetric(horizontal: 10) : null,
+                child: IconTheme.merge(
+                  data: IconThemeData(
+                    size: 18,
+                    color: selected
+                        ? cs.onSecondaryContainer
+                        : cs.onSurfaceVariant,
+                  ),
+                  child: Center(child: child),
+                ),
+              ),
             ),
           ),
         ),

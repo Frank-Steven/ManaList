@@ -978,7 +978,12 @@ class _ChatPageState extends State<ChatPage> {
       body: Column(
         children: [
           Expanded(
-            child: empty ? _buildEmpty(cs) : _buildMessageList(cs),
+            // F3 §3.2-8：点消息流空白处收起键盘（发送后不收起，便于连续对话）
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: () => FocusScope.of(context).unfocus(),
+              child: empty ? _buildEmpty(cs) : _buildMessageList(cs),
+            ),
           ),
           // F03 Step2（2026-11-03）：草稿含图片时显示「单张成条 + 敏感信息离设备」提示。
           if (_hasScreenshotAttachments) _buildScreenshotsHint(cs),

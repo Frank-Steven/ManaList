@@ -13,6 +13,7 @@ import 'views/month_view.dart';
 import 'views/schedule_shared.dart';
 import 'views/year_view.dart';
 import 'views/yearly_view.dart';
+import '../shared/skeleton_list.dart';
 
 /// 任务页·甘特视图宿主（原日程页 SchedulePage，v3 阶段 4 改造；设计 §2，v2.3/v2.4 修订）：
 /// 年度/年/月/日四级视图均无限滚动。
@@ -1114,7 +1115,10 @@ class TaskScheduleViewState extends State<TaskScheduleView>
           _buildPeriodHeader(),
           const Divider(height: 1),
           if (_loading)
-            const Expanded(child: Center(child: CircularProgressIndicator()))
+            // F4 §3.3-10：骨架屏替代转圈（延迟出现，防闪）
+            const Expanded(
+                child: DeferredSkeletonList(
+                    loading: true, child: SizedBox.shrink()))
           else
             // 甘特图 + 底部任务列表（展开/收起双模态，无拖拽分割线）。
             Expanded(child: _splitBody(context)),
