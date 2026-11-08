@@ -849,6 +849,25 @@ class AppDatabase {
         .toList();
   }
 
+  /// F2（ux-fixes-2026-11 §2.1）：应用名懒解析成功后回填消息行——
+  /// 只覆盖「未解析」的行（null / 空串 / 采集期被固化成的包名），
+  /// 不动已有正常名称。返回更新行数。
+  Future<int> backfillMessageAppName(
+      String packageName, String appName) async {
+    final db = await database;
+    var total = 0;
+    for (final table in ['messages', 'raw_messages']) {
+      total += await db.update(
+        table,
+        {'app_name': appName},
+        where: "package_name = ? "
+            "AND (app_name IS NULL OR app_name = '' OR app_name = ?)",
+        whereArgs: [packageName, packageName],
+      );
+    }
+    return total;
+  }
+
   Future<void> updateMessageStatus(List<String> ids, String status) async {
     if (ids.isEmpty) return;
     final db = await database;

@@ -13,6 +13,7 @@ import '../services/archive_import_service.dart';
 import '../services/notification_bridge.dart';
 import '../services/reminder_service.dart';
 import '../../services/app_log.dart';
+import '../../services/app_name_service.dart';
 
 /// B03：切到「仅指定应用」前是否需要先让用户选应用。
 ///
@@ -73,6 +74,25 @@ class _SettingsPageState extends State<SettingsPage> {
     final exactAlarms = await ReminderService.instance.refreshExactAlarms();
     final filterConfig = await AppFilterService.instance.load();
     final seenApps = await AppFilterService.instance.getSeenApps();
+    final knownNames = {for (final a in seenApps) a.packageName: a.appName};
+    // F2（ux-fixes-2026-11 §2.1-3）：已见应用中名称缺失（空/被固化成包名）
+    // 的，用已安装应用列表的正确 label 批量回填显示
+    if (seenApps.any(
+        (a) => AppNameService.needsResolution(a.appName, a.packageName))) {
+      try {
+        for (final a in await AppFilterService.instance.getInstalledApps()) {
+          final cur = knownNames[a.packageName];
+          if (knownNames.containsKey(a.packageName) &&
+              AppNameService.needsResolution(cur, a.packageName) &&
+              a.appName != null &&
+              a.appName!.isNotEmpty) {
+            knownNames[a.packageName] = a.appName;
+          }
+        }
+      } catch (e, st) {
+        AppLog.instance.warn('settings.appnames-backfill', e, st);
+      }
+    }
     if (!mounted) return;
     setState(() {
       _themeMode = prefs.getString('theme_mode') ?? 'system';
@@ -80,7 +100,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _batteryOptimized = batteryOptimized;
       _exactAlarms = exactAlarms;
       _filterConfig = filterConfig;
-      _knownAppNames = {for (final a in seenApps) a.packageName: a.appName};
+      _knownAppNames = knownNames;
     });
   }
 

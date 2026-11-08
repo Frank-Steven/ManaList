@@ -19,6 +19,8 @@ import 'archived_page.dart';
 import 'message_detail_sheet.dart';
 import 'message_widgets.dart';
 import '../../services/app_log.dart';
+import '../../services/app_name_service.dart';
+import '../../services/app_icon_service.dart';
 import '../../services/app_ui_state.dart';
 import '../../services/fold_markers.dart';
 
@@ -175,6 +177,11 @@ class MessagesPageState extends State<MessagesPage> {
         }
       }
       widget.onSelectionChanged?.call(_selecting);
+      // F1（ux-fixes-2026-11 §1.2-5）：首屏组头图标批量预热
+      unawaited(AppIconService.instance
+          .prewarm(_sources.map((s) => s.packageName)));
+      // F2（ux-fixes-2026-11 §2.1）：来源应用名懒解析回填（存量包名/空名）
+      _resolveSourceAppNames();
     } catch (e, st) {
       AppLog.instance.warn('messages.reload', e, st);
       if (mounted) setState(() => _loading = false);
@@ -192,6 +199,35 @@ class MessagesPageState extends State<MessagesPage> {
     } catch (e, st) { AppLog.instance.warn('messages.listener-state', e, st); }
     // U19-B：更新底部导航「消息」角标（取 DB 的未处理数，不受页面 500 条上限影响）
     await _updateBadge();
+  }
+
+  /// F2（ux-fixes-2026-11 §2.1）：对「未解析」的来源应用名（空/被固化成
+  /// 包名）逐个懒解析，成功后回填 DB 并整体刷新一次。best-effort：
+  /// 解析失败（包不存在/瞬时错误）静默，下次 reload 自然重试瞬时失败项。
+  void _resolveSourceAppNames() {
+    final pending = <String>{};
+    for (final s in _sources) {
+      if (AppNameService.needsResolution(s.appName, s.packageName)) {
+        pending.add(s.packageName);
+      }
+    }
+    for (final m in _messages) {
+      if (AppNameService.needsResolution(m.appName, m.packageName)) {
+        pending.add(m.packageName);
+      }
+    }
+    if (pending.isEmpty) return;
+    unawaited(() async {
+      var changed = false;
+      for (final pkg in pending) {
+        final name = await AppNameService.instance.resolve(pkg);
+        if (name != null && name.isNotEmpty) {
+          await _db.backfillMessageAppName(pkg, name);
+          changed = true;
+        }
+      }
+      if (changed && mounted) await reload();
+    }());
   }
 
   /// 某条消息锚点连接的任务 id（v8）：优先锚点表，回退历史只读旧列。

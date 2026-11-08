@@ -2,7 +2,6 @@ package dev.msgrepo.mobile
 
 import android.app.Notification
 import android.content.ComponentName
-import android.content.pm.PackageManager
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import org.json.JSONObject
@@ -185,12 +184,17 @@ class NotificationCaptureService : NotificationListenerService() {
         val postedAt =
             if (sbn.postTime > 0) sbn.postTime else System.currentTimeMillis()
 
+        // 应用名解析（ux-fixes-2026-11 §2.1）：失败/空白/等于包名一律记空串——
+        // 包名不再作为 appName 持久化（旧行为会把解析失败永久固化进消息行与
+        // seen_apps.json，鸿蒙等 ROM 上 label 解析失败率高，成片显示包名）；
+        // 空串由 Dart 显示层懒解析回填（AppNameService + getAppName 通道）。
         val appName = try {
             val info = packageManager.getApplicationInfo(packageName, 0)
-            packageManager.getApplicationLabel(info).toString()
-        } catch (e: PackageManager.NameNotFoundException) {
-            packageName
-        }
+            packageManager.getApplicationLabel(info)?.toString()?.trim()
+                .orEmpty()
+        } catch (e: Exception) {
+            ""
+        }.let { if (it.isEmpty() || it == packageName) "" else it }
 
         // 无论是否放行都记录"已见应用"，让设置页能列出当前被拦截的应用
         recordSeenApp(packageName, appName, postedAt)
@@ -307,9 +311,15 @@ class NotificationCaptureService : NotificationListenerService() {
         val schedule: Boolean
         synchronized(seenAppsLock) {
             loadSeenAppsLocked()
+            // 本次解析失败（空串）时保留已有条目里的好名字，避免新通知把
+            // 曾经解析成功的名称覆盖回空（ux-fixes-2026-11 §2.1）
+            val effectiveName = appName.ifEmpty {
+                (seenApps[packageName] as? JSONObject)
+                    ?.optString("appName")?.trim().orEmpty()
+            }
             val entry = JSONObject()
             entry.put("packageName", packageName)
-            entry.put("appName", appName)
+            entry.put("appName", effectiveName)
             entry.put("lastSeenAt", seenAt)
             seenApps[packageName] = entry
             seenAppsVersion++

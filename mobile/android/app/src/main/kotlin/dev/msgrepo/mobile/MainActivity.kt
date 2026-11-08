@@ -2,6 +2,7 @@ package dev.msgrepo.mobile
 
 import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -104,17 +105,72 @@ class MainActivity : FlutterActivity() {
                         }.start()
                     }
 
-                    // 应用图标 PNG（96px）；应用不存在返回 null
+                    // 应用图标 PNG（96px）。
+                    // 错误分类（ux-fixes-2026-11 §1.2-3）：应用不存在 →
+                    // icon_not_found（Dart 侧记忆 null 不再重试）；解析到但
+                    // 渲染失败/其它异常 → icon_unavailable / icon_query_failed
+                    //（瞬时失败，Dart 侧不记忆、下次重试）
                     "getAppIcon" -> {
                         val pkg = call.argument<String>("packageName")
                         if (pkg.isNullOrBlank()) {
-                            result.success(null)
+                            result.error("icon_query_failed", "packageName 为空", null)
                         } else {
                             Thread {
                                 try {
-                                    result.success(appIconPng(pkg))
+                                    val bytes = appIconPng(pkg)
+                                    if (bytes == null) {
+                                        result.error("icon_unavailable", "图标渲染失败", null)
+                                    } else {
+                                        result.success(bytes)
+                                    }
+                                } catch (nf: PackageManager.NameNotFoundException) {
+                                    result.error("icon_not_found", pkg, null)
                                 } catch (t: Throwable) {
-                                    result.success(null)
+                                    result.error("icon_query_failed", t.message, null)
+                                }
+                            }.start()
+                        }
+                    }
+
+                    // 批量取图标（首屏预热）：{packages: [...]} →
+                    // Map<packageName, ByteArray>；逐张失败的跳过（best-effort）
+                    "getAppIcons" -> {
+                        val pkgs = call.argument<List<String>>("packages") ?: emptyList()
+                        Thread {
+                            val map = HashMap<String, ByteArray>()
+                            for (pkg in pkgs) {
+                                try {
+                                    val bytes = appIconPng(pkg)
+                                    if (bytes != null) map[pkg] = bytes
+                                } catch (_: Throwable) {
+                                    // 单张失败不阻塞整批
+                                }
+                            }
+                            result.success(map)
+                        }.start()
+                    }
+
+                    // 应用显示名（懒解析回填用）：label 或错误分类
+                    // name_not_found（包不存在）/ name_query_failed（瞬时）
+                    "getAppName" -> {
+                        val pkg = call.argument<String>("packageName")
+                        if (pkg.isNullOrBlank()) {
+                            result.error("name_query_failed", "packageName 为空", null)
+                        } else {
+                            Thread {
+                                try {
+                                    val info = packageManager.getApplicationInfo(pkg, 0)
+                                    val label = packageManager.getApplicationLabel(info)
+                                        ?.toString()?.trim().orEmpty()
+                                    if (label.isEmpty() || label == pkg) {
+                                        result.error("name_unavailable", pkg, null)
+                                    } else {
+                                        result.success(label)
+                                    }
+                                } catch (nf: PackageManager.NameNotFoundException) {
+                                    result.error("name_not_found", pkg, null)
+                                } catch (t: Throwable) {
+                                    result.error("name_query_failed", t.message, null)
                                 }
                             }.start()
                         }
@@ -256,9 +312,11 @@ class MainActivity : FlutterActivity() {
         return arr.toString()
     }
 
+    /// 应用图标 PNG：包不存在抛 NameNotFoundException（由调用方分类）；
+    /// 渲染失败返回 null。
     private fun appIconPng(packageName: String): ByteArray? {
+        val drawable = packageManager.getApplicationIcon(packageName)
         return try {
-            val drawable = packageManager.getApplicationIcon(packageName)
             val bitmap = drawableToBitmap(drawable)
             val scaled = if (bitmap.width > 96 || bitmap.height > 96) {
                 Bitmap.createScaledBitmap(bitmap, 96, 96, true)
@@ -267,7 +325,7 @@ class MainActivity : FlutterActivity() {
             }
             val out = ByteArrayOutputStream()
             scaled.compress(Bitmap.CompressFormat.PNG, 100, out)
-            out.toByteArray()
+            out.toByteArray().takeIf { it.isNotEmpty() }
         } catch (t: Throwable) {
             null
         }
@@ -333,8 +391,10 @@ class MainActivity : FlutterActivity() {
 
     private fun drawableToBitmap(d: Drawable): Bitmap {
         if (d is BitmapDrawable && d.bitmap != null) return d.bitmap
-        val w = d.intrinsicWidth.coerceAtLeast(1)
-        val h = d.intrinsicHeight.coerceAtLeast(1)
+        // 自适应图标（AdaptiveIconDrawable）在部分 ROM 上 intrinsicWidth/Height
+        // ≤ 0，会得到 1×1 空图（ux-fixes-2026-11 §1.2-6）：回退固定 96px 画布
+        val w = if (d.intrinsicWidth > 0) d.intrinsicWidth else 96
+        val h = if (d.intrinsicHeight > 0) d.intrinsicHeight else 96
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         d.setBounds(0, 0, w, h)
