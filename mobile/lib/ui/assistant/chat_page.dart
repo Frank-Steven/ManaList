@@ -101,6 +101,10 @@ class _ChatPageState extends State<ChatPage> {
   StreamSubscription<AssistantEvent>? _turnSub;
 
   String? _errorText;
+
+  /// 回合错误时的端点诊断行（assistant-v4-ui §5.3）：
+  /// 当前生效端点持久化的上次测试结果，与模型选择器/配置向导同源。
+  String? _errorDiag;
   List<ChatAttachment> _pendingAttachments = [];
   late Conversation _conversation;
 
@@ -588,6 +592,7 @@ class _ChatPageState extends State<ChatPage> {
         _finishTurn();
       case AssistantTurnError():
         setState(() => _errorText = ev.message);
+        unawaited(_resolveErrorDiag());
         _finishTurn();
     }
   }
@@ -712,6 +717,7 @@ class _ChatPageState extends State<ChatPage> {
       _textBaseOffset = 0;
       _lastFullText = '';
       _errorText = null;
+      _errorDiag = null;
     });
     // 草稿附件随消息落库（startTurn 的 attachments 参数），草稿立即清空
     AppDatabase.instance
@@ -848,6 +854,7 @@ class _ChatPageState extends State<ChatPage> {
       _textBaseOffset = 0;
       _lastFullText = '';
       _errorText = null;
+      _errorDiag = null;
     });
     final handle = await AssistantService.instance
         .retryAssistantMessage(_conversation, m.id);
@@ -900,6 +907,7 @@ class _ChatPageState extends State<ChatPage> {
       _textBaseOffset = 0;
       _lastFullText = '';
       _errorText = null;
+      _errorDiag = null;
     });
     final handle = await AssistantService.instance
         .editUserMessage(_conversation, m.id, newText);
@@ -1226,6 +1234,35 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  /// 解析当前生效端点的持久化诊断（§5.3）：绑定接口优先，否则默认路由的
+  /// 远程接口；有上次失败记录时在错误横幅里补一行，与选择器/向导读同一份。
+  Future<void> _resolveErrorDiag() async {
+    String? diag;
+    try {
+      final ai = AiClient.instance;
+      final boundId = _conversation.modelConfigId;
+      AiEndpoint? endpoint;
+      if (boundId != null && boundId.isNotEmpty) {
+        for (final e in await ai.getRemoteEndpoints()) {
+          if (e.id == boundId) {
+            endpoint = e;
+            break;
+          }
+        }
+      } else {
+        endpoint = await ai.defaultRemoteEndpoint();
+      }
+      final err = endpoint?.lastError;
+      if (endpoint != null && err != null && err.isNotEmpty) {
+        diag = '端点「${endpoint.name}」上次测试：$err';
+      }
+    } catch (_) {
+      // 诊断是锦上添花，读取失败不影响主错误文案
+    }
+    if (!mounted || diag == null) return;
+    setState(() => _errorDiag = diag);
+  }
+
   Widget _buildError(ColorScheme cs) {
     final canRetry =
         _messages.any((m) => m.role == ChatRole.assistant);
@@ -1236,19 +1273,31 @@ class _ChatPageState extends State<ChatPage> {
         color: cs.errorContainer,
         borderRadius: BorderRadius.circular(12),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text('回合出错：$_errorText',
-                style:
-                    TextStyle(fontSize: 12, color: cs.onErrorContainer)),
+          Row(
+            children: [
+              Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text('回合出错：$_errorText',
+                    style:
+                        TextStyle(fontSize: 12, color: cs.onErrorContainer)),
+              ),
+              if (canRetry)
+                TextButton(
+                  onPressed: _busy ? null : _retryLast,
+                  child: const Text('重试'),
+                ),
+            ],
           ),
-          if (canRetry)
-            TextButton(
-              onPressed: _busy ? null : _retryLast,
-              child: const Text('重试'),
+          if (_errorDiag != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 24, top: 2),
+              child: Text(_errorDiag!,
+                  style:
+                      TextStyle(fontSize: 12, color: cs.onErrorContainer)),
             ),
         ],
       ),

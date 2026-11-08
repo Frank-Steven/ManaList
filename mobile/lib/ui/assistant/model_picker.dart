@@ -2,11 +2,15 @@ import 'package:flutter/material.dart';
 
 import '../../services/ai_client.dart';
 import '../../services/assistant/assistant_client.dart';
+import '../../services/database.dart';
 import '../../services/model_capabilities.dart';
+import 'model_setup_wizard.dart';
 
-/// 模型配置（design-v3 §5.5）：
+/// 模型配置（assistant-v4-ui §5）：
 /// - 电脑端（置顶只读）：连接状态/配对 + GET /v1/models 上报的模型列表；
-/// - 远程端点 CRUD：从设置页平移而来的 AiEndpoint 管理；
+/// - 远程端点 CRUD：添加/编辑走三步配置向导（model_setup_wizard.dart）；
+///   行内状态点 = 最近一次连通性测试的持久化诊断（lastError/lastLatencyMs），
+///   进入页面时对可见端点自动各测一次，不再只靠 SnackBar 一闪而过；
 /// - 选择模式（selectionMode=true，对话页「每对话绑定模型」入口）：
 ///   点选后 Navigator.pop(modelConfigId)（空串 = 解除绑定走默认路由）。
 class ModelPickerPage extends StatefulWidget {
@@ -31,17 +35,20 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
   String? _desktopDefaultModelId;
   String? _desktopModelsError;
   List<AiEndpoint> _remotes = [];
+  String? _defaultEndpointId;
   final Set<String> _testing = {};
+  bool _autoTested = false;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _load().then((_) => _autoTestRemotes());
   }
 
   Future<void> _load() async {
     final ai = AiClient.instance;
     final remotes = await ai.getRemoteEndpoints();
+    final defaultId = await ai.getDefaultEndpointId();
     final token = await ai.getDesktopToken();
     final deviceName = await ai.getDesktopDeviceName();
     final online = await ai.isDesktopOnline();
@@ -60,6 +67,7 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
     if (!mounted) return;
     setState(() {
       _remotes = remotes;
+      _defaultEndpointId = defaultId;
       _token = token;
       _desktopDeviceName = deviceName.isEmpty ? null : deviceName;
       _desktopOnline = online;
@@ -67,6 +75,40 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
       _desktopDefaultModelId = defaultModelId;
       _desktopModelsError = modelsError;
     });
+  }
+
+  /// 进入页面时对可见端点自动各测一次（§5.1）；结果持久化到端点诊断，
+  /// 行内状态点/原因直接读取，整页只自动测一轮。
+  Future<void> _autoTestRemotes() async {
+    if (_autoTested || _remotes.isEmpty || !mounted) return;
+    _autoTested = true;
+    await Future.wait([for (final e in _remotes) _testEndpointSilent(e)]);
+    await _load();
+  }
+
+  Future<void> _testEndpointSilent(AiEndpoint endpoint) async {
+    if (mounted) setState(() => _testing.add(endpoint.id));
+    try {
+      await AiClient.instance.testEndpointDetailed(endpoint);
+    } catch (_) {
+      // 失败原因已持久化到端点诊断并在行内展示
+    } finally {
+      if (mounted) setState(() => _testing.remove(endpoint.id));
+    }
+  }
+
+  /// 菜单里的手动测试：结果仍落诊断，同时 toast 完整信息。
+  Future<void> _testEndpointManual(AiEndpoint endpoint) async {
+    if (mounted) setState(() => _testing.add(endpoint.id));
+    try {
+      final r = await AiClient.instance.testEndpointDetailed(endpoint);
+      _toast('${endpoint.name}：${r.message}（${r.latencyMs}ms）');
+    } catch (e) {
+      _toast('${endpoint.name}：$e');
+    } finally {
+      await _load();
+      if (mounted) setState(() => _testing.remove(endpoint.id));
+    }
   }
 
   void _toast(String text) {
@@ -81,141 +123,30 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
     if (widget.selectionMode) Navigator.of(context).pop(modelConfigId);
   }
 
-  // ---- 端点测试 / 编辑 / 删除（自设置页平移） ----
+  // ---- 端点 CRUD（添加/编辑走配置向导） ----
 
-  Future<void> _testEndpoint(AiEndpoint endpoint) async {
-    setState(() => _testing.add(endpoint.id));
-    try {
-      final msg = await AiClient.instance.testEndpoint(endpoint);
-      _toast('${endpoint.name}：$msg');
-    } catch (e) {
-      _toast('${endpoint.name}：$e');
-    } finally {
-      await _load();
-      if (mounted) setState(() => _testing.remove(endpoint.id));
-    }
-  }
-
-  Future<void> _editEndpoint([AiEndpoint? existing]) async {
-    final ai = AiClient.instance;
-    final nameController = TextEditingController(text: existing?.name ?? '');
-    final baseUrlController =
-        TextEditingController(text: existing?.baseUrl ?? '');
-    final apiKeyController =
-        TextEditingController(text: existing?.apiKey ?? '');
-    final modelController = TextEditingController(text: existing?.model ?? '');
-    bool? vision = existing?.vision; // null = 自动（按模型能力推断）
-    final saved = await showDialog<AiEndpoint>(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: Text(existing == null ? '添加接口' : '编辑接口'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: nameController,
-                  decoration: const InputDecoration(labelText: '名称'),
-                ),
-                TextField(
-                  controller: baseUrlController,
-                  decoration: const InputDecoration(
-                    labelText: 'Base URL',
-                    hintText: 'https://api.example.com/v1',
-                  ),
-                ),
-                TextField(
-                  controller: apiKeyController,
-                  obscureText: true,
-                  decoration:
-                      const InputDecoration(labelText: 'API Key（可空）'),
-                ),
-                TextField(
-                  controller: modelController,
-                  decoration: const InputDecoration(labelText: '模型'),
-                  onChanged: (_) => setDialogState(() {}),
-                ),
-                // B11：三态而不是开关——
-                // 「自动」交给模型能力表（已知视觉模型自动支持），
-                // 「关闭」才是用户显式覆盖；未知模型显示「未确认」且不发送图片。
-                DropdownButton<bool?>(
-                  isExpanded: true,
-                  value: vision,
-                  items: const [
-                    DropdownMenuItem(
-                        value: null, child: Text('自动（按模型能力推断）')),
-                    DropdownMenuItem(value: true, child: Text('支持（发送图片）')),
-                    DropdownMenuItem(
-                        value: false, child: Text('关闭（不发送图片）')),
-                  ],
-                  onChanged: (v) => setDialogState(() => vision = v),
-                ),
-                const SizedBox(height: 4),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    visionSupportLabel(resolveVisionSupport(
-                        model: modelController.text, configured: vision)),
-                    style: const TextStyle(fontSize: 12),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () {
-                var baseUrl = baseUrlController.text.trim();
-                if (baseUrl.endsWith('/')) {
-                  baseUrl = baseUrl.substring(0, baseUrl.length - 1);
-                }
-                if (nameController.text.trim().isEmpty ||
-                    baseUrl.isEmpty ||
-                    modelController.text.trim().isEmpty) {
-                  return;
-                }
-                Navigator.of(context).pop(
-                  (existing ??
-                          AiEndpoint(
-                            id: ai.newEndpointId(),
-                            name: '',
-                            baseUrl: '',
-                          ))
-                      .copyWith(
-                    name: nameController.text.trim(),
-                    baseUrl: baseUrl,
-                    apiKey: apiKeyController.text.trim(),
-                    model: modelController.text.trim(),
-                    vision: () => vision,
-                  ),
-                );
-              },
-              child: const Text('保存'),
-            ),
-          ],
-        ),
-      ),
-    );
+  Future<void> _openWizard([AiEndpoint? existing]) async {
+    final saved = await showModelSetupWizard(context, existing: existing);
     if (saved == null) return;
-    await ai.upsertEndpoint(saved);
-    // 第一个远程接口自动设为默认
-    if (await ai.getDefaultEndpointId() == null) {
-      await ai.setDefaultEndpointId(saved.id);
-    }
     await _load();
   }
 
-  Future<void> _deleteEndpoint(AiEndpoint endpoint) async {
+  Future<void> _setDefault(AiEndpoint endpoint) async {
+    await AiClient.instance.setDefaultEndpointId(endpoint.id);
+    _toast('默认远程接口：${endpoint.name}');
+    await _load();
+  }
+
+  /// 删除确认（§5.1）：列出绑定它的对话数，删除后这些对话回退默认模型。
+  Future<bool> _confirmDelete(AiEndpoint endpoint) async {
+    final bound = await AppDatabase.instance
+        .countConversationsByModelConfig(endpoint.id);
+    if (!mounted) return false;
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('删除接口'),
-        content: Text('删除「${endpoint.name}」？'),
+        content: Text('删除「${endpoint.name}」？${bound > 0 ? '\n有 $bound 个对话绑定了该接口，删除后将回退到默认模型。' : ''}'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
@@ -228,9 +159,18 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
         ],
       ),
     );
-    if (confirm != true) return;
+    return confirm == true;
+  }
+
+  Future<void> _deleteEndpointConfirmed(AiEndpoint endpoint) async {
     await AiClient.instance.deleteEndpoint(endpoint.id);
     await _load();
+  }
+
+  Future<void> _deleteEndpoint(AiEndpoint endpoint) async {
+    if (await _confirmDelete(endpoint)) {
+      await _deleteEndpointConfirmed(endpoint);
+    }
   }
 
   // ---- 配对（自设置页「连接」段平移） ----
@@ -276,6 +216,10 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final online = _desktopOnline == true;
+    final defaultName = _remotes
+        .where((e) => e.id == _defaultEndpointId)
+        .map((e) => e.name)
+        .firstOrNull;
     return Scaffold(
       appBar: AppBar(
           title: Text(widget.selectionMode ? '选择模型' : '模型配置')),
@@ -351,13 +295,15 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
           const Divider(height: 32),
           Text('远程接口', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 4),
-          Text('LinkModel 不在线时使用；对话也可直接绑定某个远程接口',
+          Text(
+              'LinkModel 不在线时使用；对话也可直接绑定某个远程接口'
+              '${defaultName != null ? '；默认：$defaultName' : ''}',
               style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
           for (final e in _remotes) _buildRemoteTile(e, cs),
           Align(
             alignment: Alignment.centerLeft,
             child: TextButton.icon(
-              onPressed: () => _editEndpoint(),
+              onPressed: () => _openWizard(),
               icon: const Icon(Icons.add),
               label: const Text('添加远程接口'),
             ),
@@ -389,50 +335,112 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
     );
   }
 
+  /// 状态点（§5.1，全助理域同一语义）：最近测试成功 = 绿（+延迟）、
+  /// 失败 = 红（+原因一行）、未测 = 灰；测试中显示小转圈。
+  Widget _statusDot(AiEndpoint e, bool testing, ColorScheme cs) {
+    if (testing) {
+      return const SizedBox(
+          width: 20,
+          height: 20,
+          child: Padding(
+              padding: EdgeInsets.all(4),
+              child: CircularProgressIndicator(strokeWidth: 2)));
+    }
+    final color = e.lastError != null
+        ? cs.error
+        : e.lastLatencyMs != null
+            ? Colors.green.shade600
+            : cs.onSurfaceVariant;
+    return Container(
+      width: 8,
+      height: 8,
+      margin: const EdgeInsets.symmetric(horizontal: 6),
+      decoration: BoxDecoration(shape: BoxShape.circle, color: color),
+    );
+  }
+
   Widget _buildRemoteTile(AiEndpoint e, ColorScheme cs) {
     final testing = _testing.contains(e.id);
     final selected = widget.currentModelConfigId == e.id;
-    return ListTile(
+    final isDefault = e.id == _defaultEndpointId;
+    final support = resolveVisionSupport(model: e.model, configured: e.vision);
+    final statusText = testing
+        ? '测试中…'
+        : e.lastError != null
+            ? '上次测试失败：${e.lastError}'
+            : e.lastLatencyMs != null
+                ? '上次测试正常 · ${e.lastLatencyMs}ms'
+                : '未测试';
+    final tile = ListTile(
       contentPadding: EdgeInsets.zero,
       leading: widget.selectionMode
           ? Icon(
               selected ? Icons.radio_button_checked : Icons.radio_button_off,
               size: 20)
-          : Icon(Icons.cloud_outlined, color: cs.onSurfaceVariant),
-      title: Text('${e.name}${selected && widget.selectionMode ? ' ✓' : ''}'),
-      subtitle: Text(
-          '${e.baseUrl} · ${e.model}'
-          '${visionSupportBadge(resolveVisionSupport(model: e.model, configured: e.vision))}',
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
-      onTap: widget.selectionMode ? () => _select(e.id) : null,
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
+          : _statusDot(e, testing, cs),
+      title: Text(
+          '${e.name}${isDefault ? '（默认）' : ''}${selected && widget.selectionMode ? ' ✓' : ''}'),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          TextButton(
-            onPressed: testing ? null : () => _testEndpoint(e),
-            child: testing
-                ? const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2))
-                : const Text('测试'),
-          ),
-          if (!widget.selectionMode) ...[
-            IconButton(
-              tooltip: '编辑',
-              icon: const Icon(Icons.edit_outlined, size: 20),
-              onPressed: () => _editEndpoint(e),
-            ),
-            IconButton(
-              tooltip: '删除',
-              icon: const Icon(Icons.delete_outline, size: 20),
-              onPressed: () => _deleteEndpoint(e),
-            ),
-          ],
+          Text(
+              '${e.baseUrl} · ${e.model}'
+              '${visionSupportBadge(support)}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+          Text(statusText,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                  fontSize: 12,
+                  color: e.lastError != null && !testing
+                      ? cs.error
+                      : cs.onSurfaceVariant)),
         ],
       ),
+      onTap: widget.selectionMode ? () => _select(e.id) : () => _openWizard(e),
+      trailing: widget.selectionMode
+          ? null
+          : PopupMenuButton<String>(
+              tooltip: '更多',
+              onSelected: (v) {
+                switch (v) {
+                  case 'test':
+                    _testEndpointManual(e);
+                  case 'default':
+                    _setDefault(e);
+                  case 'edit':
+                    _openWizard(e);
+                  case 'delete':
+                    _deleteEndpoint(e);
+                }
+              },
+              itemBuilder: (context) => [
+                const PopupMenuItem(value: 'test', child: Text('测试连接')),
+                PopupMenuItem(
+                    value: 'default',
+                    enabled: !isDefault,
+                    child: const Text('设为默认')),
+                const PopupMenuItem(value: 'edit', child: Text('编辑')),
+                const PopupMenuItem(value: 'delete', child: Text('删除')),
+              ],
+            ),
+    );
+    if (widget.selectionMode) return tile;
+    // 管理模式：左滑删除（confirmDismiss 弹确认，列出绑定对话数）
+    return Dismissible(
+      key: ValueKey('endpoint:${e.id}'),
+      direction: DismissDirection.endToStart,
+      confirmDismiss: (_) => _confirmDelete(e),
+      onDismissed: (_) => _deleteEndpointConfirmed(e),
+      background: Container(
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 16),
+        color: cs.errorContainer,
+        child: Icon(Icons.delete_outline, color: cs.onErrorContainer),
+      ),
+      child: tile,
     );
   }
 }

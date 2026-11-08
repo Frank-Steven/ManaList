@@ -150,4 +150,64 @@ void main() {
       expect(off.copyWith(name: 'B').vision, isFalse, reason: '不改 vision 时保持原值');
     });
   });
+
+  // ---- 端点诊断（v4 批次 C：lastError/lastLatencyMs，三处 UI 共享） ----
+
+  group('端点诊断持久化（v4 批次C）', () {
+    setUp(() {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      SharedPreferences.setMockInitialValues({});
+      AiClient.secretStore = InMemorySecretStore();
+    });
+
+    test('旧配置没有诊断键：读回 null，不写回多余键', () {
+      final e = AiEndpoint.fromJson({
+        'id': 'e1',
+        'name': 'A',
+        'baseUrl': 'https://a.example.com/v1',
+      });
+      expect(e.lastError, isNull);
+      expect(e.lastLatencyMs, isNull);
+      final row = e.toJson();
+      expect(row.containsKey('lastError'), isFalse);
+      expect(row.containsKey('lastLatencyMs'), isFalse);
+    });
+
+    test('诊断序列化往返', () {
+      const e = AiEndpoint(
+          id: 'e1',
+          name: 'A',
+          baseUrl: 'https://a.example.com/v1',
+          lastError: 'HTTP 401：invalid key',
+          lastLatencyMs: 123);
+      final restored = AiEndpoint.fromJson(e.toJson());
+      expect(restored.lastError, 'HTTP 401：invalid key');
+      expect(restored.lastLatencyMs, 123);
+    });
+
+    test('recordEndpointTestResult：失败记原因清延迟，成功清原因记延迟', () async {
+      final ai = AiClient.instance;
+      final e = AiEndpoint(
+          id: ai.newEndpointId(),
+          name: '远程A',
+          baseUrl: 'https://a.example.com/v1');
+      await ai.upsertEndpoint(e);
+
+      await ai.recordEndpointTestResult(e.id, error: 'HTTP 401：bad key');
+      var saved = (await ai.getRemoteEndpoints()).single;
+      expect(saved.lastError, contains('401'));
+      expect(saved.lastLatencyMs, isNull, reason: '失败时延迟无意义，清空');
+
+      await ai.recordEndpointTestResult(e.id, latencyMs: 87);
+      saved = (await ai.getRemoteEndpoints()).single;
+      expect(saved.lastError, isNull, reason: '成功后清掉旧失败记录');
+      expect(saved.lastLatencyMs, 87);
+    });
+
+    test('recordEndpointTestResult：未保存的端点静默跳过（向导临时配置）', () async {
+      final ai = AiClient.instance;
+      await ai.recordEndpointTestResult('not-exist', error: 'x');
+      expect(await ai.getRemoteEndpoints(), isEmpty);
+    });
+  });
 }

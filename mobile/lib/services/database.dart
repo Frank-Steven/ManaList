@@ -1680,6 +1680,17 @@ class AppDatabase {
         where: 'id = ?', whereArgs: [id]);
   }
 
+  /// 绑定了某个模型配置的对话数（v4 批次 C：删除端点前的确认文案用，
+  /// 删除后这些对话回退默认路由）。
+  Future<int> countConversationsByModelConfig(String modelConfigId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+        'SELECT COUNT(*) AS c FROM conversations WHERE model_config_id = ?',
+        [modelConfigId]);
+    final v = rows.first['c'];
+    return v is int ? v : 0;
+  }
+
   /// 刷新 updated_at（有新消息时把对话顶到列表前）。
   Future<void> touchConversation(String id) async {
     final db = await database;

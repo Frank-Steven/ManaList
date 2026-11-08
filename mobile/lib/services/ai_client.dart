@@ -57,6 +57,14 @@ class AiEndpoint {
   /// services/model_capabilities.dart 的 resolveVisionSupport。
   final bool? vision;
 
+  /// 最近一次连通性测试的失败原因（v4 批次 C 诊断共享）：
+  /// 模型选择器行 / 对话页错误横幅 / 配置向导三处显示同一份；
+  /// null = 上次测试成功（或从未失败）。
+  final String? lastError;
+
+  /// 最近一次测试成功的往返延迟（毫秒）；失败或从未测试时为 null。
+  final int? lastLatencyMs;
+
   const AiEndpoint({
     required this.id,
     required this.name,
@@ -65,6 +73,8 @@ class AiEndpoint {
     this.model = '',
     this.isDesktop = false,
     this.vision,
+    this.lastError,
+    this.lastLatencyMs,
   });
 
   factory AiEndpoint.fromJson(Map<String, dynamic> json) {
@@ -86,6 +96,8 @@ class AiEndpoint {
       apiKey: json['apiKey'] as String? ?? '',
       model: json['model'] as String? ?? '',
       vision: vision,
+      lastError: json['lastError'] as String?,
+      lastLatencyMs: json['lastLatencyMs'] as int?,
     );
   }
 
@@ -99,15 +111,20 @@ class AiEndpoint {
         // 未配置（null）时不写这两个键，读回来仍是 null。
         if (vision != null) 'vision': vision,
         if (vision != null) 'visionExplicit': true,
+        if (lastError != null) 'lastError': lastError,
+        if (lastLatencyMs != null) 'lastLatencyMs': lastLatencyMs,
       };
 
   /// [vision] 用闭包以便把值设回 null（恢复「未配置」），与 Task.copyWith 同一范式。
+  /// [lastError]/[lastLatencyMs] 同理：测试成功时闭包返回 null 清掉旧诊断。
   AiEndpoint copyWith({
     String? name,
     String? baseUrl,
     String? apiKey,
     String? model,
     bool? Function()? vision,
+    String? Function()? lastError,
+    int? Function()? lastLatencyMs,
   }) =>
       AiEndpoint(
         id: id,
@@ -117,6 +134,9 @@ class AiEndpoint {
         model: model ?? this.model,
         isDesktop: isDesktop,
         vision: vision != null ? vision() : this.vision,
+        lastError: lastError != null ? lastError() : this.lastError,
+        lastLatencyMs:
+            lastLatencyMs != null ? lastLatencyMs() : this.lastLatencyMs,
       );
 }
 
@@ -125,6 +145,19 @@ class AiException implements Exception {
   AiException(this.message);
   @override
   String toString() => message;
+}
+
+/// 连通性测试的结构化结果（v4 批次 C）：配置向导要模型列表做下拉，
+/// 选择器要延迟做行内状态，纯文字的 testEndpoint 已不够用。
+class EndpointTestResult {
+  final String message;
+  final List<String> modelIds;
+  final int latencyMs;
+  const EndpointTestResult({
+    required this.message,
+    this.modelIds = const [],
+    required this.latencyMs,
+  });
 }
 
 /// AI 基建客户端（v3）：电脑端配对 / health 探测 / 远程端点 CRUD 与连通性测试。
@@ -375,32 +408,54 @@ class AiClient {
     return ok;
   }
 
-  /// 测试接口连通：电脑端打 /v1/pair（顺带刷新 token），远程打 /v1/models。
-  /// 成功返回描述文字，失败抛 AiException。
-  Future<String> testEndpoint(AiEndpoint endpoint) async {
+  /// 测试接口连通（旧签名，返回描述文字）；诊断落盘与结构化结果见
+  /// [testEndpointDetailed]。失败抛 AiException。
+  Future<String> testEndpoint(AiEndpoint endpoint) async =>
+      (await testEndpointDetailed(endpoint)).message;
+
+  /// 测试接口连通（结构化版）：电脑端打 /v1/pair（顺带刷新 token），
+  /// 远程打 /v1/models 并解析模型列表、测量往返延迟。
+  ///
+  /// 远程端点的诊断会持久化到 [AiEndpoint.lastError]/[AiEndpoint.lastLatencyMs]
+  ///（诊断共享：选择器行 / 对话错误横幅 / 配置向导读同一份）；
+  /// 未保存过的端点（向导里还没落盘的临时配置）找不到记录，静默跳过。
+  Future<EndpointTestResult> testEndpointDetailed(AiEndpoint endpoint) async {
     if (endpoint.isDesktop) {
+      final watch = Stopwatch()..start();
       final (_, deviceName) = await pairDesktop();
       await isDesktopOnline(force: true);
-      return '已连接${deviceName.isNotEmpty ? '：$deviceName' : ''}';
+      watch.stop();
+      return EndpointTestResult(
+        message: '已连接${deviceName.isNotEmpty ? '：$deviceName' : ''}',
+        latencyMs: watch.elapsedMilliseconds,
+      );
     }
+    Future<AiException> fail(String message) async {
+      await recordEndpointTestResult(endpoint.id, error: message);
+      return AiException(message);
+    }
+
     final hint = endpointConfigHint(endpoint.baseUrl);
-    if (hint != null) throw AiException(hint);
+    if (hint != null) throw await fail(hint);
     final headers = <String, String>{};
     if (endpoint.apiKey.isNotEmpty) {
       headers['Authorization'] = 'Bearer ${endpoint.apiKey}';
     }
     final url = joinEndpointUrl(endpoint.baseUrl, 'models');
+    final watch = Stopwatch()..start();
     final http.Response resp;
     try {
       resp = await _client
           .get(Uri.parse(url), headers: headers)
           .timeout(const Duration(seconds: 8));
     } catch (e) {
-      throw AiException('无法连接 $url：$e');
+      throw await fail('无法连接 $url：$e');
     }
+    watch.stop();
     if (resp.statusCode != 200) {
       final detail = describeUpstreamError(resp.body);
-      throw AiException('HTTP ${resp.statusCode} @ $url${detail.isEmpty ? '' : '：$detail'}');
+      throw await fail(
+          'HTTP ${resp.statusCode} @ $url${detail.isEmpty ? '' : '：$detail'}');
     }
     // 成功时把模型 id 列出来（U1/N2）：上游只校验 /models 不校验模型名，
     // 用户很容易填成版本号（如 DeepSeek-V41-Flash）导致真实调用 400。
@@ -414,9 +469,32 @@ class AiClient {
         }
       }
     } catch (e, st) { AppLog.instance.warn('ai.parse-models', e, st); }
-    if (ids.isEmpty) return '连通正常';
-    final shown = ids.take(5).join('、');
-    return '连通正常（${ids.length} 个模型：$shown${ids.length > 5 ? '…' : ''}）';
+    final latency = watch.elapsedMilliseconds;
+    await recordEndpointTestResult(endpoint.id, latencyMs: latency);
+    final String message;
+    if (ids.isEmpty) {
+      message = '连通正常';
+    } else {
+      final shown = ids.take(5).join('、');
+      message =
+          '连通正常（${ids.length} 个模型：$shown${ids.length > 5 ? '…' : ''}）';
+    }
+    return EndpointTestResult(
+        message: message, modelIds: ids, latencyMs: latency);
+  }
+
+  /// 把一次连通性测试的诊断写到已保存的端点上；端点不存在（临时配置）时跳过。
+  /// 成功：error 传 null（清掉旧失败记录）+ latencyMs；失败：error 传原因、延迟清空。
+  Future<void> recordEndpointTestResult(String endpointId,
+      {String? error, int? latencyMs}) async {
+    final list = await getRemoteEndpoints();
+    final i = list.indexWhere((e) => e.id == endpointId);
+    if (i < 0) return;
+    list[i] = list[i].copyWith(
+      lastError: () => error,
+      lastLatencyMs: () => error == null ? latencyMs : null,
+    );
+    await _saveRemoteEndpoints(list);
   }
 
   /// 拼接 baseUrl 与接口路径：去掉尾部多余斜杠，避免 `//` 之类的 404（N2 诊断）。
