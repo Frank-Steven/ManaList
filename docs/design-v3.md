@@ -6,6 +6,7 @@
 > v3.1 修订：锚点改为内容内联对象（弃用偏移定位）；AI 动作全部原子化并进入待确认区人工审批；批处理管线废弃、作为助理工具重生；Ollama 暂缓；QQ/微信解析器彻底移除；存档导入/导出与全新安装策略。
 > v3.2 修订：**取消过渡版本**——确认无需过渡，所有用户直接全新安装 v3；存档导入/导出保留为 v3 的备份能力，但不再承担旧版迁移桥梁（§7 重写）。
 > v3.3 命名定稿（2026-11-01）：手机端应用定名 **ManaList**，桌面网关定名 **LinkModel**（正文与历史提交中的 AndroidLocAI 即 LinkModel，MsgRepo 为仓库旧名）。UI 结构以 `docs/ui-structure.md` 为准。
+> v3.4 修订（2026-11-08）：①锚点从正文行内 marker **简化为对象级关联**（消息条/笔记章节/文件），见 `docs/anchors-v2.md`——下文 §1.1、§3.3、§3.4、§5.3、§7 中涉及 `⟦task:id⟧` marker 的描述仅作历史记录；②并发冲突收敛引入真正的 CRDT，见 `docs/crdt.md`（`assistant.md` §2.1 旧决策同步废止）；③助理域交互/外观/配置体验重设计见 `docs/assistant-v4.md`，取代 §5.1/§5.5 的 UI 细节约定；④图标缓存与应用名显示修复见 `docs/ux-fixes-2026-11.md`。
 
 ---
 
@@ -58,6 +59,8 @@ v2 确立了「日程+待办是应用本体，消息是数据源，AI 是可插�
 权威数据仍在手机端 SQLite（`mobile/lib/services/database.dart`），模型定义在 `mobile/lib/models/`。v8 一次性完成以下迁移（应用内迁移仅服务开发期与测试；正式用户走全新安装 + 存档导入，见 §7）。
 
 ### 1.1 新增表 `task_anchors`（任务锚点，核心新增）
+
+> **v3.4 起本节被 `docs/anchors-v2.md` 取代**：锚点改为对象级关联（target_type ∈ message/chapter/file），正文不再写入 marker；表结构沿用但语义更新，行内 marker 相关段落仅作历史记录。
 
 ```sql
 CREATE TABLE task_anchors(
@@ -347,6 +350,8 @@ shared/schemas 仍是双端协议事实源，v3 更新如下（同步更新 `des
 权限边界（执行层强制）：**AI 不可修改/删除已归档任务**；首版不提供笔记/文件的删除工具；不可触碰配对/密钥/设置。
 
 ### 5.3 锚点的 AI 创建
+
+> **v3.4 起本节被 `docs/anchors-v2.md` §4 取代**：`anchor.create` 去掉 `anchorText` 正文定位，只传 `{targetType, targetId, taskId}`，不存在定位失败类 `failed`。
 
 - 笔记/消息：AI 输出 `anchor.create {targetType, targetId, anchorText, taskRef}` → 生成提案；审批通过后客户端在正文定位 `anchorText` 首次出现处，在其后插入 `⟦task:<id>⟧` marker + 写表。定位失败（文本不存在）→ 执行失败置 `failed`，用户在待确认区可看到原因。
 - 文件：`anchor.create {targetType:'file', targetId, taskRef}` → 只写表，不动内容。

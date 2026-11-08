@@ -2,6 +2,8 @@
 
 配套 `docs/design-v3.md`（v3.2）与 `docs/design-v3-details.md`（v1.0，机制定稿）执行。每阶段独立可构建、真机验证、单独 git 提交；任一阶段出问题只回滚该阶段（`git revert` 对应提交）。
 
+> 2026-11-08 注：锚点行内 marker 方案已被对象级锚点取代（`docs/anchors-v2.md`，含 v11 迁移），并发语义以 `docs/crdt.md` 为准，助理 UI 以 `docs/assistant-v4.md` 为准。本文涉 marker 的步骤（阶段 2 的 links→marker 迁移、阶段 4 的手动锚点等）在落地时按锚点 v2 口径执行。
+
 ## 总则
 
 - 每阶段验收：`flutter analyze` 无错误 + `flutter test` 通过 + `flutter build apk --debug` 通过 + 真机过该阶段验证清单 + commit。
