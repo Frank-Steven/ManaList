@@ -1,10 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../models/conversation.dart';
+import '../../models/library_file.dart';
+import '../../models/message.dart';
 import '../../services/assistant/assistant_service.dart';
 import '../../services/assistant/models.dart';
 import '../../services/app_log.dart';
@@ -14,11 +18,14 @@ import '../../services/database.dart';
 import '../../services/library_file_service.dart';
 import '../library/files_page.dart' show libraryFileIcon;
 import 'approvals_page.dart';
-import 'attachment_picker.dart';
 import 'model_picker.dart';
+import 'attachment_picker.dart';
 import 'widgets/attachment_cards.dart';
+import 'widgets/chat_appbar.dart';
+import 'widgets/input_bar.dart';
 import 'widgets/proposal_card.dart';
 import 'widgets/streaming_blocks.dart';
+import 'widgets/suggestion_chips.dart';
 
 /// F03（2026-11-03）：从相册批量加截图的单批上限。
 const int maxScreenshotsPerBatch = 6;
@@ -34,24 +41,26 @@ String screenshotsConventionHint() =>
     '每张截图单独成条：能确定时间的出待办（task.create），纯信息出笔记（note.create），'
     '不跨图合并。截图可能含敏感信息，远程模型会离开设备。';
 
-/// 对话页（design-v3 §5.1；2026-11-01 流式渲染改版 + 多 Agent 并行）：
-/// 用户消息发送后立即上屏；Agent 回复分段流式渲染——
-/// 思考用思考块、工具调用用工具块（图标 + 自然语言标题 + 状态、可展开收起），
-/// 正文直接显示在外面；文字淡入，未落定时按住末尾两个词保证换行稳定，
-/// 回合进行中以呼吸圆点光标指示（替代旧「正在输入…」块）。
+/// 对话页（assistant-v4-ui §3，2026-11-08 重设计）：
+///
+/// 呈现：助理消息为**全宽时间线**（不再用气泡），用户消息保留右对齐
+/// primary pill；时间戳不常驻，收进长按菜单「详情」。空对话显示情境化
+/// 建议 chips（suggestion_chips.dart，按真实数据生成）。
+///
+/// 结构（组件拆分决策）：壳只持有回合订阅与消息状态，呈现下沉为
+/// ChatAppBar（顶栏 + 切模型后果 sheet）/ ChatInputBar（附件条、
+/// `/` 指令面板、发送/停止键）/ SuggestionChips 等独立组件。
 ///
 /// 回合 pump 由 AssistantService 自持：离开本页回合继续跑（多对话并行），
-/// 回来时经 turnOf 重新订阅在途回合；对话列表经 turnsVersion 指示工作状态。
+/// 回来时经 turnOf 重新订阅在途回合。回合进行中允许切换模型，但先弹
+/// 后果说明 sheet（assistant-v4-ui §3.2）。
 ///
-/// 消息操作（长按气泡）：Agent 回复可重试；用户消息可编辑/撤回——
+/// 消息操作（长按）：复制 / 详情；Agent 回复可重试；用户消息可编辑/撤回——
 /// 三者都删除后续消息（pending 提案一并撤销），编辑/重试随后重跑回合。
 ///
-/// 附件按类型渲染：媒体（图片可直接预览、视频/音频可打开）显示预览卡，
-/// 文档显示文件块（图标/文件名/大小），多附件横向堆叠卡片、左右滑动切换。
-///
 /// 附件 bar 即草稿附件（DB v9 conversations.draft_attachments）：打开对话时
-/// 从草稿加载，附件选择器与 chip 移除都写透到草稿；库页「发送给助理」追加的
-/// 条目也会出现在这里。发送时草稿随消息落 chat_messages.attachments 并清空。
+/// 从草稿加载，附件选择器与 chip 移除都写透到草稿；发送时草稿随消息落
+/// chat_messages.attachments 并清空。
 class ChatPage extends StatefulWidget {
   final Conversation conversation;
 
@@ -98,6 +107,9 @@ class _ChatPageState extends State<ChatPage> {
   /// task-50（2026-11-03）：`modelConfigId` 解析后的可读名称。
   /// null = 还在解析；解析失败/已失效会写成「模型配置已失效」，绝不回退显示 id。
   String? _modelDisplayName;
+
+  /// 空对话建议 chips（assistant-v4-ui §3.8）；非空对话恒为空表。
+  List<String> _suggestions = [];
 
   bool get _busy => _turn != null;
 
@@ -150,6 +162,32 @@ class _ChatPageState extends State<ChatPage> {
     _scrollToBottom();
     // task-50：模型可能被切换过，重新解析显示名（异步，不影响列表渲染）
     unawaited(_refreshModelDisplayName());
+    // 空对话：按真实数据生成建议 chips（§3.8）
+    if (messages.isEmpty) {
+      unawaited(_refreshSuggestions());
+    } else if (_suggestions.isNotEmpty && mounted) {
+      setState(() => _suggestions = []);
+    }
+  }
+
+  /// 建议 chips 数据源：收件箱未处理数 + 今天的进行中任务数。
+  Future<void> _refreshSuggestions() async {
+    final db = AppDatabase.instance;
+    try {
+      final pending = await db.countMessages(status: MessageStatus.pending);
+      final now = DateTime.now();
+      final dayStart = DateTime(now.year, now.month, now.day);
+      final todayTasks = await db.getTasksOverlapping(
+          dayStart.millisecondsSinceEpoch,
+          dayStart.add(const Duration(days: 1)).millisecondsSinceEpoch);
+      if (!mounted || _messages.isNotEmpty) return;
+      setState(() {
+        _suggestions = suggestionPrompts(
+            pendingMessages: pending, todayOpenTasks: todayTasks.length);
+      });
+    } catch (e, st) {
+      AppLog.instance.warn('chat.suggestions', e, st);
+    }
   }
 
   /// task-50（2026-11-03）：把 `modelConfigId` 解析成可读名称。
@@ -192,7 +230,7 @@ class _ChatPageState extends State<ChatPage> {
         (trimmed != null && trimmed.isNotEmpty) ? trimmed : '模型配置已失效');
   }
 
-  /// AppBar 右侧的模型文案：解析中先显示占位，**绝不闪现 id**。
+  /// 顶栏模型行文案：解析中先显示占位，**绝不闪现 id**。
   String get _modelLabel {
     if (_conversation.modelConfigId == null ||
         _conversation.modelConfigId!.isEmpty) {
@@ -319,6 +357,12 @@ class _ChatPageState extends State<ChatPage> {
     _showSnack(parts.join('；'));
   }
 
+  void _removeAttachment(ChatAttachment a) {
+    setState(() => _pendingAttachments.remove(a));
+    AppDatabase.instance.setConversationDraftAttachments(
+        _conversation.id, _pendingAttachments);
+  }
+
   void _showSnack(String text) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -344,7 +388,13 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  /// 切换模型（assistant-v4-ui §3.2 决策）：回合进行中先弹后果说明
+  /// sheet；确认后（或无在途回合时直接）进模型选择器（选择模式）。
   Future<void> _switchModel() async {
+    if (_busy) {
+      final proceed = await showModelSwitchConsequences(context);
+      if (!proceed || !mounted) return;
+    }
     final selected = await Navigator.of(context).push<String>(
       MaterialPageRoute(
         builder: (_) => ModelPickerPage(
@@ -357,6 +407,127 @@ class _ChatPageState extends State<ChatPage> {
     await AppDatabase.instance
         .setConversationModel(_conversation.id, selected.isEmpty ? null : selected);
     await _reload();
+    if (mounted) _showSnack('下一条消息起使用 $_modelLabel');
+  }
+
+  // ---- 顶栏菜单动作 ----
+
+  Future<void> _rename() async {
+    final controller = TextEditingController(text: _conversation.title);
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('重命名对话'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: '标题'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (saved == null || saved.isEmpty || !mounted) return;
+    await AppDatabase.instance.renameConversation(_conversation.id, saved);
+    await _reload();
+  }
+
+  /// 导出对话为 markdown 文件（落文件区，note_export 来源）。
+  Future<void> _export() async {
+    final buf = StringBuffer()
+      ..writeln('# ${_conversation.title}')
+      ..writeln()
+      ..writeln('> 导出自 ManaList 助理对话 · 模型：$_modelLabel')
+      ..writeln();
+    for (final m in _messages) {
+      final who = m.role == ChatRole.user
+          ? '我'
+          : m.role == ChatRole.assistant
+              ? '助理'
+              : '工具';
+      buf
+        ..writeln('## $who（${_fmtFullTime(m.createdAt)}）')
+        ..writeln()
+        ..writeln(m.content)
+        ..writeln();
+    }
+    final safeTitle = _conversation.title
+        .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
+        .trim();
+    final name =
+        '对话-${safeTitle.isEmpty ? '未命名' : safeTitle}.md';
+    try {
+      await LibraryFileService.instance.importBytes(
+        utf8.encode(buf.toString()),
+        name: name,
+        mimeType: 'text/markdown',
+        source: FileSource.noteExport,
+      );
+      _showSnack('已导出到文件区：$name');
+    } catch (e, st) {
+      AppLog.instance.warn('chat.export', e, st);
+      _showSnack('导出失败：$e');
+    }
+  }
+
+  /// 清空上下文重开：删除本对话全部消息记录，待确认提案保留。
+  Future<void> _clearAndRestart() async {
+    if (_busy) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('清空重开'),
+        content: const Text('删除本对话的全部消息记录？待确认提案会保留在待确认区。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true || !mounted) return;
+    await AppDatabase.instance.deleteChatMessages(
+        _messages.map((m) => m.id).toList());
+    await _reload();
+  }
+
+  Future<void> _deleteConversation() async {
+    if (_busy) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('删除对话'),
+        content:
+            Text('删除「${_conversation.title}」？其待确认提案会保留在待确认区。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true || !mounted) return;
+    await AppDatabase.instance.deleteConversation(_conversation.id);
+    if (mounted) Navigator.of(context).pop();
   }
 
   // ---- 回合订阅（pump 在服务侧，本页只渲染事件） ----
@@ -556,7 +727,7 @@ class _ChatPageState extends State<ChatPage> {
     AssistantService.instance.cancelTurn(_conversation.id);
   }
 
-  /// 消息长按操作：Agent 回复 → 重试；用户消息 → 编辑 / 撤回。
+  /// 消息长按操作：复制 / 详情；Agent 回复可重试；用户消息可编辑/撤回。
   void _showMessageActions(ChatMessage m) {
     final isUser = m.role == ChatRole.user;
     final isAssistant = m.role == ChatRole.assistant;
@@ -568,41 +739,103 @@ class _ChatPageState extends State<ChatPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            ListTile(
+              leading: const Icon(Icons.copy_outlined),
+              title: const Text('复制'),
+              onTap: () {
+                Navigator.of(sheetContext).pop();
+                Clipboard.setData(ClipboardData(text: m.content));
+                _showSnack('已复制');
+              },
+            ),
             if (isAssistant)
               ListTile(
                 leading: const Icon(Icons.refresh),
                 title: const Text('重试'),
-                subtitle: const Text('删除该回复及其后内容，重新生成',
-                    style: TextStyle(fontSize: 12)),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  _retry(m);
-                },
+                subtitle: Text(
+                    _busy ? '等本回合结束后可用' : '删除该回复及其后内容，重新生成',
+                    style: const TextStyle(fontSize: 12)),
+                onTap: _busy
+                    ? null
+                    : () {
+                        Navigator.of(sheetContext).pop();
+                        _retry(m);
+                      },
               ),
             if (isUser) ...[
               ListTile(
                 leading: const Icon(Icons.edit_outlined),
                 title: const Text('编辑'),
-                subtitle: const Text('修改后从此处重新生成回复',
-                    style: TextStyle(fontSize: 12)),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  _editUserMessage(m);
-                },
+                subtitle: Text(
+                    _busy ? '等本回合结束后可用' : '修改后从此处重新生成回复',
+                    style: const TextStyle(fontSize: 12)),
+                onTap: _busy
+                    ? null
+                    : () {
+                        Navigator.of(sheetContext).pop();
+                        _editUserMessage(m);
+                      },
               ),
               ListTile(
                 leading: const Icon(Icons.undo),
                 title: const Text('撤回'),
-                subtitle: const Text('删除该消息及其后所有内容',
-                    style: TextStyle(fontSize: 12)),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  _recall(m);
-                },
+                subtitle: Text(
+                    _busy ? '等本回合结束后可用' : '删除该消息及其后所有内容',
+                    style: const TextStyle(fontSize: 12)),
+                onTap: _busy
+                    ? null
+                    : () {
+                        Navigator.of(sheetContext).pop();
+                        _recall(m);
+                      },
               ),
             ],
+            ListTile(
+              leading: const Icon(Icons.info_outline),
+              title: const Text('详情'),
+              onTap: () {
+                Navigator.of(sheetContext).pop();
+                _showMessageDetail(m);
+              },
+            ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 消息详情（时间戳不常驻消息流，收在这里；assistant-v4-ui §3.7）。
+  void _showMessageDetail(ChatMessage m) {
+    final rows = <(String, String)>[
+      ('时间', _fmtFullTime(m.createdAt)),
+      ('角色', m.role == ChatRole.user ? '我' : '助理'),
+      ('字数', '${m.content.length}'),
+      if (m.attachments.isNotEmpty) ('附件', '${m.attachments.length} 个'),
+      if (m.role == ChatRole.assistant) ('模型', _modelLabel),
+      if ((_proposalsByBatch[m.id] ?? []).isNotEmpty)
+        ('产出提案', '${_proposalsByBatch[m.id]!.length} 条'),
+    ];
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('消息详情'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (final (k, v) in rows)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text('$k：$v'),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
       ),
     );
   }
@@ -621,6 +854,16 @@ class _ChatPageState extends State<ChatPage> {
     if (!mounted) return;
     await _reload();
     if (handle != null) _attachTurn(handle);
+  }
+
+  /// 错误横幅的「重试」：重跑最后一条 assistant 消息（无则隐藏按钮）。
+  Future<void> _retryLast() async {
+    for (final m in _messages.reversed) {
+      if (m.role == ChatRole.assistant) {
+        await _retry(m);
+        return;
+      }
+    }
   }
 
   Future<void> _editUserMessage(ChatMessage m) async {
@@ -693,97 +936,116 @@ class _ChatPageState extends State<ChatPage> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final empty = _messages.isEmpty && !_busy;
     return Scaffold(
-      appBar: AppBar(
-        title: Text(_conversation.title,
-            maxLines: 1, overflow: TextOverflow.ellipsis),
-        actions: [
-          IconButton(
-            tooltip: '待确认区',
-            icon: const Icon(Icons.fact_check_outlined),
-            onPressed: () async {
-              await Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const ApprovalsPage()),
-              );
-              await _reload();
-            },
-          ),
-          TextButton(
-            onPressed: _busy ? null : _switchModel,
-            child: Text(
-              // task-50：显示接口名称，找不到显示「模型配置已失效」，不显示 id
-              _modelLabel,
-              style: const TextStyle(fontSize: 12),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ],
+      appBar: ChatAppBar(
+        title: _conversation.title,
+        modelLabel: _modelLabel,
+        onModelTap: _switchModel,
+        onRename: _rename,
+        onExport: _export,
+        onClearAndRestart: _clearAndRestart,
+        onDelete: _deleteConversation,
       ),
       body: Column(
         children: [
           Expanded(
-            child: ListView(
-              controller: _scroll,
-              padding: const EdgeInsets.all(12),
-              children: [
-                for (final m in _messages) ..._buildMessage(m, cs),
-                if (_busy) _buildStreaming(cs),
-                if (_errorText != null) _buildError(cs),
-              ],
-            ),
+            child: empty ? _buildEmpty(cs) : _buildMessageList(cs),
           ),
           // F03 Step2（2026-11-03）：草稿含图片时显示「单张成条 + 敏感信息离设备」提示。
           if (_hasScreenshotAttachments) _buildScreenshotsHint(cs),
-          if (_pendingAttachments.isNotEmpty) _buildAttachmentBar(cs),
-          _buildInputBar(cs),
+          ChatInputBar(
+            controller: _input,
+            busy: _busy,
+            attachments: _pendingAttachments,
+            metaOf: _metaOf,
+            onRemoveAttachment: _removeAttachment,
+            onAddAttachments: _pickAttachments,
+            onPickScreenshots: _pickScreenshots,
+            onSend: _send,
+            onCancel: _cancel,
+          ),
         ],
       ),
     );
   }
 
-  /// 气泡装饰（2026-11-01 视觉统一）：用户 = 实心 primary 圆角泡
-  /// （右下小角），Agent = surfaceContainerHigh 描边泡（左下小角）。
-  BoxDecoration _bubbleDecoration(bool isUser, ColorScheme cs) =>
-      BoxDecoration(
-        color: isUser ? cs.primary : cs.surfaceContainerHigh,
-        borderRadius: BorderRadius.only(
-          topLeft: const Radius.circular(16),
-          topRight: const Radius.circular(16),
-          bottomLeft: Radius.circular(isUser ? 16 : 4),
-          bottomRight: Radius.circular(isUser ? 4 : 16),
+  /// 空态（§3.8）：引导语 + 情境化建议 chips。
+  Widget _buildEmpty(ColorScheme cs) {
+    return Column(
+      children: [
+        const Spacer(),
+        Icon(Icons.smart_toy_outlined, size: 48, color: cs.onSurfaceVariant),
+        const SizedBox(height: 12),
+        Text('有什么可以帮你？',
+            style: TextStyle(fontSize: 16, color: cs.onSurfaceVariant)),
+        const SizedBox(height: 16),
+        if (_suggestions.isNotEmpty)
+          SuggestionChips(
+            prompts: _suggestions,
+            onPick: (p) {
+              _input.text = p;
+              _send();
+            },
+          ),
+        const Spacer(flex: 2),
+      ],
+    );
+  }
+
+  Widget _buildMessageList(ColorScheme cs) {
+    return ListView(
+      controller: _scroll,
+      padding: const EdgeInsets.all(12),
+      children: [
+        for (final m in _messages) ..._buildMessage(m, cs),
+        if (_busy) _buildStreaming(cs),
+        if (_errorText != null) _buildError(cs),
+      ],
+    );
+  }
+
+  /// 用户 pill 装饰：实心 primary 圆角泡（右下小角）。
+  /// 助理消息为全宽时间线，不再用气泡（assistant-v4-ui §3.3）。
+  BoxDecoration _userPillDecoration(ColorScheme cs) => BoxDecoration(
+        color: cs.primary,
+        borderRadius: const BorderRadius.only(
+          topLeft: Radius.circular(16),
+          topRight: Radius.circular(16),
+          bottomLeft: Radius.circular(16),
+          bottomRight: Radius.circular(4),
         ),
-        border: isUser ? null : Border.all(color: cs.outlineVariant),
       );
 
-  /// 气泡最大宽度：不超过屏宽 82%（小屏不溢出，大屏不拉满）。
-  double _bubbleMaxWidth(BuildContext context) =>
+  /// 用户 pill 最大宽度：不超过屏宽 82%（小屏不溢出，大屏不拉满）。
+  double _pillMaxWidth(BuildContext context) =>
       (MediaQuery.of(context).size.width * 0.82).clamp(0.0, 560.0);
 
-  static String _fmtTime(int ms) {
+  static String _fmtFullTime(int ms) {
     final d = DateTime.fromMillisecondsSinceEpoch(ms);
     String two(int v) => v.toString().padLeft(2, '0');
-    return '${two(d.hour)}:${two(d.minute)}';
+    return '${d.year}-${two(d.month)}-${two(d.day)} '
+        '${two(d.hour)}:${two(d.minute)}';
   }
 
   /// Agent 正文：Markdown 渲染（代码块/引用/列表）；用户消息保持纯文本。
   Widget _messageText(BuildContext context, ChatMessage m, ColorScheme cs) {
     if (m.role == ChatRole.user) {
       return Text(m.content,
-          style: TextStyle(fontSize: 15, height: 1.4, color: cs.onPrimary));
+          style: TextStyle(fontSize: 16, height: 1.5, color: cs.onPrimary));
     }
     return MarkdownBody(
       data: m.content,
       selectable: true,
       softLineBreak: true,
       styleSheet: MarkdownStyleSheet(
-        p: TextStyle(fontSize: 15, height: 1.45, color: cs.onSurface),
+        p: TextStyle(fontSize: 16, height: 1.6, color: cs.onSurface),
         h1: TextStyle(
-            fontSize: 18, fontWeight: FontWeight.w700, color: cs.onSurface),
+            fontSize: 20, fontWeight: FontWeight.w700, color: cs.onSurface),
         h2: TextStyle(
-            fontSize: 17, fontWeight: FontWeight.w700, color: cs.onSurface),
+            fontSize: 18, fontWeight: FontWeight.w700, color: cs.onSurface),
         h3: TextStyle(
-            fontSize: 16, fontWeight: FontWeight.w600, color: cs.onSurface),
+            fontSize: 17, fontWeight: FontWeight.w600, color: cs.onSurface),
         code: TextStyle(
           fontFamily: 'monospace',
           fontSize: 13,
@@ -800,7 +1062,7 @@ class _ChatPageState extends State<ChatPage> {
           border: Border(
               left: BorderSide(color: cs.outlineVariant, width: 3)),
         ),
-        listBullet: TextStyle(fontSize: 15, color: cs.onSurface),
+        listBullet: TextStyle(fontSize: 16, color: cs.onSurface),
         tableBorder: TableBorder.all(color: cs.outlineVariant),
         horizontalRuleDecoration: BoxDecoration(
           border: Border(top: BorderSide(color: cs.outlineVariant)),
@@ -812,7 +1074,7 @@ class _ChatPageState extends State<ChatPage> {
   List<Widget> _buildMessage(ChatMessage m, ColorScheme cs) {
     final isUser = m.role == ChatRole.user;
     final isTool = m.role == ChatRole.tool;
-    // 工具消息：渲染为可展开/收起的工具块（历史默认收起）
+    // 工具消息：渲染为可展开/收起的工具块（历史默认收起），全宽
     if (isTool) {
       final failed = m.content.startsWith('一个动作未能理解');
       final seg = ChatStreamSegment(
@@ -826,73 +1088,73 @@ class _ChatPageState extends State<ChatPage> {
         ..detail = m.content
         ..expanded = _expandedToolMsgIds.contains(m.id);
       return [
-        Align(
-          alignment: Alignment.centerLeft,
-          child: ConstrainedBox(
-            constraints:
-                BoxConstraints(maxWidth: _bubbleMaxWidth(context)),
-            child: ToolCallBlock(
-              segment: seg,
-              onToggle: () => setState(() {
-                if (!_expandedToolMsgIds.remove(m.id)) {
-                  _expandedToolMsgIds.add(m.id);
-                }
-              }),
-            ),
-          ),
+        ToolCallBlock(
+          segment: seg,
+          onToggle: () => setState(() {
+            if (!_expandedToolMsgIds.remove(m.id)) {
+              _expandedToolMsgIds.add(m.id);
+            }
+          }),
         ),
       ];
     }
-    final widgets = <Widget>[
-      Align(
-        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+    final widgets = <Widget>[];
+    if (isUser) {
+      // 用户消息：右对齐 pill；附件卡栈在 pill 下方独立成行
+      widgets.add(Align(
+        alignment: Alignment.centerRight,
         child: GestureDetector(
-          // 回合进行中禁操作（重试/编辑/撤回都要先等回合落定）
-          onLongPress:
-              _busy ? null : () => _showMessageActions(m),
+          onLongPress: () => _showMessageActions(m),
           child: Container(
-            margin: const EdgeInsets.symmetric(vertical: 3),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            constraints:
-                BoxConstraints(maxWidth: _bubbleMaxWidth(context)),
-            decoration: _bubbleDecoration(isUser, cs),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (m.content.isNotEmpty) _messageText(context, m, cs),
-                if (m.status == ChatMessageStatus.error)
-                  Text('（本回合出错）',
-                      style: TextStyle(fontSize: 11, color: cs.error)),
-                if (m.attachments.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: AttachmentCardStack(
-                      attachments: m.attachments,
-                      metaOf: _metaOf,
-                    ),
-                  ),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Text(
-                      _fmtTime(m.createdAt),
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: isUser
-                            ? cs.onPrimary.withValues(alpha: 0.7)
-                            : cs.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            margin: const EdgeInsets.symmetric(vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            constraints: BoxConstraints(maxWidth: _pillMaxWidth(context)),
+            decoration: _userPillDecoration(cs),
+            child: m.content.isNotEmpty
+                ? _messageText(context, m, cs)
+                : const SizedBox.shrink(),
           ),
         ),
-      ),
-    ];
+      ));
+      if (m.attachments.isNotEmpty) {
+        widgets.add(Align(
+          alignment: Alignment.centerRight,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: _pillMaxWidth(context)),
+            child: AttachmentCardStack(
+              attachments: m.attachments,
+              metaOf: _metaOf,
+            ),
+          ),
+        ));
+      }
+    } else {
+      // 助理消息：全宽时间线，无气泡
+      widgets.add(GestureDetector(
+        onLongPress: () => _showMessageActions(m),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (m.content.isNotEmpty) _messageText(context, m, cs),
+              if (m.status == ChatMessageStatus.error)
+                Text('（本回合出错）',
+                    style: TextStyle(fontSize: 11, color: cs.error)),
+              if (m.attachments.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: AttachmentCardStack(
+                    attachments: m.attachments,
+                    metaOf: _metaOf,
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ));
+    }
     // 提案卡片内联：挂在产出它们的 assistant 消息后面
     final proposals = _proposalsByBatch[m.id];
     if (proposals != null) {
@@ -918,7 +1180,7 @@ class _ChatPageState extends State<ChatPage> {
 
   /// 流式区：按分段渲染——思考块/工具块（状态 + 可展开收起）、
   /// 正文段直接显示（淡入 + 按住末尾两词）；活动中的尾部文本段
-  /// 末尾挂呼吸圆点光标，最后一段不是正文时光标单独成行。
+  /// 末尾挂呼吸圆点光标。全宽时间线（与落定的助理消息同一形态）。
   Widget _buildStreaming(ColorScheme cs) {
     ChatStreamSegment? lastText;
     for (final s in _segments.reversed) {
@@ -928,168 +1190,68 @@ class _ChatPageState extends State<ChatPage> {
       }
     }
     final cursorInText = lastText != null && lastText.active;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 3),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        constraints: BoxConstraints(maxWidth: _bubbleMaxWidth(context)),
-        decoration: _bubbleDecoration(false, cs),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (final seg in _segments)
-              switch (seg.kind) {
-                ChatStreamSegmentKind.text => FadeInStreamingText(
-                    text: seg.text,
-                    settled: !seg.active,
-                    showCursor: identical(seg, lastText) && cursorInText,
-                  ),
-                ChatStreamSegmentKind.thinking => ThinkingBlock(
-                    segment: seg,
-                    onToggle: () =>
-                        setState(() => seg.expanded = !seg.expanded),
-                  ),
-                ChatStreamSegmentKind.tool => ToolCallBlock(
-                    segment: seg,
-                    onToggle: () =>
-                        setState(() => seg.expanded = !seg.expanded),
-                  ),
-              },
-            // 回合进行中但尾部不是正文段（思考中/工具中/等首个 token）：
-            // 光标单独成行
-            if (!cursorInText)
-              const Padding(
-                padding: EdgeInsets.only(top: 6, left: 2),
-                child: BreathingDot(),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildError(ColorScheme cs) => Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: cs.errorContainer,
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Row(
-          children: [
-            Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text('回合出错：$_errorText',
-                  style:
-                      TextStyle(fontSize: 12, color: cs.onErrorContainer)),
-            ),
-          ],
-        ),
-      );
-
-  Widget _buildAttachmentBar(ColorScheme cs) {
-    return Container(
-      height: 44,
-      decoration: BoxDecoration(
-        border: Border(top: BorderSide(color: cs.outlineVariant)),
-      ),
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          for (final a in _pendingAttachments)
-            Padding(
-              padding: const EdgeInsets.only(right: 6),
-              child: InputChip(
-                avatar: Icon(_metaOf(a)?.icon ?? Icons.attach_file,
-                    size: 16),
-                label: Text(_metaOf(a)?.title ?? '${a.type}:${_short(a.id)}',
-                    style: const TextStyle(fontSize: 11)),
-                visualDensity: VisualDensity.compact,
-                side: BorderSide(color: cs.outlineVariant),
-                onDeleted: () {
-                  setState(() => _pendingAttachments.remove(a));
-                  AppDatabase.instance.setConversationDraftAttachments(
-                      _conversation.id, _pendingAttachments);
-                },
-              ),
+          for (final seg in _segments)
+            switch (seg.kind) {
+              ChatStreamSegmentKind.text => FadeInStreamingText(
+                  text: seg.text,
+                  settled: !seg.active,
+                  showCursor: identical(seg, lastText) && cursorInText,
+                ),
+              ChatStreamSegmentKind.thinking => ThinkingBlock(
+                  segment: seg,
+                  onToggle: () =>
+                      setState(() => seg.expanded = !seg.expanded),
+                ),
+              ChatStreamSegmentKind.tool => ToolCallBlock(
+                  segment: seg,
+                  onToggle: () =>
+                      setState(() => seg.expanded = !seg.expanded),
+                ),
+            },
+          // 回合进行中但尾部不是正文段（思考中/工具中/等首个 token）：
+          // 光标单独成行
+          if (!cursorInText)
+            const Padding(
+              padding: EdgeInsets.only(top: 6, left: 2),
+              child: BreathingDot(),
             ),
         ],
       ),
     );
   }
 
-  Widget _buildInputBar(ColorScheme cs) {
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Expanded(
-              child: Container(
-                decoration: BoxDecoration(
-                  color: cs.surfaceContainerHigh,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(color: cs.outlineVariant),
-                ),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    IconButton(
-                      tooltip: '添加附件（笔记/消息/文件）',
-                      visualDensity: VisualDensity.compact,
-                      icon: Icon(Icons.attach_file,
-                          size: 20, color: cs.onSurfaceVariant),
-                      onPressed: _busy ? null : _pickAttachments,
-                    ),
-                    // F03 Step1（2026-11-03）：相册多选截图，逐张入库后进草稿附件。
-                    IconButton(
-                      tooltip: '从相册选截图（每批最多 $maxScreenshotsPerBatch 张）',
-                      visualDensity: VisualDensity.compact,
-                      icon: Icon(Icons.photo_library_outlined,
-                          size: 20, color: cs.onSurfaceVariant),
-                      onPressed: _busy ? null : _pickScreenshots,
-                    ),
-                    Expanded(
-                      child: TextField(
-                        controller: _input,
-                        minLines: 1,
-                        maxLines: 4,
-                        decoration: const InputDecoration(
-                          hintText: '和助理说点什么…',
-                          isDense: true,
-                          border: InputBorder.none,
-                          contentPadding:
-                              EdgeInsets.symmetric(vertical: 10),
-                        ),
-                        onSubmitted: (_) => _send(),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+  Widget _buildError(ColorScheme cs) {
+    final canRetry =
+        _messages.any((m) => m.role == ChatRole.assistant);
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: cs.errorContainer,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('回合出错：$_errorText',
+                style:
+                    TextStyle(fontSize: 12, color: cs.onErrorContainer)),
+          ),
+          if (canRetry)
+            TextButton(
+              onPressed: _busy ? null : _retryLast,
+              child: const Text('重试'),
             ),
-            const SizedBox(width: 8),
-            // 回合中发送键变停止键（同一位置，避免布局跳动）
-            IconButton.filled(
-              tooltip: _busy ? '取消' : '发送',
-              style: IconButton.styleFrom(
-                backgroundColor: _busy ? cs.error : cs.primary,
-                foregroundColor: _busy ? cs.onError : cs.onPrimary,
-              ),
-              icon: Icon(_busy ? Icons.stop : Icons.send, size: 20),
-              onPressed: _busy ? _cancel : _send,
-            ),
-          ],
-        ),
+        ],
       ),
     );
   }
-
-  static String _short(String id) => id.length <= 6 ? id : id.substring(0, 6);
 }
