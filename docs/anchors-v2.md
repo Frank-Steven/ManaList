@@ -36,7 +36,7 @@
 - 基数约束不变：一个锚点连一个任务，一个任务可被多个锚点连接；删除任务级联删锚点行（无需残迹化——正文里没有东西可清理）；删除对象级联删其锚点。
 - `label` 字段保留（提案卡片与列表展示用），但不再承担残迹化职责。
 
-DDL 变化（v8 → v11 迁移时一并调整）：无新增列；`target_type` 注释语义更新为 `'message' | 'chapter' | 'file'`。
+DDL 变化（v8 → v12 迁移时一并调整）：无新增列；`target_type` 注释语义更新为 `'message' | 'chapter' | 'file'`。
 
 ## 3. 展示与交互
 
@@ -63,7 +63,7 @@ DDL 变化（v8 → v11 迁移时一并调整）：无新增列；`target_type` 
 
 ## 5. 废弃清单（实现层）
 
-随 v11 一并移除/改写：
+随 v12 一并移除/改写：
 
 - `TaskAnchorInlineSyntax`、`MarkdownElementBuilder` 锚点 chip 分支、`AnchorHighlightController`、`AnchoredMarkdownBody` 中的 marker 渲染（组件本身保留给 markdown 正文渲染，去掉锚点职责）；
 - `stripAnchorMarkers` 及三处调用点审计（`content_hash` 恢复为对原文直接计算）；`computeContentHash` 相关防御性剥离测试删除；
@@ -71,12 +71,14 @@ DDL 变化（v8 → v11 迁移时一并调整）：无新增列；`target_type` 
 - 存档格式：正文不再含 marker，`anchors.json` 照常导出；导入的「marker 一致性校验」步骤删除；
 - 测试替换：`anchor_syntax_test` / `content_hash_marker_test` 删除；`anchor_service_test` 改写为对象级 CRUD + 级联删除 + OR-Set 并发语义（见 `docs/crdt.md` §4.3）。
 
-## 6. v11 迁移（行内 marker → 对象级锚点）
+## 6. v12 迁移（行内 marker → 对象级锚点）
+
+> 2026-11-08：v11 已被批次 D 的 `conversations.pinned` 占用，本节迁移顺延至 v12，与 `crdt.md` §7 同窗口。
 
 1. 扫描 `messages` / `notes` 正文，剥离全部 `⟦task:<id>⟧` marker（纯文本替换，正文恢复原貌）；
 2. 每条被剥离的 marker 转为对象级锚点行：所在消息 → `target_type='message', target_id=messages.id`；所在笔记 → 其所属章节 `target_type='chapter', target_id=chapters.id`（同一对象多个 marker 去重为一条，保留最早 `created_at`）；
 3. 受影响消息的 `content_hash` 按原文明文重算更新；
-4. 迁移测试：`db_v11_migration_test.dart`——marker 剥离幂等、锚点转换去重、哈希与重投去重一致、无 marker 数据原样通过。
+4. 迁移测试：`db_v12_migration_test.dart`——marker 剥离幂等、锚点转换去重、哈希与重投去重一致、无 marker 数据原样通过。
 
 ## 7. 与 CRDT 的关系
 

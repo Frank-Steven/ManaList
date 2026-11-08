@@ -102,4 +102,50 @@ void main() {
     });
     expect((await db.query('files')).single['folder'], '');
   });
+
+  group('v11：conversations.pinned（对话置顶，v4 批次 D）', () {
+    test('v10 老表迁移后加列，存量行默认未置顶', () async {
+      await createV8ShapeTables(db);
+      await migrateToV9(db);
+      await migrateToV10(db);
+      await db.insert('conversations', {
+        'id': 'c1',
+        'title': '对话',
+        'draft_attachments': '[]',
+        'created_at': 1000,
+        'updated_at': 1000,
+      });
+
+      await migrateToV11(db);
+
+      expect(await columnNames(db, 'conversations'), contains('pinned'));
+      expect((await db.query('conversations')).single['pinned'], 0,
+          reason: '存量对话默认未置顶');
+    });
+
+    test('迁移幂等：列已存在时安全空转（含 createV8Tables 新表路径）', () async {
+      await createV8ShapeTables(db);
+      await migrateToV9(db);
+      await migrateToV11(db);
+      await migrateToV11(db);
+      expect(
+          (await columnNames(db, 'conversations'))
+              .where((c) => c == 'pinned')
+              .length,
+          1);
+
+      // 初始建表已带 pinned 时迁移是 no-op（与 _onCreate 路径收敛）
+      final db2 =
+          await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      addTearDown(db2.close);
+      await createV8Tables(db2);
+      expect(await columnNames(db2, 'conversations'), contains('pinned'));
+      await migrateToV11(db2);
+      expect(
+          (await columnNames(db2, 'conversations'))
+              .where((c) => c == 'pinned')
+              .length,
+          1);
+    });
+  });
 }

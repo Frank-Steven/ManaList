@@ -41,6 +41,12 @@ class ChatInputBar extends StatefulWidget {
   final VoidCallback onSend;
   final VoidCallback onCancel;
 
+  /// 草稿附件的 token 估算合计（预算条，§3.6）；null 不渲染预算条。
+  final int? attachmentTokens;
+
+  /// 模型上下文上限（token）；无数据时按 32k。
+  final int tokenLimit;
+
   const ChatInputBar({
     super.key,
     required this.controller,
@@ -52,6 +58,8 @@ class ChatInputBar extends StatefulWidget {
     required this.onPickScreenshots,
     required this.onSend,
     required this.onCancel,
+    this.attachmentTokens,
+    this.tokenLimit = kDefaultContextTokenLimit,
   });
 
   @override
@@ -125,25 +133,77 @@ class _ChatInputBarState extends State<ChatInputBar> {
       decoration: BoxDecoration(
         border: Border(top: BorderSide(color: cs.outlineVariant)),
       ),
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(
         children: [
-          for (final a in widget.attachments)
-            Padding(
-              padding: const EdgeInsets.only(right: 6),
-              child: InputChip(
-                avatar:
-                    Icon(widget.metaOf(a)?.icon ?? Icons.attach_file, size: 16),
-                label: Text(
-                    widget.metaOf(a)?.title ?? a.id,
-                    style: const TextStyle(fontSize: 11)),
-                visualDensity: VisualDensity.compact,
-                side: BorderSide(color: cs.outlineVariant),
-                onDeleted: () => widget.onRemoveAttachment(a),
+          Expanded(
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              children: [
+                for (final a in widget.attachments)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: InputChip(
+                      avatar: Icon(
+                          widget.metaOf(a)?.icon ?? Icons.attach_file,
+                          size: 16),
+                      label: Text(
+                          widget.metaOf(a)?.title ?? a.id,
+                          style: const TextStyle(fontSize: 11)),
+                      visualDensity: VisualDensity.compact,
+                      side: BorderSide(color: cs.outlineVariant),
+                      onDeleted: () => widget.onRemoveAttachment(a),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          if (widget.attachmentTokens != null) _buildBudgetBar(cs),
+        ],
+      ),
+    );
+  }
+
+  /// 预算条（§3.6）：48 宽细条 + 百分比；≤80% 灰、>80% amber、
+  /// >100% 红且发送键禁用。
+  Widget _buildBudgetBar(ColorScheme cs) {
+    final used = widget.attachmentTokens!;
+    final level = budgetLevel(used, widget.tokenLimit);
+    final pct = widget.tokenLimit > 0
+        ? (used / widget.tokenLimit * 100).clamp(0, 999).round()
+        : 0;
+    final color = switch (level) {
+      BudgetLevel.normal => cs.onSurfaceVariant,
+      BudgetLevel.warning => Colors.amber.shade800,
+      BudgetLevel.over => cs.error,
+    };
+    return Tooltip(
+      message: level == BudgetLevel.over
+          ? '附件超出模型上下文，请移除部分附件'
+          : '附件约占上下文 $pct%（≈$used / ${widget.tokenLimit} tokens）',
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            SizedBox(
+              width: 48,
+              child: LinearProgressIndicator(
+                value: widget.tokenLimit > 0
+                    ? (used / widget.tokenLimit).clamp(0.0, 1.0)
+                    : 0,
+                minHeight: 4,
+                borderRadius: BorderRadius.circular(2),
+                color: color,
+                backgroundColor: cs.surfaceContainerHighest,
               ),
             ),
-        ],
+            const SizedBox(height: 2),
+            Text('$pct%',
+                style: TextStyle(
+                    fontSize: 10, color: color, fontFeatures: const [])),
+          ],
+        ),
       ),
     );
   }
@@ -209,23 +269,34 @@ class _ChatInputBarState extends State<ChatInputBar> {
                   ),
                 ),
                 const SizedBox(width: 8),
-                // 回合中发送键变停止键（同一位置，避免布局跳动）
-                IconButton.filled(
-                  tooltip: widget.busy ? '取消' : '发送',
-                  style: IconButton.styleFrom(
-                    backgroundColor:
-                        widget.busy ? cs.error : cs.primary,
-                    foregroundColor:
-                        widget.busy ? cs.onError : cs.onPrimary,
-                  ),
-                  icon: Icon(widget.busy ? Icons.stop : Icons.send, size: 20),
-                  onPressed: widget.busy ? widget.onCancel : widget.onSend,
-                ),
+                // 回合中发送键变停止键（同一位置，避免布局跳动）；
+                // 附件超预算时发送禁用并提示（§3.6 预算规则拦截）
+                _buildSendButton(cs),
               ],
             ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildSendButton(ColorScheme cs) {
+    final overBudget = !widget.busy &&
+        budgetLevel(widget.attachmentTokens ?? 0, widget.tokenLimit) ==
+            BudgetLevel.over;
+    return IconButton.filled(
+      tooltip: widget.busy
+          ? '取消'
+          : overBudget
+              ? '附件超出模型上下文，请移除部分附件'
+              : '发送',
+      style: IconButton.styleFrom(
+        backgroundColor: widget.busy ? cs.error : cs.primary,
+        foregroundColor: widget.busy ? cs.onError : cs.onPrimary,
+      ),
+      icon: Icon(widget.busy ? Icons.stop : Icons.send, size: 20),
+      onPressed:
+          widget.busy ? widget.onCancel : (overBudget ? null : widget.onSend),
     );
   }
 }

@@ -20,6 +20,9 @@ class Conversation {
   /// 该对话绑定的模型配置（可切换）。
   final String? modelConfigId;
 
+  /// 置顶（DB v11，assistant-v4-ui §2.2）：置顶区排在普通区之前。
+  final bool pinned;
+
   /// 草稿附件（DB v9，conversations.draft_attachments）：库页「发送给助理」
   /// 与对话页附件选择器都写到这里；发送时随消息落 chat_messages.attachments 并清空。
   final List<ChatAttachment> draftAttachments;
@@ -30,6 +33,7 @@ class Conversation {
     required this.id,
     required this.title,
     this.modelConfigId,
+    this.pinned = false,
     this.draftAttachments = const [],
     required this.createdAt,
     required this.updatedAt,
@@ -39,6 +43,8 @@ class Conversation {
         id: row['id'] as String,
         title: row['title'] as String,
         modelConfigId: row['model_config_id'] as String?,
+        // 旧表/测试表可能没有 pinned 列：缺列按未置顶
+        pinned: ((row['pinned'] as num?) ?? 0) != 0,
         draftAttachments: row['draft_attachments'] == null
             ? const []
             : (jsonDecode(row['draft_attachments'] as String) as List)
@@ -52,6 +58,7 @@ class Conversation {
         'id': id,
         'title': title,
         'model_config_id': modelConfigId,
+        'pinned': pinned ? 1 : 0,
         'draft_attachments':
             jsonEncode(draftAttachments.map((e) => e.toJson()).toList()),
         'created_at': createdAt,
@@ -62,6 +69,7 @@ class Conversation {
     String? id,
     String? title,
     String? Function()? modelConfigId,
+    bool? pinned,
     List<ChatAttachment>? draftAttachments,
     int? createdAt,
     int? updatedAt,
@@ -71,10 +79,39 @@ class Conversation {
         title: title ?? this.title,
         modelConfigId:
             modelConfigId != null ? modelConfigId() : this.modelConfigId,
+        pinned: pinned ?? this.pinned,
         draftAttachments: draftAttachments ?? this.draftAttachments,
         createdAt: createdAt ?? this.createdAt,
         updatedAt: updatedAt ?? this.updatedAt,
       );
+}
+
+/// 对话搜索命中（assistant-v4-ui §2.3）：标题命中时 matchedMessageId/snippet
+/// 为 null；正文命中时带命中消息 id 与片段，用于跳转定位与行内高亮。
+class ConversationSearchHit {
+  final Conversation conversation;
+  final String? matchedMessageId;
+  final String? snippet;
+
+  const ConversationSearchHit({
+    required this.conversation,
+    this.matchedMessageId,
+    this.snippet,
+  });
+}
+
+/// 截取命中片段：命中词前后各 radius 字符，被截断的首尾补省略号。
+String makeSearchSnippet(String content, String query, {int radius = 20}) {
+  final idx = content.toLowerCase().indexOf(query.toLowerCase());
+  if (idx < 0) {
+    return content.length <= radius * 2
+        ? content
+        : '${content.substring(0, radius * 2)}…';
+  }
+  final start = (idx - radius).clamp(0, content.length);
+  final end = (idx + query.length + radius).clamp(0, content.length);
+  return '${start > 0 ? '…' : ''}${content.substring(start, end)}'
+      '${end < content.length ? '…' : ''}';
 }
 
 /// 对话内的一条消息（chat_messages 表行）。

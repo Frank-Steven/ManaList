@@ -103,6 +103,7 @@ Future<void> createV8Tables(DatabaseExecutor db) async {
       title TEXT NOT NULL,
       model_config_id TEXT,
       draft_attachments TEXT NOT NULL DEFAULT '[]',
+      pinned INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
@@ -242,6 +243,17 @@ Future<void> migrateToV10(DatabaseExecutor db) async {
       created_at INTEGER NOT NULL
     )
   ''');
+}
+
+/// v10 → v11 迁移：conversations.pinned（对话置顶，assistant-v4 批次 D，
+/// assistant-v4-ui §2.2：置顶区排在普通区之前，区间细分隔线）。
+/// PRAGMA 守卫保证幂等（onCreate 的新表已带该列时跳过）。
+Future<void> migrateToV11(DatabaseExecutor db) async {
+  final cols = await db.rawQuery('PRAGMA table_info(conversations)');
+  if (!cols.any((c) => c['name'] == 'pinned')) {
+    await db.execute(
+        'ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 /// 批量入库的分块大小：SQLite 的绑定变量上限（老版本 999），留足余量。
@@ -391,7 +403,7 @@ class AppDatabase {
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'msgrepo.db'),
-      version: 10,
+      version: 11,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -433,6 +445,10 @@ class AppDatabase {
     if (oldVersion < 10) {
       // v10：library_folders（空文件夹持久化）。
       await migrateToV10(db);
+    }
+    if (oldVersion < 11) {
+      // v11：conversations.pinned（对话置顶，assistant-v4 批次 D）。
+      await migrateToV11(db);
     }
   }
 
@@ -1654,7 +1670,9 @@ class AppDatabase {
 
   Future<List<Conversation>> getConversations() async {
     final db = await database;
-    final rows = await db.query('conversations', orderBy: 'updated_at DESC');
+    // 置顶区在前，区内都按最近更新（assistant-v4-ui §2.2）
+    final rows = await db.query('conversations',
+        orderBy: 'pinned DESC, updated_at DESC');
     return rows.map(Conversation.fromRow).toList();
   }
 
@@ -1672,6 +1690,62 @@ class AppDatabase {
         {'title': title, 'updated_at': DateTime.now().millisecondsSinceEpoch},
         where: 'id = ?',
         whereArgs: [id]);
+  }
+
+  Future<void> setConversationPinned(String id, bool pinned) async {
+    final db = await database;
+    await db.update('conversations', {'pinned': pinned ? 1 : 0},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 每个对话的待审批提案数（assistant-v4-ui §2.2 副标题三态之一）：
+  /// 一条 GROUP BY 查全量，列表页避免逐行 N+1。
+  Future<Map<String, int>> pendingProposalCountsByConversation() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+        "SELECT conversation_id, COUNT(*) AS c FROM change_proposals "
+        "WHERE status = 'pending' AND conversation_id IS NOT NULL "
+        "GROUP BY conversation_id");
+    return {
+      for (final r in rows)
+        r['conversation_id'] as String: (r['c'] as num).toInt(),
+    };
+  }
+
+  /// 对话搜索（assistant-v4-ui §2.3）：标题命中优先，其次消息全文命中
+  /// （带回命中消息与片段，点击进对话后滚动定位）。大小写不敏感走 LIKE。
+  Future<List<ConversationSearchHit>> searchConversations(String query) async {
+    final q = query.trim();
+    if (q.isEmpty) return const [];
+    final db = await database;
+    final like = '%${q.replaceAll('%', '').replaceAll('_', '')}%';
+    final hits = <String, ConversationSearchHit>{};
+    final titleRows = await db.query('conversations',
+        where: 'title LIKE ?', whereArgs: [like]);
+    for (final r in titleRows) {
+      final c = Conversation.fromRow(r);
+      hits[c.id] = ConversationSearchHit(conversation: c);
+    }
+    final msgRows = await db.rawQuery(
+        'SELECT m.id AS mid, m.content AS content, m.conversation_id AS cid '
+        'FROM chat_messages m WHERE m.content LIKE ? '
+        'ORDER BY m.created_at DESC',
+        [like]);
+    for (final r in msgRows) {
+      final cid = r['cid'] as String;
+      if (hits.containsKey(cid)) continue; // 标题命中优先
+      final convRow = await db.query('conversations',
+          where: 'id = ?', whereArgs: [cid], limit: 1);
+      if (convRow.isEmpty) continue;
+      final content = r['content'] as String;
+      hits[cid] = ConversationSearchHit(
+        conversation: Conversation.fromRow(convRow.first),
+        matchedMessageId: r['mid'] as String,
+        snippet: makeSearchSnippet(content, q),
+      );
+      if (hits.length >= 50) break; // 结果上限，防止全文 LIKE 扫出超大列表
+    }
+    return hits.values.toList();
   }
 
   Future<void> setConversationModel(String id, String? modelConfigId) async {

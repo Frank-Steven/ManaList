@@ -15,11 +15,34 @@ class AttachmentMeta {
   /// file 类型附件的库实体（媒体预览/文件块用），其余类型为 null。
   final LibraryFile? file;
 
+  /// 正文字符数估算（token 预算条用，assistant-v4-ui §3.6）：
+  /// 消息 = body 长度，笔记 = content 长度，文件 = 字节数（文本文件近似）；
+  /// 对象已被删除/不可读时为 null（按 0 计）。
+  final int? chars;
+
   const AttachmentMeta({
     required this.title,
     required this.icon,
     this.file,
+    this.chars,
   });
+}
+
+/// token 估算（§3.6）：字符数 / 2（CJK 保守估计）。
+int estimateTokensFromChars(int chars) => (chars / 2).ceil();
+
+/// 附件预算档（§3.6）：≤80% 灰、>80% amber、>100% 红且禁用发送。
+enum BudgetLevel { normal, warning, over }
+
+/// 模型上下文上限缺省值：模型配置无数据时按 32k（§3.6）。
+const int kDefaultContextTokenLimit = 32768;
+
+BudgetLevel budgetLevel(int usedTokens, int limitTokens) {
+  if (limitTokens <= 0 || usedTokens <= 0) return BudgetLevel.normal;
+  final ratio = usedTokens / limitTokens;
+  if (ratio > 1) return BudgetLevel.over;
+  if (ratio > 0.8) return BudgetLevel.warning;
+  return BudgetLevel.normal;
 }
 
 String formatAttachmentSize(int? bytes) {

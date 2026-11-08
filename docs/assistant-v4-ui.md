@@ -276,7 +276,7 @@ AppBar「模型」（选择模式时标题「本对话模型」）
 
 ### 5.3 诊断共享
 
-端点最近一次失败原因持久化（`AiEndpoint` 加 `last_error`/`last_latency` 字段，v11 迁移）：选择器行、对话页错误横幅、配置向导显示同一份；对话页回合错误时横幅文案可直接引用（「该端点上次测试：401 密钥无效」）。
+端点最近一次失败原因持久化（`AiEndpoint` 加 `lastError`/`lastLatencyMs` 字段，存 SharedPreferences JSON、无 DB 迁移）：选择器行、对话页错误横幅、配置向导显示同一份；对话页回合错误时横幅文案可直接引用（「该端点上次测试：401 密钥无效」）。
 
 ## 6. 附件选择器（attachment_picker）
 
@@ -323,7 +323,7 @@ AppBar「模型」（选择模式时标题「本对话模型」）
 | `model_picker.dart` | §5 全部（向导拆 `model_setup_wizard.dart`） |
 | `attachment_picker.dart` | §6 三点 |
 | `widgets/attachment_cards.dart` | 附件卡栈外置用户 pill（§3.3）；「已附加」角标 |
-| DB v11 | `conversations.pinned`、`AiEndpoint.last_error/last_latency`（与 `anchors-v2.md`/`crdt.md` 的 v11 同批） |
+| DB v11 | `conversations.pinned`（✅ 已随批次 D 落地）；`AiEndpoint.last_error/last_latency` 为 SharedPreferences JSON 字段（批次 C 已落地，无需 DB 迁移）。`anchors-v2.md`/`crdt.md` 的迁移顺延至 v12，随批次 A 同窗口 |
 
 ## 9. 验收清单
 

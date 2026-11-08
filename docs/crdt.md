@@ -127,13 +127,15 @@ SSA（`assistant.md` §7.1）保持不动：**正文本体不可变**。在此�
 | 审批 12 条 inbox.triage 提案中的任意 5 条 | 依赖「二次校验」逐个赌运气 | 每条独立裁决，顺序无关 |
 | 助理提案删除任务 T，人刚把 T 标记完成 | failed 或误删 | LWW 墓碑比较 lamport：完成在后 → 删除提案 superseded 并提示 |
 
-## 7. 实施与迁移（DB v11 增量）
+## 7. 实施与迁移（DB v12 增量）
+
+> 2026-11-08：v11 已被批次 D 的 `conversations.pinned` 占用，本节顺延至 v12。
 
 1. 新增 `op_log` 表（§2.2 结构）+ `change_proposals.status` 枚举加 `superseded` + payload 加 `base` 字段约定；
 2. 写路径改造：`proposal_executor` 三态裁决管线（§3.2）；人工写路径（任务编辑、完成勾选、锚点增删、优先级标记）统一经 `OpService.apply(op)` 落 log + 更新物化表（先行双写，物化表仍是读路径）；
 3. `UndoService` 换底为逆 op；
-4. 迁移：现有物化表状态视为「lamport=0 的初始折叠」，不补历史 op；`anchors-v2.md` §6 的 v11 锚点迁移与本表同批进行；
-5. 测试：`crdt_merge_test`（LWW/OR-Set/追加集纯函数性质：交换、结合、幂等）、`proposal_rebase_test`（三态裁决全分支）、`undo_inverse_op_test`（撤销与并发交叉）、`db_v11_migration_test`。
+4. 迁移：现有物化表状态视为「lamport=0 的初始折叠」，不补历史 op；`anchors-v2.md` §6 的锚点迁移与本表同批进行；
+5. 测试：`crdt_merge_test`（LWW/OR-Set/追加集纯函数性质：交换、结合、幂等）、`proposal_rebase_test`（三态裁决全分支）、`undo_inverse_op_test`（撤销与并发交叉）、`db_v12_migration_test`。
 
 ## 8. 不变量重申
 

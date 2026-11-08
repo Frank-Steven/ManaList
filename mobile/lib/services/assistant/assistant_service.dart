@@ -20,6 +20,13 @@ sealed class AssistantEvent {
   const AssistantEvent();
 }
 
+/// 首条用户消息派生对话标题（design-v3 §1.4 / assistant-v4-ui §9 验收）：
+/// 去首尾空白，超 20 字截断加省略号。纯函数便于单测。
+String deriveConversationTitle(String firstMessage) {
+  final t = firstMessage.trim();
+  return t.length > 20 ? '${t.substring(0, 20)}…' : t;
+}
+
 /// 可见文本增量（工具块内容不含在内）。
 class AssistantTextDelta extends AssistantEvent {
   final String delta;
@@ -118,6 +125,9 @@ class AssistantTurnHandle {
 
   /// 当前阶段（对话列表指示用）。
   final ValueNotifier<TurnPhase> phase = ValueNotifier(TurnPhase.starting);
+
+  /// 回合开始时间（对话列表副标题「思考中 12s」的秒数来源，assistant-v4-ui §2.2）。
+  final DateTime startedAt = DateTime.now();
 
   /// 本回合的独立通道（取消时中断其 SSE）。
   late final AssistantClient channel;
@@ -421,10 +431,11 @@ class AssistantService {
     await db.insertChatMessage(userMsg);
     // 首条用户消息截断生成对话标题（design-v3 §1.4）
     if (conversation.title == '新对话') {
-      final title = handle.text.trim();
-      await db.renameConversation(
-          conversation.id,
-          title.length > 20 ? '${title.substring(0, 20)}…' : title);
+      final title = deriveConversationTitle(handle.text);
+      // 纯附件回合没有文本：保留「新对话」，等第一条有文本的消息再命名
+      if (title.isNotEmpty) {
+        await db.renameConversation(conversation.id, title);
+      }
     }
     await db.touchConversation(conversation.id);
 

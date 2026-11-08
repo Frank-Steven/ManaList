@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,7 +6,6 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../models/conversation.dart';
-import '../../models/library_file.dart';
 import '../../models/message.dart';
 import '../../services/assistant/assistant_service.dart';
 import '../../services/assistant/models.dart';
@@ -20,6 +18,7 @@ import '../library/files_page.dart' show libraryFileIcon;
 import 'approvals_page.dart';
 import 'model_picker.dart';
 import 'attachment_picker.dart';
+import 'conversation_export.dart';
 import 'widgets/attachment_cards.dart';
 import 'widgets/chat_appbar.dart';
 import 'widgets/input_bar.dart';
@@ -64,7 +63,12 @@ String screenshotsConventionHint() =>
 class ChatPage extends StatefulWidget {
   final Conversation conversation;
 
-  const ChatPage({super.key, required this.conversation});
+  /// 搜索定位（assistant-v4-ui §2.3）：从对话列表搜索结果进入时，
+  /// 首帧后滚动到该消息并高亮。
+  final String? initialScrollToMessageId;
+
+  const ChatPage(
+      {super.key, required this.conversation, this.initialScrollToMessageId});
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -73,6 +77,11 @@ class ChatPage extends StatefulWidget {
 class _ChatPageState extends State<ChatPage> {
   final _input = TextEditingController();
   final _scroll = ScrollController();
+
+  /// 搜索定位目标（§2.3）：非 null 时在消息流里高亮该条并滚动到位。
+  String? _searchHitMessageId;
+  final _searchHitKey = GlobalKey();
+  bool _searchHitScrolled = false;
 
   List<ChatMessage> _messages = [];
 
@@ -121,6 +130,7 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     _conversation = widget.conversation;
+    _searchHitMessageId = widget.initialScrollToMessageId;
     _reload();
     // task-50：模型名称异步解析，不阻塞首帧
     unawaited(_refreshModelDisplayName());
@@ -163,7 +173,7 @@ class _ChatPageState extends State<ChatPage> {
       }
     });
     await _resolveAttachmentMeta();
-    _scrollToBottom();
+    if (!_maybeScrollToSearchHit()) _scrollToBottom();
     // task-50：模型可能被切换过，重新解析显示名（异步，不影响列表渲染）
     unawaited(_refreshModelDisplayName());
     // 空对话：按真实数据生成建议 chips（§3.8）
@@ -276,20 +286,37 @@ class _ChatPageState extends State<ChatPage> {
               ? libraryFileIcon(f)
               : Icons.insert_drive_file_outlined,
           file: f,
+          // 文本文件按字节数近似字符数（预算条保守估算）
+          chars: f?.size,
         );
       case ChatAttachmentType.note:
         final n = await db.getNoteById(a.id);
         return AttachmentMeta(
-            title: n?.title ?? '笔记', icon: Icons.note_outlined);
+            title: n?.title ?? '笔记',
+            icon: Icons.note_outlined,
+            chars: n?.content.length);
       default:
         final m = await db.getMessageById(a.id);
         return AttachmentMeta(
-            title: m?.title ?? '消息', icon: Icons.mail_outline);
+            title: m?.title ?? '消息',
+            icon: Icons.mail_outline,
+            chars: m == null ? null : m.title.length + m.body.length);
     }
   }
 
   AttachmentMeta? _metaOf(ChatAttachment a) =>
       _attachmentMeta['${a.type}:${a.id}'];
+
+  /// 草稿附件的 token 估算合计（assistant-v4-ui §3.6 预算条）：
+  /// 字符数/2（CJK 保守估计）；元数据未解析或对象已删的按 0 计。
+  int get _pendingAttachmentTokens {
+    var sum = 0;
+    for (final a in _pendingAttachments) {
+      final chars = _metaOf(a)?.chars;
+      if (chars != null) sum += estimateTokensFromChars(chars);
+    }
+    return sum;
+  }
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -297,6 +324,25 @@ class _ChatPageState extends State<ChatPage> {
         _scroll.jumpTo(_scroll.position.maxScrollExtent);
       }
     });
+  }
+
+  /// 搜索定位（§2.3）：命中消息在列表里时接管首屏滚动，滚动到该条。
+  /// 返回 true 表示已接管（不再滚到底）。
+  bool _maybeScrollToSearchHit() {
+    final id = _searchHitMessageId;
+    if (id == null || _searchHitScrolled) return false;
+    if (!_messages.any((m) => m.id == id)) return false;
+    _searchHitScrolled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _searchHitKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(ctx,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOutCubic,
+            alignment: 0.2);
+      }
+    });
+    return true;
   }
 
   Future<void> _pickAttachments() async {
@@ -447,35 +493,9 @@ class _ChatPageState extends State<ChatPage> {
 
   /// 导出对话为 markdown 文件（落文件区，note_export 来源）。
   Future<void> _export() async {
-    final buf = StringBuffer()
-      ..writeln('# ${_conversation.title}')
-      ..writeln()
-      ..writeln('> 导出自 ManaList 助理对话 · 模型：$_modelLabel')
-      ..writeln();
-    for (final m in _messages) {
-      final who = m.role == ChatRole.user
-          ? '我'
-          : m.role == ChatRole.assistant
-              ? '助理'
-              : '工具';
-      buf
-        ..writeln('## $who（${_fmtFullTime(m.createdAt)}）')
-        ..writeln()
-        ..writeln(m.content)
-        ..writeln();
-    }
-    final safeTitle = _conversation.title
-        .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
-        .trim();
-    final name =
-        '对话-${safeTitle.isEmpty ? '未命名' : safeTitle}.md';
     try {
-      await LibraryFileService.instance.importBytes(
-        utf8.encode(buf.toString()),
-        name: name,
-        mimeType: 'text/markdown',
-        source: FileSource.noteExport,
-      );
+      final name = await exportConversationToMarkdown(_conversation,
+          modelLabel: _modelLabel);
       _showSnack('已导出到文件区：$name');
     } catch (e, st) {
       AppLog.instance.warn('chat.export', e, st);
@@ -967,6 +987,8 @@ class _ChatPageState extends State<ChatPage> {
             busy: _busy,
             attachments: _pendingAttachments,
             metaOf: _metaOf,
+            attachmentTokens:
+                _pendingAttachments.isEmpty ? null : _pendingAttachmentTokens,
             onRemoveAttachment: _removeAttachment,
             onAddAttachments: _pickAttachments,
             onPickScreenshots: _pickScreenshots,
@@ -1006,11 +1028,30 @@ class _ChatPageState extends State<ChatPage> {
       controller: _scroll,
       padding: const EdgeInsets.all(12),
       children: [
-        for (final m in _messages) ..._buildMessage(m, cs),
+        for (final m in _messages) ..._buildMessageWrapped(m, cs),
         if (_busy) _buildStreaming(cs),
         if (_errorText != null) _buildError(cs),
       ],
     );
+  }
+
+  /// 搜索命中的消息条：包一层高亮容器并挂定位 Key（§2.3）。
+  List<Widget> _buildMessageWrapped(ChatMessage m, ColorScheme cs) {
+    final ws = _buildMessage(m, cs);
+    if (m.id != _searchHitMessageId || ws.isEmpty) return ws;
+    return [
+      Container(
+        key: _searchHitKey,
+        decoration: BoxDecoration(
+          color: cs.primaryContainer.withValues(alpha: 0.35),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: ws,
+        ),
+      ),
+    ];
   }
 
   /// 用户 pill 装饰：实心 primary 圆角泡（右下小角）。
