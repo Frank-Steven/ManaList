@@ -7,7 +7,6 @@ import 'package:sqflite/sqflite.dart';
 
 import '../models/message.dart';
 import 'archive_export_service.dart';
-import 'assistant/models.dart';
 import 'attachment_store.dart';
 import 'database.dart';
 
@@ -40,10 +39,10 @@ class ArchiveImportResult {
 
 /// v3 存档导入（格式与流程定稿见 design-v3-details §5.3）：
 /// 解压 → 校验 manifest.format/version → 空库守卫（非空拒绝，不做合并）→
-/// 单事务入库（全量保留原 id）→ marker 一致性校验（缺失记入警告列表）。
+/// 单事务入库（全量保留原 id）→ 对象级锚点归一化（旧版行内 marker 剥离，
+/// 与 v12 迁移共用 [normalizeAnchorsToObjectLevel]）→ 目标存在性校验。
 ///
-/// content_hash 不信任导出值，导入时按 §1.4 规则重算
-/// （computeContentHash 内建 strip marker）。
+/// content_hash 不信任导出值，导入时按原文明文重算（v12 起正文不含 marker）。
 class ArchiveImportService {
   ArchiveImportService._();
 
@@ -223,28 +222,39 @@ class ArchiveImportService {
       }
     });
 
-    // 5. marker 一致性校验（§5.3-4）：锚点 marker 必须在对应正文中存在；
-    //    缺失记入警告列表（不阻断）。file 锚点无 marker，跳过。
-    final bodiesById = {
-      for (final r in messages) r['id'] as String: r['body'] as String? ?? '',
-    };
-    final notesById = {
-      for (final r in notes) r['id'] as String: r['content'] as String? ?? '',
-    };
-    for (final a in anchors) {
+    // 5. 行内 marker → 对象级锚点归一化（anchors-v2 §6，与 v12 迁移共用）：
+    //    旧版存档正文中的 ⟦task:⟧ 剥离、note 锚点转章节级、重复锚点去重；
+    //    再做目标存在性校验（缺失记入警告列表，不阻断）。
+    await normalizeAnchorsToObjectLevel(db);
+
+    final anchorRows = await db.query('task_anchors');
+    for (final a in anchorRows) {
       final anchorId = a['id'] as String;
       final targetType = a['target_type'] as String;
       final targetId = a['target_id'] as String;
-      final body = switch (targetType) {
-        'message' => bodiesById[targetId],
-        'note' => notesById[targetId],
-        _ => null,
+      final exists = switch (targetType) {
+        'message' => await db.query('messages',
+                columns: ['id'],
+                where: 'id = ?',
+                whereArgs: [targetId],
+                limit: 1)
+            .then((r) => r.isNotEmpty),
+        'chapter' => await db.query('chapters',
+                columns: ['id'],
+                where: 'id = ?',
+                whereArgs: [targetId],
+                limit: 1)
+            .then((r) => r.isNotEmpty),
+        'file' => await db.query('files',
+                columns: ['id'],
+                where: 'id = ?',
+                whereArgs: [targetId],
+                limit: 1)
+            .then((r) => r.isNotEmpty),
+        _ => false,
       };
-      if (targetType == 'file') continue;
-      if (body == null) {
+      if (!exists) {
         warnings.add('锚点 $anchorId 的目标 $targetType/$targetId 不存在');
-      } else if (!body.contains(anchorMarker(anchorId))) {
-        warnings.add('锚点 $anchorId 的 marker 在 $targetType/$targetId 正文中缺失');
       }
     }
 

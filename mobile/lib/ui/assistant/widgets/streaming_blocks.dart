@@ -63,8 +63,6 @@ enum ChatStreamSegmentKind { text, thinking, tool }
       ToolNames.taskSearch => ('搜索任务', Icons.travel_explore_outlined),
       ToolNames.noteCreate => ('新建笔记', Icons.note_add_outlined),
       ToolNames.noteAppend => ('追加笔记内容', Icons.post_add_outlined),
-      ToolNames.noteReplaceSection =>
-        ('替换笔记区段', Icons.find_replace_outlined),
       ToolNames.noteRead => ('读取笔记', Icons.menu_book_outlined),
       ToolNames.anchorCreate => ('建立任务锚点', Icons.anchor_outlined),
       ToolNames.anchorRemove => ('移除锚点', Icons.link_off_outlined),

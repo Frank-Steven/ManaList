@@ -53,7 +53,7 @@ void main() {
       expect(ProposalService.toolCategory('task.create'), 'task');
       expect(ProposalService.toolCategory('task.update'), 'task');
       expect(ProposalService.toolCategory('note.append'), 'note');
-      expect(ProposalService.toolCategory('note.replace_section'), 'note');
+      expect(ProposalService.toolCategory('note.create'), 'note');
       expect(ProposalService.toolCategory('anchor.create'), 'anchor');
       expect(ProposalService.toolCategory('anchor.remove'), 'anchor');
       expect(ProposalService.toolCategory('message.set_priority'), 'message');

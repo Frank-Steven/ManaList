@@ -5,14 +5,14 @@ import '../../services/app_ui_state.dart';
 import '../../services/assistant/models.dart';
 import '../../services/database.dart';
 import '../messages/message_detail_sheet.dart';
-import '../notes/note_editor_page.dart';
+import '../notes/chapters_page.dart';
 import 'task_detail_panel.dart';
 import 'task_editor.dart';
 
-/// 锚点双向跳转中枢（design-v3 §3.4，v3 阶段 4）：
-/// - 正向：锚点 chip 点击 → [showTaskDetailSheet] 弹任务详情；
+/// 锚点双向跳转中枢（anchors-v2.md §3）：
+/// - 正向：对象详情「关联任务」区 chip 点击 → [showTaskDetailSheet] 弹任务详情；
 /// - 反向：任务详情「来源锚点」列表点击 → [openAnchorTarget] 按目标类型
-///   跳消息详情 / 笔记编辑器（定位高亮该 chip）/ 库·文件区。
+///   跳消息详情 / 章节笔记列表 / 库·文件区。
 
 /// 任务详情底部弹出（锚点 chip 点击的落点）。编辑走任务编辑器；
 /// 父/子任务点击再叠一层详情。
@@ -52,8 +52,8 @@ Future<void> showTaskDetailSheet(BuildContext context, Task task) {
 }
 
 /// 反向跳转（任务详情「来源锚点」点击）：
-/// - message → 消息详情面板；
-/// - note → 笔记编辑器，预览态并高亮/定位该锚点 chip；
+/// - message → 消息详情面板（「关联任务」区）；
+/// - chapter → 章节笔记列表页；
 /// - file → 收到库页文件区（弹层先收起）。
 Future<void> openAnchorTarget(BuildContext context, TaskAnchor anchor) async {
   final db = AppDatabase.instance;
@@ -66,18 +66,15 @@ Future<void> openAnchorTarget(BuildContext context, TaskAnchor anchor) async {
         return;
       }
       await showMessageDetail(context, msg);
-    case AnchorTargetType.note:
-      final note = await db.getNoteById(anchor.targetId);
+    case AnchorTargetType.chapter:
+      final chapter = await db.getChapterById(anchor.targetId);
       if (!context.mounted) return;
-      if (note == null) {
-        _toastGone(context, '笔记');
+      if (chapter == null) {
+        _toastGone(context, '章节');
         return;
       }
       await Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => NoteEditorPage(
-          existing: note,
-          highlightAnchorId: anchor.id,
-        ),
+        builder: (_) => NotesListPage(chapter: chapter),
       ));
     case AnchorTargetType.file:
       final file = await db.getFileById(anchor.targetId);

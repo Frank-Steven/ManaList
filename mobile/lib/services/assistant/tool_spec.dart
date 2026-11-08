@@ -40,7 +40,6 @@ class ToolNames {
   static const taskSearch = 'task.search';
   static const noteCreate = 'note.create';
   static const noteAppend = 'note.append';
-  static const noteReplaceSection = 'note.replace_section';
   static const noteRead = 'note.read';
   static const anchorCreate = 'anchor.create';
   static const anchorRemove = 'anchor.remove';
@@ -108,15 +107,6 @@ const List<ToolSpec> kToolSpecs = [
         '{"tool":"note.append","args":{"noteId":"<笔记id>","content":"\\n补充一行"}}',
   ),
   ToolSpec(
-    name: ToolNames.noteReplaceSection,
-    kind: ToolKind.write,
-    description: '替换一篇笔记中由标题界定的区段（避免全文覆盖）',
-    paramsDoc: 'noteId(必填); heading(必填, markdown 标题文本, 不含 # 号); '
-        'content(必填, 该区段的新正文, 不含标题行本身)',
-    example:
-        '{"tool":"note.replace_section","args":{"noteId":"<笔记id>","heading":"周二安排","content":"新内容"}}',
-  ),
-  ToolSpec(
     name: ToolNames.noteRead,
     kind: ToolKind.read,
     description: '读取一篇笔记（只读，直接执行）',
@@ -126,17 +116,17 @@ const List<ToolSpec> kToolSpecs = [
   ToolSpec(
     name: ToolNames.anchorCreate,
     kind: ToolKind.write,
-    description: '在库中目标（笔记/消息指定文本处，或整个文件）创建一个任务锚点',
-    paramsDoc: 'targetType: note|message|file(必填); targetId(必填); taskId(必填); '
-        'anchorText(笔记/消息必填: 正文中的定位文本, 锚点插到其首次出现处之后; file 不需要)',
+    description: '把库中对象（一条消息/一个笔记章节/一个文件）关联到一个任务',
+    paramsDoc: 'targetType: message|chapter|file(必填); targetId(必填: 消息/章节/文件 id); '
+        'taskId(必填)。对象级关联，不改动任何正文',
     example:
-        '{"tool":"anchor.create","args":{"targetType":"note","targetId":"<笔记id>","taskId":"<任务id>","anchorText":"买菜"}}',
+        '{"tool":"anchor.create","args":{"targetType":"message","targetId":"<消息id>","taskId":"<任务id>"}}',
   ),
   ToolSpec(
     name: ToolNames.anchorRemove,
     kind: ToolKind.write,
-    description: '移除一个任务锚点（正文中的 marker 一并清除）',
-    paramsDoc: 'anchorId(必填, 即正文中 ⟦task:<id>⟧ 的 id)',
+    description: '移除一个任务锚点（只删关联，不动正文）',
+    paramsDoc: 'anchorId(必填)',
     example: '{"tool":"anchor.remove","args":{"anchorId":"<锚点id>"}}',
   ),
   ToolSpec(

@@ -13,6 +13,7 @@ import '../assistant/send_to_assistant.dart';
 import '../messages/message_widgets.dart' show SelectionAction, SelectionActionBar;
 import '../notes/notes_page.dart' show promptNameDialog;
 import '../shared/back_to_top.dart';
+import '../shared/linked_tasks_section.dart';
 import 'file_thumbnail.dart';
 import 'folder_tree.dart';
 import '../shared/skeleton_list.dart';
@@ -682,6 +683,24 @@ class FilesPageState extends State<FilesPage> {
       ..showSnackBar(SnackBar(content: Text(text)));
   }
 
+  /// 文件级「关联任务」区（anchors-v2 §3：整个文件关联任务）。
+  void _showLinkedTasks(LibraryFile file) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 8, 16),
+          child: LinkedTasksSection(
+            targetType: AnchorTargetType.file,
+            targetId: file.id,
+            seedTitle: file.name,
+          ),
+        ),
+      ),
+    );
+  }
+
   void _showActions(LibraryFile file) {
     showModalBottomSheet(
       context: context,
@@ -733,6 +752,14 @@ class FilesPageState extends State<FilesPage> {
               onTap: () {
                 Navigator.of(sheetContext).pop();
                 _rename(file);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.add_link),
+              title: const Text('关联任务'),
+              onTap: () {
+                Navigator.of(sheetContext).pop();
+                _showLinkedTasks(file);
               },
             ),
             ListTile(

@@ -23,8 +23,13 @@ String stripAnchorMarkers(String text) =>
 
 class AnchorTargetType {
   static const message = 'message';
-  static const note = 'note';
+
+  /// 笔记章节（anchors-v2.md §2：对象级锚点，锚到整章）。
+  static const chapter = 'chapter';
   static const file = 'file';
+
+  /// v12 前的行内 marker 锚点目标（单篇笔记）。仅迁移/兼容读取用。
+  static const note = 'note';
 }
 
 class AnchorCreatedBy {
@@ -306,6 +311,10 @@ class ProposalStatus {
   static const rejected = 'rejected';
   static const applied = 'applied';
   static const failed = 'failed';
+
+  /// 被并发修改覆盖而未执行（crdt.md §3.2）：不是错误，
+  /// 卡片提供「以当前状态重新提交」入口。
+  static const superseded = 'superseded';
 }
 
 /// 待确认区的一条原子变更提案：AI 写工具调用的落点，人工审批后执行。

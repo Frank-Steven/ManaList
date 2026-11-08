@@ -154,6 +154,14 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
     await _reload();
   }
 
+  /// superseded 提案「以当前状态重新提交」（crdt.md §3.2）：
+  /// base 刷新后退回待确认区，可再次审批。
+  Future<void> _resubmit(ChangeProposal p) async {
+    final ok = await ProposalExecutor.instance.resubmit(p.id);
+    if (mounted) _toast(ok ? '已按当前状态重新提交，回到待确认区' : '重新提交失败');
+    await _reload();
+  }
+
   void _toast(String text) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -339,6 +347,9 @@ class _ApprovalsPageState extends State<ApprovalsPage> {
               density: ProposalCardDensity.full,
               onUndo: p.status == ProposalStatus.applied && !_busy
                   ? () => _undo(p)
+                  : null,
+              onResubmit: p.status == ProposalStatus.superseded && !_busy
+                  ? () => _resubmit(p)
                   : null,
             ),
       ],

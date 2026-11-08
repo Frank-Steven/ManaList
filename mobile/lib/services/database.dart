@@ -11,9 +11,9 @@ import '../models/library_file.dart';
 import '../models/message.dart';
 import '../models/note.dart';
 import '../models/task.dart';
-import 'anchor_service.dart';
 import 'app_log.dart';
 import 'assistant/models.dart';
+import 'crdt.dart';
 import 'reminder_service.dart';
 
 /// 收件箱按应用筛选用的来源应用项。
@@ -256,6 +256,111 @@ Future<void> migrateToV11(DatabaseExecutor db) async {
   }
 }
 
+/// op_log 建表（crdt.md §2.2/§7，DB v12）。onCreate 与 v12 迁移共用。
+Future<void> createOpLogTable(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS op_log(
+      op_id TEXT PRIMARY KEY,
+      actor TEXT NOT NULL,
+      lamport INTEGER NOT NULL,
+      target TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload TEXT,
+      base TEXT,
+      created_at INTEGER NOT NULL
+    )
+  ''');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_op_log_target ON op_log(target)');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_op_log_lamport ON op_log(lamport)');
+}
+
+/// v11 → v12 迁移（crdt.md §7 + anchors-v2.md §6，同窗口）：
+/// 1. 新增 op_log 表（现有物化状态视为 lamport=0 的初始折叠，不补历史 op）；
+/// 2. 行内 marker 锚点 → 对象级锚点：剥离 messages/notes 正文中的
+///    ⟦task:<id>⟧ marker；note 锚点改写为所属章节（target_type='chapter'）；
+///    同一 (task_id, target_type, target_id) 多条去重保留最早 created_at；
+///    受影响消息的 content_hash 按原文明文重算（OR IGNORE 防撞 UNIQUE）。
+Future<void> migrateToV12(DatabaseExecutor db) async {
+  await createOpLogTable(db);
+  await normalizeAnchorsToObjectLevel(db);
+}
+
+/// 行内 marker → 对象级锚点归一化（anchors-v2.md §6）：
+/// 1. note 锚点改写为所属章节（target_type='chapter'），悬挂行删除；
+/// 2. 同一 (task_id, target_type, target_id) 多条去重，保留最早 created_at；
+/// 3. 剥离 messages/notes 正文中的 ⟦task:<id>⟧ marker（连同追加式分隔
+///    空白），受影响消息的 content_hash 按原文明文重算（OR IGNORE 防撞
+///    UNIQUE）。
+/// v12 迁移与旧版存档导入（import 后正文/锚点仍是行内形态）共用。
+/// 剥离行内 marker（连同追加式 marker 前的分隔空白），
+/// v12 迁移、存档导入归一化、旧版撤销快照回写共用。
+String stripMarkersWithSpacing(String text) => text.replaceAll(
+    RegExp(r' ?⟦task:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}⟧'),
+    '');
+
+Future<void> normalizeAnchorsToObjectLevel(DatabaseExecutor db) async {
+  // 1) note 锚点 → 章节锚点
+  final noteAnchors = await db.query('task_anchors',
+      where: "target_type = 'note'");
+  for (final a in noteAnchors) {
+    final noteRows = await db.query('notes',
+        columns: ['chapter_id'],
+        where: 'id = ?',
+        whereArgs: [a['target_id']],
+        limit: 1);
+    if (noteRows.isEmpty) {
+      // 悬挂锚点（目标笔记已不存在）：直接删行
+      await db.delete('task_anchors', where: 'id = ?', whereArgs: [a['id']]);
+      continue;
+    }
+    await db.update('task_anchors',
+        {'target_type': 'chapter', 'target_id': noteRows.first['chapter_id']},
+        where: 'id = ?', whereArgs: [a['id']]);
+  }
+
+  // 2) 同一对象多条锚点去重（保留最早 created_at，并列取 id 最小者）
+  final all = await db.query('task_anchors',
+      orderBy: 'created_at ASC, id ASC');
+  final kept = <String>{};
+  final dupeIds = <String>[];
+  for (final a in all) {
+    final key = '${a['task_id']}|${a['target_type']}|${a['target_id']}';
+    if (kept.add(key)) continue;
+    dupeIds.add(a['id'] as String);
+  }
+  for (final id in dupeIds) {
+    await db.delete('task_anchors', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // 3) 剥离正文 marker（连同追加式 marker 前的分隔空白），消息哈希重算
+  final messages = await db.query('messages',
+      columns: ['id', 'package_name', 'title', 'body', 'posted_at'],
+      where: "body LIKE '%⟦task:%'");
+  for (final m in messages) {
+    final body = stripMarkersWithSpacing(m['body'] as String);
+    await db.rawUpdate(
+      'UPDATE OR IGNORE messages SET body = ?, content_hash = ? WHERE id = ?',
+      [
+        body,
+        computeContentHash(m['package_name'] as String, m['title'] as String,
+            body, (m['posted_at'] as num).toInt()),
+        m['id'],
+      ],
+    );
+  }
+  final notes = await db.query('notes',
+      columns: ['id', 'content'], where: "content LIKE '%⟦task:%'");
+  for (final n in notes) {
+    await db.update(
+        'notes',
+        {'content': stripMarkersWithSpacing(n['content'] as String)},
+        where: 'id = ?',
+        whereArgs: [n['id']]);
+  }
+}
+
 /// 批量入库的分块大小：SQLite 的绑定变量上限（老版本 999），留足余量。
 const int kMessageHashLookupChunk = 400;
 
@@ -314,14 +419,13 @@ Future<int> insertMessagesIfNewInto(
 
 /// 删除任务撤销快照中的一条受影响正文（[AppDatabase.snapshotTaskDeletion]）。
 ///
-/// message → body 原文 + edited_at 原值；note → content 原文 + updated_at 原值
-///（统一放在 [editedAt] 字段）。撤销时整段原文回写，marker 精确复原，
-/// 消息的 content_hash 由原文重算（同一输入天然复原），留痕字段写回原值。
+/// v12 起锚点不入正文，新快照不再产生本类条目；本类仅为兼容旧版撤销
+/// payload（行内 marker 时代）保留，回写前剥离 marker。
 class TaskDeletionBodySnapshot {
   final String targetType; // AnchorTargetType.message | note
   final String targetId;
 
-  /// 删除前的正文原文（含 ⟦task:id⟧ marker，未残迹化）。
+  /// 删除前的正文原文（可能含旧版 ⟦task:id⟧ marker，回写前剥离）。
   final String content;
 
   /// 删除前的留痕字段原值：message.edited_at / note.updated_at。
@@ -351,9 +455,9 @@ class TaskDeletionBodySnapshot {
 }
 
 /// 删除任务的撤销快照（details §1.5 撤销补全）：任务行由调用方持有，
-/// 本快照覆盖 [AppDatabase.deleteTasks] 事务内被改写的其余状态 ——
-/// 该任务的全部 task_anchors 行 + 所有受影响正文（notes.content /
-/// messages.body）的原文与留痕原值。file 锚点不入正文，只记行。
+/// 本快照覆盖 [AppDatabase.deleteTasks] 事务内被级联删除的 task_anchors 行。
+/// v12 起锚点不入正文（anchors-v2.md §2），正文不受任务删除影响，
+/// [bodies] 恒为空，仅为兼容旧版 payload 保留。
 class TaskDeletionSnapshot {
   final List<TaskAnchor> anchors;
   final List<TaskDeletionBodySnapshot> bodies;
@@ -397,16 +501,106 @@ class AppDatabase {
   @visibleForTesting
   void debugDetachDatabase() => _db = null;
 
+  // ---- v12：op_log（crdt.md §2.2） ----
+  // 物化表是「当前值缓存」，op_log 是事实源；写路径双写（落 op + 更新物化表），
+  // 读路径仍走物化表。lamport 为库级单调计数，打开/附加库时从 op_log 恢复。
+
+  int _lamport = 0;
+
+  Future<void> _restoreLamport(Database db) async {
+    final rows =
+        await db.rawQuery('SELECT MAX(lamport) AS m FROM op_log');
+    _lamport = (rows.first['m'] as num?)?.toInt() ?? 0;
+  }
+
+  /// 落一条 op 并返回其 lamport。[base] 缺省时自动填该 target 的当前版本
+  /// （人工即时操作的 base = 当前版本，crdt.md §2.2）。
+  Future<int> recordOp({
+    required String actor,
+    required String target,
+    required String kind,
+    Map<String, dynamic>? payload,
+    OpStamp? base,
+  }) async {
+    final db = await database;
+    _lamport += 1;
+    final lamport = _lamport;
+    final effectiveBase = base ?? await currentVersion(target);
+    await db.insert('op_log', {
+      'op_id': const Uuid().v4(),
+      'actor': actor,
+      'lamport': lamport,
+      'target': target,
+      'kind': kind,
+      'payload': payload == null ? null : jsonEncode(payload),
+      'base': effectiveBase == null ? null : jsonEncode(effectiveBase.toJson()),
+      'created_at': DateTime.now().millisecondsSinceEpoch,
+    });
+    return lamport;
+  }
+
+  /// 某 target（精确寻址串）的当前版本：lamport 最大的那条 op。
+  Future<OpStamp?> currentVersion(String target) async {
+    final db = await database;
+    final rows = await db.query('op_log',
+        columns: ['lamport', 'actor', 'op_id'],
+        where: 'target = ?',
+        whereArgs: [target],
+        orderBy: 'lamport DESC',
+        limit: 1);
+    if (rows.isEmpty) return null;
+    final r = rows.first;
+    return OpStamp(
+        lamport: (r['lamport'] as num).toInt(),
+        actor: r['actor'] as String,
+        opId: r['op_id'] as String);
+  }
+
+  /// 某前缀（如 `tasks:<id>:`）下全部 target 的当前版本（最大 lamport 的 op）。
+  Future<OpStamp?> currentVersionPrefix(String targetPrefix) async {
+    final db = await database;
+    final rows = await db.query('op_log',
+        columns: ['lamport', 'actor', 'op_id'],
+        where: "target LIKE ? ESCAPE '\\'",
+        whereArgs: ['${targetPrefix.replaceAll('\\', '\\\\')}%'],
+        orderBy: 'lamport DESC',
+        limit: 1);
+    if (rows.isEmpty) return null;
+    final r = rows.first;
+    return OpStamp(
+        lamport: (r['lamport'] as num).toInt(),
+        actor: r['actor'] as String,
+        opId: r['op_id'] as String);
+  }
+
+  /// 前缀下 lamport > [sinceLamport] 的全部 op（提案裁决的改动域检测用）。
+  Future<List<Map<String, Object?>>> opsOnPrefixSince(
+      String targetPrefix, int sinceLamport) async {
+    final db = await database;
+    return db.query('op_log',
+        where: "target LIKE ? ESCAPE '\\' AND lamport > ?",
+        whereArgs: [targetPrefix, sinceLamport],
+        orderBy: 'lamport ASC');
+  }
+
+  /// 最近变更（审计视图用，crdt.md §5），新的在前。
+  Future<List<Map<String, Object?>>> recentOps({int limit = 50}) async {
+    final db = await database;
+    return db.query('op_log',
+        orderBy: 'lamport DESC', limit: limit);
+  }
+
   Future<Database> get database async {
     final existing = _db;
     if (existing != null) return existing;
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'msgrepo.db'),
-      version: 11,
+      version: 12,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
+    await _restoreLamport(_db!);
     return _db!;
   }
 
@@ -449,6 +643,10 @@ class AppDatabase {
     if (oldVersion < 11) {
       // v11：conversations.pinned（对话置顶，assistant-v4 批次 D）。
       await migrateToV11(db);
+    }
+    if (oldVersion < 12) {
+      // v12：op_log（crdt.md §7）+ 行内 marker → 对象级锚点迁移（anchors-v2 §6）。
+      await migrateToV12(db);
     }
   }
 
@@ -534,6 +732,8 @@ class AppDatabase {
     await createV8Tables(db);
     // v10 起初始建库直接带上 library_folders（与老库升级链收敛）
     await migrateToV10(db);
+    // v12 起初始建库直接带上 op_log（空库上锚点迁移为 no-op）
+    await migrateToV12(db);
   }
 
   /// v2 数据层建表（设计 §1.1 messages、§1.2 tasks、§1.3 笔记三级）。
@@ -892,19 +1092,26 @@ class AppDatabase {
         where: 'id IN ($placeholders)', whereArgs: ids);
   }
 
-  Future<void> updateMessagePriority(List<String> ids, String priority) async {
+  Future<void> updateMessagePriority(List<String> ids, String priority,
+      {String actor = OpActor.user}) async {
     if (ids.isEmpty) return;
     final db = await database;
     final placeholders = List.filled(ids.length, '?').join(',');
     await db.update('messages', {'priority': priority},
         where: 'id IN ($placeholders)', whereArgs: ids);
+    for (final id in ids) {
+      await recordOp(
+          actor: actor,
+          target: messageFieldTarget(id, 'priority'),
+          kind: OpKind.lwwSet,
+          payload: {'value': priority});
+    }
   }
 
   /// 用户手动编辑消息正文（F07）：同时打上 edited_at，便于区分采集原文。
-  /// v8（details §1.4）：保存时重算并更新 content_hash（对剥离 marker 后的
-  /// 文本，strip 内建于 computeContentHash），保证与「同一通知再次送达」的
-  /// 判重语义一致。锚点插入/移除路径也走这里。
-  Future<void> updateMessageBody(String id, String body) async {
+  /// v12 起正文不再含锚点 marker，content_hash 对原文直接计算。
+  Future<void> updateMessageBody(String id, String body,
+      {String actor = OpActor.user}) async {
     final db = await database;
     final values = <String, Object?>{
       'body': body,
@@ -921,6 +1128,11 @@ class AppDatabase {
           r['title'] as String, body, (r['posted_at'] as num).toInt());
     }
     await db.update('messages', values, where: 'id = ?', whereArgs: [id]);
+    await recordOp(
+        actor: actor,
+        target: messageFieldTarget(id, 'body'),
+        kind: OpKind.lwwSet,
+        payload: {'value': body});
   }
 
   /// 用户增删消息附件（F07）：整份 attachments JSON 覆盖写，同样打 edited_at。
@@ -974,10 +1186,20 @@ class AppDatabase {
         'created_at': a.createdAt,
       };
 
-  Future<void> insertAnchor(TaskAnchor anchor) async {
+  Future<void> insertAnchor(TaskAnchor anchor,
+      {String actor = OpActor.user}) async {
     final db = await database;
     await db.insert('task_anchors', _anchorToRow(anchor),
         conflictAlgorithm: ConflictAlgorithm.replace);
+    await recordOp(
+        actor: actor,
+        target: anchorSetTarget(anchor.taskId),
+        kind: OpKind.orAdd,
+        payload: {
+          'tag': anchor.id,
+          'targetType': anchor.targetType,
+          'targetId': anchor.targetId,
+        });
   }
 
   Future<TaskAnchor?> getAnchorById(String id) async {
@@ -1032,9 +1254,19 @@ class AppDatabase {
     return rows.map(_anchorFromRow).toList();
   }
 
-  Future<void> deleteAnchor(String id) async {
+  Future<void> deleteAnchor(String id, {String actor = OpActor.user}) async {
     final db = await database;
+    final rows = await db.query('task_anchors',
+        where: 'id = ?', whereArgs: [id], limit: 1);
     await db.delete('task_anchors', where: 'id = ?', whereArgs: [id]);
+    if (rows.isNotEmpty) {
+      // OR-Set 移除：只移除观察到的 tag（本行 id），并发再添加的新 tag 保留。
+      await recordOp(
+          actor: actor,
+          target: anchorSetTarget(rows.first['task_id'] as String),
+          kind: OpKind.orRemove,
+          payload: {'tags': [id]});
+    }
   }
 
   /// 全量映射 messageId → taskIds（消息列表一次取回，避免 N+1 查询）。
@@ -1112,8 +1344,10 @@ class AppDatabase {
   }
 
   /// 全字段更新并自动刷新 updated_at。
-  Future<void> updateTask(Task task) async {
+  /// v12：逐字段 diff 落 lww_set op（crdt.md §4.1 字段级寄存器）。
+  Future<void> updateTask(Task task, {String actor = OpActor.user}) async {
     final db = await database;
+    final old = await getTaskById(task.id);
     await db.update(
       'tasks',
       task
@@ -1122,6 +1356,26 @@ class AppDatabase {
       where: 'id = ?',
       whereArgs: [task.id],
     );
+    if (old != null) {
+      final changed = <String, Object?>{};
+      if (old.title != task.title) changed['title'] = task.title;
+      if (old.description != task.description) {
+        changed['description'] = task.description;
+      }
+      if (old.kind != task.kind) changed['kind'] = task.kind;
+      if (old.startAt != task.startAt) changed['startAt'] = task.startAt;
+      if (old.endAt != task.endAt) changed['endAt'] = task.endAt;
+      if (old.priority != task.priority) changed['priority'] = task.priority;
+      if (old.status != task.status) changed['status'] = task.status;
+      if (old.parentId != task.parentId) changed['parentId'] = task.parentId;
+      for (final e in changed.entries) {
+        await recordOp(
+            actor: actor,
+            target: taskFieldTarget(task.id, e.key),
+            kind: OpKind.lwwSet,
+            payload: {'value': e.value});
+      }
+    }
     _rescheduleReminders();
   }
 
@@ -1260,36 +1514,50 @@ class AppDatabase {
     return result;
   }
 
-  Future<void> setTaskStatus(List<String> ids, String status) async {
+  Future<void> setTaskStatus(List<String> ids, String status,
+      {String actor = OpActor.user}) async {
     if (ids.isEmpty) return;
     final db = await database;
     final placeholders = List.filled(ids.length, '?').join(',');
     await db.update('tasks', {'status': status},
         where: 'id IN ($placeholders)', whereArgs: ids);
+    for (final id in ids) {
+      await recordOp(
+          actor: actor,
+          target: taskFieldTarget(id, 'status'),
+          kind: OpKind.lwwSet,
+          payload: {'value': status});
+    }
     _rescheduleReminders();
   }
 
-  /// 删除任务：先把该任务所有锚点残迹化（正文 marker 替换为 label 纯文本，
-  /// 删除锚点行，details §1.5），再删任务行，同一事务。
+  /// 删除任务：锚点行级联删除（对象级锚点不入正文，无需残迹化，
+  /// anchors-v2.md §2），再删任务行，同一事务；每任务落 tombstone op
+  /// （crdt.md §4.2）。
   ///
   /// 需要可撤销的调用方：删除前先 [snapshotTaskDeletion]，撤销时
   /// [restoreTaskDeletionSnapshot] + 回插任务行。
-  Future<void> deleteTasks(List<String> ids) async {
+  Future<void> deleteTasks(List<String> ids,
+      {String actor = OpActor.user}) async {
     if (ids.isEmpty) return;
     final db = await database;
     final placeholders = List.filled(ids.length, '?').join(',');
     await db.transaction((txn) async {
-      for (final id in ids) {
-        await residualizeAnchorsForTaskInto(txn, id);
-      }
+      await txn.delete('task_anchors',
+          where: 'task_id IN ($placeholders)', whereArgs: ids);
       await txn.delete('tasks', where: 'id IN ($placeholders)', whereArgs: ids);
     });
+    for (final id in ids) {
+      await recordOp(
+          actor: actor, target: taskPrefix(id), kind: OpKind.tombstone);
+    }
     _rescheduleReminders();
   }
 
-  /// 删除任务前的完整快照（撤销用，details §1.5）：[taskIds] 全部任务的
-  /// 锚点行 + 受影响正文（message/note，按目标去重）的原文与留痕原值。
-  /// 同一正文含多个被删任务的锚点时只记一份原文，整段回写天然正确。
+  /// 删除任务前的锚点快照（撤销用）：[taskIds] 全部任务的锚点行。
+  /// v12 起锚点不入正文（anchors-v2.md §2），正文不受任务删除影响，
+  /// bodies 恒为空；旧版撤销 payload 中的 bodies 仍由 restore 兼容处理
+  /// （回写前剥离 marker）。
   Future<TaskDeletionSnapshot> snapshotTaskDeletion(
       List<String> taskIds) async {
     final db = await database;
@@ -1301,50 +1569,17 @@ class AppDatabase {
           where: 'task_id = ?', whereArgs: [id], orderBy: 'created_at ASC');
       anchors.addAll(rows.map(_anchorFromRow));
     }
-    final bodies = <TaskDeletionBodySnapshot>[];
-    final seenTargets = <String>{};
-    for (final a in anchors) {
-      if (a.targetType == AnchorTargetType.file) continue; // 文件锚点不入正文
-      if (!seenTargets.add('${a.targetType}|${a.targetId}')) continue;
-      if (a.targetType == AnchorTargetType.message) {
-        final rows = await db.query('messages',
-            columns: ['body', 'edited_at'],
-            where: 'id = ?',
-            whereArgs: [a.targetId],
-            limit: 1);
-        if (rows.isEmpty) continue;
-        bodies.add(TaskDeletionBodySnapshot(
-          targetType: a.targetType,
-          targetId: a.targetId,
-          content: rows.first['body'] as String,
-          editedAt: (rows.first['edited_at'] as num?)?.toInt(),
-        ));
-      } else if (a.targetType == AnchorTargetType.note) {
-        final rows = await db.query('notes',
-            columns: ['content', 'updated_at'],
-            where: 'id = ?',
-            whereArgs: [a.targetId],
-            limit: 1);
-        if (rows.isEmpty) continue;
-        bodies.add(TaskDeletionBodySnapshot(
-          targetType: a.targetType,
-          targetId: a.targetId,
-          content: rows.first['content'] as String,
-          editedAt: (rows.first['updated_at'] as num?)?.toInt(),
-        ));
-      }
-    }
-    return TaskDeletionSnapshot(anchors: anchors, bodies: bodies);
+    return TaskDeletionSnapshot(anchors: anchors, bodies: const []);
   }
 
-  /// 撤销删除：正文原文整段回写（marker 精确复原；message 的 content_hash
-  /// 由原文重算一并复原；edited_at / updated_at 写回删除前原值），
-  /// 锚点行原样回插。任务行本身由调用方回插。目标已删除时跳过其正文。
+  /// 撤销删除：锚点行原样回插（任务行本身由调用方回插）。
+  /// 旧版快照中的 bodies（含行内 marker 的正文）回写前剥离 marker。
   Future<void> restoreTaskDeletionSnapshot(TaskDeletionSnapshot snap) async {
     if (snap.anchors.isEmpty && snap.bodies.isEmpty) return;
     final db = await database;
     await db.transaction((txn) async {
       for (final b in snap.bodies) {
+        final content = stripMarkersWithSpacing(b.content);
         if (b.targetType == AnchorTargetType.message) {
           final rows = await txn.query('messages',
               columns: ['package_name', 'title', 'posted_at'],
@@ -1356,21 +1591,22 @@ class AppDatabase {
           await txn.update(
             'messages',
             {
-              'body': b.content,
+              'body': content,
               'edited_at': b.editedAt,
               'content_hash': computeContentHash(
                   r['package_name'] as String,
                   r['title'] as String,
-                  b.content,
+                  content,
                   (r['posted_at'] as num).toInt()),
             },
             where: 'id = ?',
             whereArgs: [b.targetId],
           );
-        } else if (b.targetType == AnchorTargetType.note) {
+        } else if (b.targetType == AnchorTargetType.note ||
+            b.targetType == AnchorTargetType.chapter) {
           await txn.update(
             'notes',
-            {'content': b.content, 'updated_at': b.editedAt},
+            {'content': content, 'updated_at': b.editedAt},
             where: 'id = ?',
             whereArgs: [b.targetId],
           );
@@ -1439,10 +1675,10 @@ class AppDatabase {
   Future<void> deleteNotebook(String id) async {
     final db = await database;
     await db.transaction((txn) async {
-      const noteIds =
-          'SELECT id FROM notes WHERE chapter_id IN (SELECT id FROM chapters WHERE notebook_id = ?)';
+      // v12 起锚点为章节级：删笔记本级联其章节锚点行。
       await txn.delete('task_anchors',
-          where: "target_type = 'note' AND target_id IN ($noteIds)",
+          where:
+              "target_type = 'chapter' AND target_id IN (SELECT id FROM chapters WHERE notebook_id = ?)",
           whereArgs: [id]);
       await txn.delete('notes',
           where:
@@ -1471,17 +1707,23 @@ class AppDatabase {
         .update('chapters', {'name': name}, where: 'id = ?', whereArgs: [id]);
   }
 
-  /// 级联删除：章节 + 其下全部笔记（含笔记锚点行）。
+  /// 级联删除：章节 + 其下全部笔记 + 该章节的对象级锚点行。
   Future<void> deleteChapter(String id) async {
     final db = await database;
     await db.transaction((txn) async {
       await txn.delete('task_anchors',
-          where:
-              "target_type = 'note' AND target_id IN (SELECT id FROM notes WHERE chapter_id = ?)",
+          where: "target_type = 'chapter' AND target_id = ?",
           whereArgs: [id]);
       await txn.delete('notes', where: 'chapter_id = ?', whereArgs: [id]);
       await txn.delete('chapters', where: 'id = ?', whereArgs: [id]);
     });
+  }
+
+  Future<Chapter?> getChapterById(String id) async {
+    final db = await database;
+    final rows =
+        await db.query('chapters', where: 'id = ?', whereArgs: [id], limit: 1);
+    return rows.isEmpty ? null : Chapter.fromRow(rows.first);
   }
 
   Future<List<Note>> getNotes(String chapterId) async {
@@ -1505,24 +1747,33 @@ class AppDatabase {
     await db.insert('notes', note.toRow());
   }
 
-  /// 全字段更新并自动刷新 updated_at。
-  Future<void> updateNote(Note note) async {
+  /// 更新笔记。content 变化时落 op（crdt.md §4.4）：普通编辑为 lww_set；
+  /// note.append 路径传 [opKind] = append + [opPayload] 携带追加段。
+  Future<void> updateNote(Note note,
+      {String actor = OpActor.user,
+      String opKind = OpKind.lwwSet,
+      Map<String, dynamic>? opPayload}) async {
     final db = await database;
+    final old = await getNoteById(note.id);
     await db.update(
       'notes',
       note.copyWith(updatedAt: DateTime.now().millisecondsSinceEpoch).toRow(),
       where: 'id = ?',
       whereArgs: [note.id],
     );
+    if (old != null && old.content != note.content) {
+      await recordOp(
+          actor: actor,
+          target: noteFieldTarget(note.id, 'content'),
+          kind: opKind,
+          payload: opPayload ?? {'value': note.content});
+    }
   }
 
   Future<void> deleteNote(String id) async {
     final db = await database;
-    await db.transaction((txn) async {
-      await txn.delete('task_anchors',
-          where: "target_type = 'note' AND target_id = ?", whereArgs: [id]);
-      await txn.delete('notes', where: 'id = ?', whereArgs: [id]);
-    });
+    // v12 起锚点为章节级对象锚点，删单篇笔记不影响锚点行。
+    await db.delete('notes', where: 'id = ?', whereArgs: [id]);
   }
 
   // ---- v8：文件区（files，design-v3 §1.3） ----
@@ -1949,15 +2200,23 @@ class AppDatabase {
     return rows.map(_proposalFromRow).toList();
   }
 
-  /// 提案状态流转（design-v3 §1.4）：pending→approved/rejected→applied/failed。
+  /// 提案状态流转（design-v3 §1.4 + crdt.md §3.2）：
+  /// pending→approved/rejected→applied/failed；approved→superseded 为
+  /// 「被并发修改覆盖」（人优先决胜）；superseded→pending 为
+  /// 「以当前状态重新提交」（base 由 proposal_executor 刷新）。
   /// applied→pending 为「撤销已应用的变更」（details §3.2 历史区撤销入口）：
   /// 逆操作由 proposal_executor 先执行，再把提案退回待确认区。
   /// 非法流转或不存在的 id 返回 false；流转成功打 resolved_at。
   Future<bool> transitionProposal(String id, String to) async {
     const allowed = {
       ProposalStatus.pending: {ProposalStatus.approved, ProposalStatus.rejected},
-      ProposalStatus.approved: {ProposalStatus.applied, ProposalStatus.failed},
+      ProposalStatus.approved: {
+        ProposalStatus.applied,
+        ProposalStatus.failed,
+        ProposalStatus.superseded,
+      },
       ProposalStatus.applied: {ProposalStatus.pending},
+      ProposalStatus.superseded: {ProposalStatus.pending},
     };
     final db = await database;
     return db.transaction((txn) async {

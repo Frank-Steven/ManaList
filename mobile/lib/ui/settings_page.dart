@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'theme_fader.dart';
+import 'recent_ops_page.dart';
 import '../main.dart' show themeModeNotifier, themeModeFromString;
 import 'about_page.dart';
 import 'shared/app_icon.dart';
@@ -675,6 +676,20 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
               trailing: const Icon(Icons.chevron_right),
               onTap: _showRecentErrors,
+            ),
+            // crdt.md §5：审计视图——谁在什么时候改了什么（人/助理/系统）
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.history, color: cs.onSurfaceVariant),
+              title: const Text('最近变更'),
+              subtitle: Text(
+                '查看最近的修改记录（含助理操作）',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => const RecentOpsPage()),
+              ),
             ),
           ]),
           const Divider(height: 32),

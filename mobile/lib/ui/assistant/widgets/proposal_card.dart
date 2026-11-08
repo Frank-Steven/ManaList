@@ -33,6 +33,9 @@ class ProposalCard extends StatelessWidget {
   /// applied 状态的「撤销」回调；null 时不显示。
   final VoidCallback? onUndo;
 
+  /// superseded 状态的「以当前状态重新提交」回调（crdt.md §3.2）；null 时不显示。
+  final VoidCallback? onResubmit;
+
   /// compact 密度、pending 状态时的「去审批」回调；null 时不显示。
   final VoidCallback? onGoToApprovals;
 
@@ -43,6 +46,7 @@ class ProposalCard extends StatelessWidget {
     this.onApprove,
     this.onReject,
     this.onUndo,
+    this.onResubmit,
     this.onGoToApprovals,
   });
 
@@ -63,6 +67,11 @@ class ProposalCard extends StatelessWidget {
           ),
         ProposalStatus.rejected => (Icons.block, '已拒绝', cs.onSurfaceVariant),
         ProposalStatus.failed => (Icons.error_outline, '失败', cs.error),
+        ProposalStatus.superseded => (
+            Icons.update_disabled_outlined,
+            '已被覆盖',
+            Colors.blueGrey.shade600,
+          ),
         _ => (Icons.hourglass_top, status, cs.onSurfaceVariant),
       };
 
@@ -92,6 +101,7 @@ class ProposalCard extends StatelessWidget {
     final entries = <MapEntry<String, String>>[];
     for (final e in proposal.payload.entries) {
       if (e.key.startsWith('_')) continue;
+      if (e.key == 'base') continue; // crdt base 版本快照，非展示内容
       final v = e.value;
       entries.add(MapEntry(e.key, v is String ? v : jsonEncode(v)));
       if (entries.length >= 4) break;
@@ -209,7 +219,15 @@ class ProposalCard extends StatelessWidget {
                     minimumSize: const Size(64, 48),
                     tapTargetSize: MaterialTapTargetSize.padded),
                 onPressed: onUndo,
-                child: const Text('撤销')),
+                child: const Text('撤销'))
+          else if (proposal.status == ProposalStatus.superseded &&
+              onResubmit != null)
+            TextButton(
+                style: TextButton.styleFrom(
+                    minimumSize: const Size(64, 48),
+                    tapTargetSize: MaterialTapTargetSize.padded),
+                onPressed: onResubmit,
+                child: const Text('重新提交')),
         ],
       ),
     );

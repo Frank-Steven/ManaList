@@ -4,46 +4,35 @@ import 'package:image_picker/image_picker.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../models/note.dart';
-import '../../models/task.dart';
-import '../../services/anchor_service.dart';
-import '../../services/assistant/models.dart';
 import '../../services/database.dart';
 import '../../services/library_file_service.dart';
 import '../../services/system_intent.dart';
-import '../shared/anchor_highlight_controller.dart';
 import '../shared/anchored_markdown.dart';
-import '../tasks/task_navigation.dart';
-import '../tasks/task_picker.dart';
 
-/// 笔记编辑器（设计 §4；v3 阶段 4 markdown 化，design-v3 §3.3、details §1.3）：
-/// 标题 + 正文，退出自动保存，无保存按钮。
+/// 笔记编辑器（设计 §4）：标题 + 正文，退出自动保存，无保存按钮。
 ///
-/// v3 阶段 4 变更：
-/// - 双模式：编辑态 = 纯文本 TextField + [AnchorHighlightController]
-///   高亮 marker（不做 WYSIWYG）；预览态 = [AnchoredMarkdownBody]
-///   （锚点 chip 可点击跳任务详情）。plain 笔记预览维持纯文本渲染。
-/// - 手动锚点：编辑态工具栏「添加任务锚点」（取选中文本/光标处），预览态
-///   长按选段的上下文菜单「添加任务锚点」；plain 笔记先弹「转为 Markdown」
-///   一次性确认（纯文本是 markdown 合法子集，无损）。
-/// - 附件：插入图片/文件 → 入 files 表 → 正文插入 `![name](file://id)`。
+/// - 双模式：编辑态 = 纯文本 TextField；预览态 = [AnchoredMarkdownBody]
+///   （markdown 笔记）。plain 笔记预览维持纯文本渲染。
+/// - 附件：插入图片/文件 → 入 files 表 → 正文插入 `![name](file://id)`；
+///   plain 笔记插图前弹一次性「转为 Markdown」确认（纯文本是 markdown
+///   合法子集，无损）。
+/// - v12（anchors-v2.md §3）：正文不再写入锚点 marker，编辑态高亮与
+///   「添加任务锚点」入口废弃；任务关联改为章节级「关联任务」区
+///   （NotesListPage），正文完全归作者。
 ///
 /// - [existing] 非空 = 编辑已有笔记；否则按 [chapterId] 新建（content_format
 ///   默认 markdown）。
-/// - [highlightAnchorId] 非空 = 反向跳转进入：直接落到预览态并高亮/定位
-///   该锚点 chip。
 /// - 标题留空时取正文首个非空行的前 20 字作标题；标题、正文均为空则不保存。
 /// - pop 返回值：新建且实际入库时为新建的 [Note]，其余情况为 null
 ///   （由调用方负责撤销注册）。
 class NoteEditorPage extends StatefulWidget {
   final Note? existing;
   final String? chapterId;
-  final String? highlightAnchorId;
 
   const NoteEditorPage({
     super.key,
     this.existing,
     this.chapterId,
-    this.highlightAnchorId,
   });
 
   @override
@@ -52,7 +41,7 @@ class NoteEditorPage extends StatefulWidget {
 
 class _NoteEditorPageState extends State<NoteEditorPage> {
   late final TextEditingController _titleController;
-  late final AnchorHighlightController _contentController;
+  late final TextEditingController _contentController;
 
   /// 笔记格式（'markdown' / 'plain'）；新建默认 markdown。
   late String _contentFormat =
@@ -62,20 +51,17 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   late List<String> _attachments =
       List<String>.of(widget.existing?.attachments ?? const []);
 
-  /// false=编辑态 true=预览态；反向跳转（highlightAnchorId）直接落预览态。
-  late bool _preview = widget.highlightAnchorId != null;
+  /// false=编辑态 true=预览态。
+  bool _preview = false;
 
   bool _allowPop = false;
   bool _exiting = false;
   Future<void>? _saveFuture;
   Note? _inserted;
 
-  /// 库内当前状态快照（初始 = [NoteEditorPage.existing]，每次成功落库/
-  /// 锚点同步后更新）——保存时与快照比较，避免冗余写库。
+  /// 库内当前状态快照（初始 = [NoteEditorPage.existing]，每次成功落库
+  /// 后更新）——保存时与快照比较，避免冗余写库。
   late Note? _persistedNote = widget.existing;
-
-  /// 预览态 SelectionArea 当前选中的片段（「添加任务锚点」菜单用）。
-  String? _selectedText;
 
   bool get _isMarkdown => _contentFormat == 'markdown';
 
@@ -85,7 +71,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     _titleController =
         TextEditingController(text: widget.existing?.title ?? '');
     _contentController =
-        AnchorHighlightController(text: widget.existing?.content ?? '');
+        TextEditingController(text: widget.existing?.content ?? '');
   }
 
   @override
@@ -177,7 +163,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       ..showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  /// plain 笔记加锚点/插图前的一次性「转为 Markdown」确认（details §1.3）。
+  /// plain 笔记插图前的一次性「转为 Markdown」确认（details §1.3）。
   /// 已是 markdown 直接返回 true；用户取消返回 false。
   Future<bool> _ensureMarkdown() async {
     if (_isMarkdown) return true;
@@ -185,7 +171,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('转为 Markdown'),
-        content: const Text('锚点与图片需要 Markdown 渲染。纯文本是 Markdown 的合法子集，'
+        content: const Text('图片需要 Markdown 渲染。纯文本是 Markdown 的合法子集，'
             '转换不改动正文内容；转换后预览将按 Markdown 渲染。'),
         actions: [
           TextButton(
@@ -208,71 +194,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       if (_inserted != null) _inserted = updated;
     }
     return true;
-  }
-
-  /// 确保笔记已入库（锚点/附件要写 notes 行）；返回笔记 id，未入库且
-  /// 内容为空（保存不了）时返回 null。
-  /// 锚点写入以库内正文为准，先强制把最新编辑刷进库（_saveFuture 缓存的
-  /// 可能是旧正文，否则 anchorText 定位会失败）。
-  Future<String?> _ensurePersisted() async {
-    _saveFuture = null;
-    await _save();
-    return _persistedNote?.id;
-  }
-
-  /// 手动锚点主流程（design-v3 §3.3）：选/建任务 → AnchorService 插
-  /// marker + 写表 → 编辑器内容与库内正文同步。
-  /// [anchorText] 为空时追加到正文末尾。
-  Future<void> _addAnchor(String? anchorText) async {
-    final text = anchorText?.trim();
-    if (!await _ensureMarkdown()) return;
-    if (!mounted) return;
-    final task = await showTaskPicker(
-        context, seedTitle: (text == null || text.isEmpty) ? null : text);
-    if (task == null || !mounted) return;
-    final noteId = await _ensurePersisted();
-    if (noteId == null) {
-      _toast('请先输入内容再添加锚点');
-      return;
-    }
-    final result = await AnchorService.instance.insertAnchor(
-      taskId: task.id,
-      targetType: AnchorTargetType.note,
-      targetId: noteId,
-      anchorText: (text == null || text.isEmpty) ? null : text,
-    );
-    if (!mounted) return;
-    if (!result.ok) {
-      _toast(result.error ?? '添加锚点失败');
-      return;
-    }
-    // 库内正文已被 AnchorService 改写（含 marker），回读同步编辑器。
-    final note = await AppDatabase.instance.getNoteById(noteId);
-    if (!mounted || note == null) return;
-    _persistedNote = note;
-    setState(() => _contentController.text = note.content);
-    _saveFuture = null; // 内容变了，允许再次保存
-    _toast(result.multipleMatches ? '已添加锚点（多处出现，定位在第一处）' : '已添加锚点');
-  }
-
-  /// 编辑态工具栏「添加任务锚点」：取当前选中文本，无选中则追加到末尾。
-  Future<void> _addAnchorFromEditSelection() {
-    final sel = _contentController.selection;
-    final text = _contentController.text;
-    String? selected;
-    if (sel.isValid && !sel.isCollapsed &&
-        sel.start >= 0 && sel.end <= text.length) {
-      selected = text.substring(sel.start, sel.end);
-    }
-    return _addAnchor(selected);
-  }
-
-  /// 预览态长按选段「添加任务锚点」（SelectionArea 上下文菜单）。
-  Future<void> _addAnchorFromPreviewSelection() async {
-    final text = _selectedText?.trim();
-    if (!mounted) return;
-    if (text == null || text.isEmpty) return;
-    await _addAnchor(text);
   }
 
   /// 插入附件（design-v3 §3.3）：图片/文件 → 入 files 表 → 光标处插入
@@ -360,18 +281,12 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
             textInputAction: TextInputAction.next,
           ),
           actions: [
-            if (!_preview) ...[
-              IconButton(
-                tooltip: '添加任务锚点',
-                onPressed: _addAnchorFromEditSelection,
-                icon: const Icon(Icons.add_link, size: 20),
-              ),
+            if (!_preview)
               IconButton(
                 tooltip: '插入图片/文件',
                 onPressed: _insertAttachment,
                 icon: const Icon(Icons.attach_file, size: 20),
               ),
-            ],
             IconButton(
               tooltip: _preview ? '编辑' : '预览',
               onPressed: () => setState(() => _preview = !_preview),
@@ -402,8 +317,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     );
   }
 
-  /// 预览态（details §1.3）：markdown 笔记走锚点渲染管线（SelectionArea
-  /// 提供长按选段 + 「添加任务锚点」菜单）；plain 笔记维持纯文本渲染。
+  /// 预览态：markdown 笔记走统一渲染管线（SelectionArea 提供系统选择/复制）；
+  /// plain 笔记维持纯文本渲染。
   Widget _buildPreview() {
     final content = _contentController.text;
     if (!_isMarkdown) {
@@ -418,27 +333,8 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: SelectionArea(
-        onSelectionChanged: (content) =>
-            _selectedText = content?.plainText,
-        contextMenuBuilder: (context, selectableRegionState) {
-          return AdaptiveTextSelectionToolbar.buttonItems(
-            anchors: selectableRegionState.contextMenuAnchors,
-            buttonItems: [
-              ...selectableRegionState.contextMenuButtonItems,
-              ContextMenuButtonItem(
-                label: '添加任务锚点',
-                onPressed: () {
-                  ContextMenuController.removeAny();
-                  _addAnchorFromPreviewSelection();
-                },
-              ),
-            ],
-          );
-        },
         child: AnchoredMarkdownBody(
           data: content.isEmpty ? '（无内容）' : content,
-          highlightAnchorId: widget.highlightAnchorId,
-          onOpenTask: (Task t) => showTaskDetailSheet(context, t),
         ),
       ),
     );

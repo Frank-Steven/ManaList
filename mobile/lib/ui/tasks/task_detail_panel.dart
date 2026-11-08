@@ -79,7 +79,7 @@ class _TaskDetailPanelState extends State<TaskDetailPanel> {
     final parent =
         t.parentId == null ? null : await db.getTaskById(t.parentId!);
     final children = await db.getChildTasks(t.id);
-    // v3 阶段 4：来源锚点（message/note/file 统一列出，图标区分）。
+    // 来源锚点（anchors-v2 §3：message/chapter/file 统一列出，图标区分）。
     final anchors = await db.anchorsForTask(t.id);
     final sources = <_AnchorSource>[];
     for (final a in anchors) {
@@ -87,9 +87,9 @@ class _TaskDetailPanelState extends State<TaskDetailPanel> {
         case AnchorTargetType.message:
           final msg = await db.getMessageById(a.targetId);
           if (msg != null) sources.add(_AnchorSource(a, msg.title));
-        case AnchorTargetType.note:
-          final note = await db.getNoteById(a.targetId);
-          if (note != null) sources.add(_AnchorSource(a, note.title));
+        case AnchorTargetType.chapter:
+          final chapter = await db.getChapterById(a.targetId);
+          if (chapter != null) sources.add(_AnchorSource(a, chapter.name));
         case AnchorTargetType.file:
           final file = await db.getFileById(a.targetId);
           if (file != null) sources.add(_AnchorSource(a, file.name));
@@ -113,7 +113,7 @@ class _TaskDetailPanelState extends State<TaskDetailPanel> {
   }
 
   IconData _anchorIcon(String targetType) => switch (targetType) {
-        AnchorTargetType.note => Icons.edit_note,
+        AnchorTargetType.chapter => Icons.edit_note,
         AnchorTargetType.file => Icons.insert_drive_file_outlined,
         _ => Icons.message_outlined,
       };

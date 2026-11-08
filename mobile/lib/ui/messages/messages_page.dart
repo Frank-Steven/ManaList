@@ -422,7 +422,7 @@ class MessagesPageState extends State<MessagesPage> {
       await _db.updateTask(result.parentExpanded!);
     }
     await _db.insertTask(task);
-    // v8：消息 ↔ 任务关联落为锚点（marker 追加到正文末尾）
+    // 消息 ↔ 任务关联落为对象级锚点（只落 task_anchors 表，不动正文）
     final anchorResult = await AnchorService.instance.insertAnchor(
         taskId: task.id,
         targetType: AnchorTargetType.message,
@@ -432,7 +432,6 @@ class MessagesPageState extends State<MessagesPage> {
     UndoService.instance.register(
       label: '已创建任务',
       undo: () async {
-        // 先摘锚点（清 marker），再删任务——避免 deleteTasks 残迹化留文本
         if (anchorId != null) {
           await AnchorService.instance.removeAnchor(anchorId);
         }

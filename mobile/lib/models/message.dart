@@ -2,19 +2,14 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 
-import '../services/assistant/models.dart';
-
 /// SHA-256(packageName|title|body|postedAt)，消息入库去重的统一算法。
 ///
-/// v3（design-v3-details §1.4）：参与哈希的正文必须先剥离锚点 marker。
-/// strip 内建在本函数里，所有调用点（通知采集入库、导入、手动添加、
-/// 编辑保存/锚点插入移除时的重算）天然统一，逐个调用点 strip 反而可能漏。
-/// strip 不做空白折叠：追加式 marker 留下的空格差异同样参与哈希。
+/// v12（anchors-v2.md §5）：正文不再含锚点 marker，哈希对原文直接计算；
+/// v12 迁移会把存量 marker 剥离并按本函数重算受影响行。
 String computeContentHash(
     String packageName, String title, String body, int postedAt) {
   return sha256
-      .convert(
-          utf8.encode('$packageName|$title|${stripAnchorMarkers(body)}|$postedAt'))
+      .convert(utf8.encode('$packageName|$title|$body|$postedAt'))
       .toString();
 }
 

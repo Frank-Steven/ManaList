@@ -43,8 +43,6 @@ void main() {
     await createBaseTables(db);
     await db.execute(
         'CREATE TABLE notebooks(id TEXT PRIMARY KEY, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)');
-    await db.execute(
-        'CREATE TABLE chapters(id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)');
     return db;
   }
 
@@ -66,7 +64,7 @@ void main() {
       'is_annual': 0, 'source_message_id': null, 'status': 'archived',
       'created_at': 1002, 'updated_at': 1003, 'parent_id': 't-parent',
     });
-    // 消息：m1 正文带 marker（与锚点一致），m2 带「坏」锚点（正文无 marker）
+    // 消息：m1 正文带旧版行内 marker（导入侧归一化剥离），m2 纯文本
     await db1.insert('messages', {
       'id': 'm1', 'package_name': 'com.test', 'app_name': 'Test',
       'channel_id': null, 'conversation_title': '群聊', 'sender': '张三',
@@ -109,7 +107,7 @@ void main() {
       'size': payload.length, 'local_path': att.access.value,
       'source': 'user_upload', 'created_at': 5000,
     });
-    // 锚点：a1 一致（marker 在 m1 正文里），a-bad 不一致（m2 正文无 marker）
+    // 锚点：两条均指向存在的消息，对象级保留
     await db1.insert('task_anchors', {
       'id': anchorId1, 'task_id': 't-parent', 'target_type': 'message',
       'target_id': 'm1', 'label': '周报', 'created_by': 'user',
@@ -137,9 +135,9 @@ void main() {
     expect(result.notes, 1);
     expect(result.files, 1);
     expect(result.anchors, 2);
-    // marker 一致性警告：a-bad 的正文缺 marker
-    expect(result.warnings, hasLength(1));
-    expect(result.warnings.single, contains(anchorIdBad));
+    // v12 起导入后统一跑对象级归一化：正文 marker 剥离、锚点保留；
+    // 两个锚点目标均存在 → 无警告
+    expect(result.warnings, isEmpty);
 
     // 任务逐字段一致（原 id、parent_id、archived 全保留）
     final tasks = await rows(db2, 'tasks');
@@ -149,17 +147,16 @@ void main() {
     expect(child['status'], 'archived');
     expect(child['start_at'], 1761900000000);
 
-    // 消息逐字段一致，唯 content_hash 按 §1.4 重算
+    // 消息逐字段一致，唯 content_hash 按 §1.4 重算；
+    // v12 归一化：正文中的行内 marker 被剥离（锚点行保留）
     final messages = await rows(db2, 'messages');
     final m1 = messages.singleWhere((m) => m['id'] == 'm1');
-    expect(m1['body'], '周五前交 ⟦task:$anchorId1⟧');
+    expect(m1['body'], '周五前交');
     expect(m1['priority'], 'red');
     expect(m1['status'], 'processed');
     expect(m1['content_hash'], isNot('stale-hash-m1'));
-    expect(
-        m1['content_hash'],
-        computeContentHash(
-            'com.test', '记得写周报', '周五前交 ⟦task:$anchorId1⟧', 1700000000000));
+    expect(m1['content_hash'],
+        computeContentHash('com.test', '记得写周报', '周五前交', 1700000000000));
     final m2 = messages.singleWhere((m) => m['id'] == 'm2');
     expect(m2['edited_at'], 1700000002000);
 

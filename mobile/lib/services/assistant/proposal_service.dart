@@ -2,6 +2,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../models/message.dart';
 import '../../models/task.dart';
+import '../crdt.dart';
 import '../database.dart';
 import 'models.dart';
 import 'proposal_executor.dart';
@@ -115,18 +116,62 @@ class ProposalService {
     final existing = await db.getProposalById(id);
     if (existing != null) return ProposalDuplicate(existing);
 
+    // crdt.md §3.1：修改/删除类提案落 pending 时携带目标当前版本（base），
+    // 审批时据此做三态裁决；创建类提案无 base（新对象永不冲突）。
+    final base = await captureBase(tool, args);
     final proposal = ChangeProposal(
       id: id,
       conversationId: conversationId,
       batchId: batchId,
       tool: tool,
       summary: summarize(tool, args),
-      payload: args,
+      payload: base == null ? args : {...args, 'base': base},
       status: ProposalStatus.pending,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
     await db.insertProposal(proposal);
     return ProposalCreated(proposal);
+  }
+
+  /// 捕获提案 base（crdt.md §3.1）：目标字段当前的 (lamport, actor) 版本。
+  /// 无 base 语义的工具（创建类、锚点集合类、追加类）返回 null。
+  static Future<Map<String, dynamic>?> captureBase(
+      String tool, Map<String, dynamic> args) async {
+    final db = AppDatabase.instance;
+    Future<Map<String, dynamic>?> fieldStamp(String target) async =>
+        (await db.currentVersion(target))?.toJson();
+    switch (tool) {
+      case ToolNames.taskUpdate:
+        final id = args['id'] as String;
+        const mutable = {
+          'title',
+          'description',
+          'kind',
+          'startAt',
+          'endAt',
+          'priority',
+          'status'
+        };
+        final fields = <String, dynamic>{};
+        for (final f in args.keys.where(mutable.contains)) {
+          fields[f] = await fieldStamp(taskFieldTarget(id, f));
+        }
+        return {'fields': fields};
+      case ToolNames.taskDelete:
+        final id = args['id'] as String;
+        return {
+          'task': (await db.currentVersionPrefix(taskPrefix(id)))?.toJson()
+        };
+      case ToolNames.messageSetPriority:
+        return {
+          'fields': {
+            'priority': await fieldStamp(
+                messageFieldTarget(args['messageId'] as String, 'priority')),
+          }
+        };
+      default:
+        return null;
+    }
   }
 
   /// B15 收尾：返回「目标消息 id 不在选中集合内」的那个 id（null = 不拦）。
@@ -318,19 +363,6 @@ class ProposalService {
         }
         return null;
 
-      case ToolNames.noteReplaceSection:
-        if (_reqString(args, 'noteId') != null) {
-          return _reqString(args, 'noteId');
-        }
-        if (_reqString(args, 'heading') != null) {
-          return _reqString(args, 'heading');
-        }
-        if (args['content'] is! String) return '缺少必填参数: content';
-        if (await db.getNoteById(args['noteId'] as String) == null) {
-          return '笔记不存在: ${args['noteId']}';
-        }
-        return null;
-
       case ToolNames.noteRead:
         if (_reqString(args, 'noteId') != null) {
           return _reqString(args, 'noteId');
@@ -343,11 +375,11 @@ class ProposalService {
       case ToolNames.anchorCreate:
         final targetType = args['targetType'];
         if (!{
-          AnchorTargetType.note,
+          AnchorTargetType.chapter,
           AnchorTargetType.message,
           AnchorTargetType.file
         }.contains(targetType)) {
-          return 'targetType 须为 note|message|file';
+          return 'targetType 须为 chapter|message|file';
         }
         if (_reqString(args, 'targetId') != null) {
           return _reqString(args, 'targetId');
@@ -355,19 +387,13 @@ class ProposalService {
         if (_reqString(args, 'taskId') != null) return _reqString(args, 'taskId');
         final targetId = args['targetId'] as String;
         final exists = switch (targetType) {
-          AnchorTargetType.note => await db.getNoteById(targetId) != null,
+          AnchorTargetType.chapter => await db.getChapterById(targetId) != null,
           AnchorTargetType.message => await db.getMessageById(targetId) != null,
           _ => await db.getFileById(targetId) != null,
         };
         if (!exists) return '锚点目标不存在: $targetType/$targetId';
         if (await db.getTaskById(args['taskId'] as String) == null) {
           return '任务不存在: ${args['taskId']}';
-        }
-        if (targetType != AnchorTargetType.file) {
-          final at = args['anchorText'];
-          if (at is! String || at.isEmpty) {
-            return '笔记/消息锚点需要 anchorText（正文定位文本）';
-          }
         }
         return null;
 
@@ -416,8 +442,6 @@ class ProposalService {
         return '新建笔记「${args['title']}」';
       case ToolNames.noteAppend:
         return '向笔记 ${args['noteId']} 追加内容';
-      case ToolNames.noteReplaceSection:
-        return '替换笔记 ${args['noteId']} 的「${args['heading']}」区段';
       case ToolNames.anchorCreate:
         return '在 ${args['targetType']} ${args['targetId']} 上为任务 ${args['taskId']} 建锚点';
       case ToolNames.anchorRemove:
@@ -439,7 +463,6 @@ class ProposalService {
           'task',
         ToolNames.noteCreate ||
         ToolNames.noteAppend ||
-        ToolNames.noteReplaceSection ||
         ToolNames.noteRead =>
           'note',
         ToolNames.anchorCreate || ToolNames.anchorRemove => 'anchor',

@@ -5,31 +5,25 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../models/message.dart';
-import '../../models/task.dart';
-import '../../services/anchor_service.dart';
-import '../../services/app_ui_state.dart';
 import '../../services/assistant/models.dart';
 import '../../services/attachment_store.dart';
 import '../../services/database.dart';
 import '../../services/fold_markers.dart';
 import '../../services/system_intent.dart';
 import '../shared/anchored_markdown.dart';
-import '../tasks/task_navigation.dart';
-import '../tasks/task_picker.dart';
+import '../shared/linked_tasks_section.dart';
 
-/// 消息详情面板（P3-2 → F07/F08/F09/F10/F11；v3 阶段 4 锚点化）。
+/// 消息详情面板（P3-2 → F07/F08/F09/F10/F11；v12 对象级锚点）。
 ///
 /// - 看图（缩略图点击放大）；
 /// - F07 编辑正文 / 增删附件（写 messages.body / attachments，并打 edited_at）；
-/// - F08 展示关联待办（v8 起走 task_anchors），点击跳到任务页；
+/// - 「关联任务」区（anchors-v2.md §3）：对象级锚点 chip + 添加/移除，
+///   正文不再写入 marker（受限写入通道取消）；
 /// - F09 附件里的链接可「打开」「复制」；
 /// - F10 附件里的文件可「导出到下载」（MediaStore，不需要存储权限）；
 /// - F11 小程序附件如实说明暂不支持打开，并允许复制路径。
 ///
-/// v3 阶段 4（design-v3 §3.4）：
-/// - 正文改用统一 markdown 渲染管线（[AnchoredMarkdownBody]，只读）：
-///   锚点 marker 显示为可点击 chip（跳任务详情）；
-/// - 长按选段上下文菜单「添加任务锚点」（受限写入，走 edited_at）。
+/// 正文用统一 markdown 渲染管线（[AnchoredMarkdownBody]，只读）。
 Future<void> showMessageDetail(BuildContext context, Message m) {
   return showModalBottomSheet<void>(
     context: context,
@@ -66,33 +60,8 @@ class _MessageDetailState extends State<_MessageDetail> {
   late String _body = widget.message.body;
   late List<Attachment> _attachments =
       List<Attachment>.of(widget.message.attachments);
-  List<Task>? _linkedTasks;
-  bool _loadingTasks = true;
-
-  /// SelectionArea 当前选中的正文片段（「添加任务锚点」菜单用）。
-  String? _selectedText;
 
   Message get message => widget.message;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadLinkedTasks();
-  }
-
-  Future<void> _loadLinkedTasks() async {
-    try {
-      final tasks = await AppDatabase.instance.tasksForMessage(message.id);
-      if (mounted) {
-        setState(() {
-          _linkedTasks = tasks;
-          _loadingTasks = false;
-        });
-      }
-    } catch (_) {
-      if (mounted) setState(() => _loadingTasks = false);
-    }
-  }
 
   Future<void> _editBody() async {
     final controller = TextEditingController(text: _body);
@@ -210,46 +179,6 @@ class _MessageDetailState extends State<_MessageDetail> {
     return file.uri.pathSegments.last;
   }
 
-  /// F14：跳任务页并**定位到该任务**（切 tab → 投递定位请求 →
-  /// 任务页切列表视图、滚动顶部对齐 + 约 1 秒临时高亮）。
-  void _jumpToTask(Task t) {
-    Navigator.of(context).pop();
-    // 先切页：任务页若尚未创建，壳层在这一帧懒构建它；请求留在 AppUiState，
-    // 任务页首帧补消费（未消费的请求不会被丢弃）。
-    AppUiState.instance.setTab(AppUiState.tasksTabIndex);
-    AppUiState.instance.requestTaskFocus(t.id);
-  }
-
-  /// 长按选段「添加任务锚点」（design-v3 §3.4）：选/建任务 →
-  /// AnchorService 受限写入消息正文（marker + edited_at 留痕）。
-  /// 选中文本经 SelectionArea.onSelectionChanged 捕获在 [_selectedText]。
-  Future<void> _addAnchorFromSelection() async {
-    final text = _selectedText?.trim();
-    if (!mounted || text == null || text.isEmpty) return;
-    final task = await showTaskPicker(context, seedTitle: text);
-    if (task == null || !mounted) return;
-    final result = await AnchorService.instance.insertAnchor(
-      taskId: task.id,
-      targetType: AnchorTargetType.message,
-      targetId: message.id,
-      anchorText: text,
-    );
-    if (!mounted) return;
-    if (!result.ok) {
-      _toast(result.error ?? '添加锚点失败');
-      return;
-    }
-    // 正文已被受限写入（含 marker），回读同步展示与关联列表。
-    final fresh = await AppDatabase.instance.getMessageById(message.id);
-    if (!mounted) return;
-    setState(() {
-      if (fresh != null) _body = fresh.body;
-      _loadingTasks = true;
-    });
-    _loadLinkedTasks();
-    _toast(result.multipleMatches ? '已添加锚点（多处出现，定位在第一处）' : '已添加锚点');
-  }
-
   void _toast(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -295,51 +224,16 @@ class _MessageDetailState extends State<_MessageDetail> {
           ],
         ),
         SelectionArea(
-          onSelectionChanged: (content) =>
-              _selectedText = content?.plainText,
-          contextMenuBuilder: (context, selectableRegionState) {
-            return AdaptiveTextSelectionToolbar.buttonItems(
-              anchors: selectableRegionState.contextMenuAnchors,
-              buttonItems: [
-                ...selectableRegionState.contextMenuButtonItems,
-                ContextMenuButtonItem(
-                  label: '添加任务锚点',
-                  onPressed: () {
-                    ContextMenuController.removeAny();
-                    _addAnchorFromSelection();
-                  },
-                ),
-              ],
-            );
-          },
           child: AnchoredMarkdownBody(
             data: _body.isEmpty ? '（无正文）' : _body,
-            onOpenTask: (t) => showTaskDetailSheet(context, t),
           ),
         ),
         const SizedBox(height: 16),
-        Row(
-          children: [
-            Icon(Icons.checklist_rtl, size: 18, color: cs.onSurfaceVariant),
-            const SizedBox(width: 6),
-            Text('关联待办',
-                style: tt.labelLarge?.copyWith(color: cs.onSurfaceVariant)),
-          ],
+        LinkedTasksSection(
+          targetType: AnchorTargetType.message,
+          targetId: message.id,
+          seedTitle: message.title,
         ),
-        const SizedBox(height: 6),
-        if (_loadingTasks)
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 6),
-            child: SizedBox(
-                height: 16,
-                width: 16,
-                child: CircularProgressIndicator(strokeWidth: 2)),
-          )
-        else if ((_linkedTasks ?? const <Task>[]).isEmpty)
-          Text('这条消息没有关联待办',
-              style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant))
-        else
-          for (final t in _linkedTasks!) _taskRow(t, cs, tt),
         const SizedBox(height: 16),
         Row(
           children: [
@@ -361,40 +255,6 @@ class _MessageDetailState extends State<_MessageDetail> {
           for (final a in _attachments) _attachment(a),
       ],
     );
-  }
-
-  Widget _taskRow(Task t, ColorScheme cs, TextTheme tt) {
-    final done = t.status == TaskStatus.done;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
-      child: InkWell(
-        onTap: () => _jumpToTask(t),
-        child: Row(
-          children: [
-            Icon(
-              done ? Icons.check_circle_outline : Icons.radio_button_unchecked,
-              size: 16,
-              color: done ? cs.primary : cs.onSurfaceVariant,
-            ),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Text(t.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: tt.bodyMedium),
-            ),
-            if (t.startAt != null)
-              Text(_shortTime(t.startAt!),
-                  style: tt.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _shortTime(int ms) {
-    final d = DateTime.fromMillisecondsSinceEpoch(ms);
-    return '${d.month}-${d.day} ${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
   }
 
   Widget _attachment(Attachment a) {

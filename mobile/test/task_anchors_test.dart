@@ -67,7 +67,11 @@ Future<void> createBaseTables(Database db) async {
   ''');
   await db.execute(
       "CREATE TABLE notes(id TEXT PRIMARY KEY, chapter_id TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', content_format TEXT NOT NULL DEFAULT 'plain', attachments TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+  await db.execute(
+      "CREATE TABLE chapters(id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL, name TEXT NOT NULL, sort INTEGER NOT NULL, created_at INTEGER NOT NULL)");
   await createV8Tables(db);
+  // v12：写路径（任务/优先级/锚点/笔记内容）双写 op_log
+  await createOpLogTable(db);
 }
 
 Future<void> insertMessage(Database db, String id, String body) =>
@@ -117,8 +121,8 @@ void main() {
 
   test('CRUD：插入/按 id 查/按任务查/按目标查/删除', () async {
     await appDb.insertAnchor(anchor(anchorId1, 't1', 'm1', label: '买菜'));
-    await appDb.insertAnchor(anchor(anchorId2, 't1', 'n1',
-        targetType: AnchorTargetType.note, createdAt: 1001));
+    await appDb.insertAnchor(anchor(anchorId2, 't1', 'c1',
+        targetType: AnchorTargetType.chapter, createdAt: 1001));
     await appDb.insertAnchor(anchor(anchorId3, 't2', 'm1', createdAt: 1002));
 
     final byId = await appDb.getAnchorById(anchorId1);
@@ -131,9 +135,10 @@ void main() {
     final forM1 =
         await appDb.anchorsForTarget(AnchorTargetType.message, 'm1');
     expect(forM1.map((a) => a.id), [anchorId1, anchorId3]);
-    // targetType 隔离：笔记 n1 不混进消息查询
-    final forN1 = await appDb.anchorsForTarget(AnchorTargetType.note, 'n1');
-    expect(forN1.single.id, anchorId2);
+    // targetType 隔离：章节 c1 不混进消息查询
+    final forC1 =
+        await appDb.anchorsForTarget(AnchorTargetType.chapter, 'c1');
+    expect(forC1.single.id, anchorId2);
 
     final batch = await appDb.anchorsByIds([anchorId1, anchorId3, 'missing']);
     expect(batch.map((a) => a.id), containsAll([anchorId1, anchorId3]));
@@ -182,7 +187,30 @@ void main() {
     expect(await appDb.anchorsForTask('t1'), isEmpty);
   });
 
-  test('删除笔记级联删锚点行', () async {
+  test('删除章节级联删锚点行（v12：锚点为章节级）', () async {
+    await db.insert('chapters', {
+      'id': 'c1',
+      'notebook_id': 'nb1',
+      'name': '章节',
+      'sort': 0,
+      'created_at': 1000,
+    });
+    await insertTask(db, 't1');
+    await appDb.insertAnchor(anchor(anchorId1, 't1', 'c1',
+        targetType: AnchorTargetType.chapter));
+
+    await appDb.deleteChapter('c1');
+    expect(await appDb.anchorsForTask('t1'), isEmpty);
+  });
+
+  test('删除笔记不影响章节级锚点（v12：锚点不锚单篇笔记）', () async {
+    await db.insert('chapters', {
+      'id': 'c1',
+      'notebook_id': 'nb1',
+      'name': '章节',
+      'sort': 0,
+      'created_at': 1000,
+    });
     await db.insert('notes', {
       'id': 'n1',
       'chapter_id': 'c1',
@@ -191,29 +219,24 @@ void main() {
       'updated_at': 1000,
     });
     await insertTask(db, 't1');
-    await appDb.insertAnchor(anchor(anchorId1, 't1', 'n1',
-        targetType: AnchorTargetType.note));
+    await appDb.insertAnchor(anchor(anchorId1, 't1', 'c1',
+        targetType: AnchorTargetType.chapter));
 
     await appDb.deleteNote('n1');
-    expect(await appDb.anchorsForTask('t1'), isEmpty);
+    expect((await appDb.anchorsForTask('t1')).single.id, anchorId1);
   });
 
-  test('删除任务：锚点残迹化（marker → [任务:label] 纯文本）并删锚点行', () async {
-    await insertMessage(db, 'm1', '记得买菜 ⟦task:$anchorId1⟧');
+  test('删除任务：级联删锚点行，正文不动（对象级锚点不入正文）', () async {
+    await insertMessage(db, 'm1', '记得买菜');
     await insertTask(db, 't1', title: '买菜');
     await appDb.insertAnchor(anchor(anchorId1, 't1', 'm1', label: '买菜'));
 
     await appDb.deleteTasks(['t1']);
 
-    final body = (await db.query('messages', where: "id = 'm1'"))
-        .single['body'] as String;
-    expect(body, '记得买菜 [任务:买菜]', reason: '内容不留空洞、不留死 id');
+    final row = (await db.query('messages', where: "id = 'm1'")).single;
+    expect(row['body'], '记得买菜', reason: '正文完全只读，删除任务不触碰');
+    expect(row['edited_at'], isNull, reason: '无受限写入，不留痕');
     expect(await appDb.anchorsForTask('t1'), isEmpty);
-    // 残迹化走受限写入：edited_at 留痕
-    expect(
-        (await db.query('messages', where: "id = 'm1'"))
-            .single['edited_at'],
-        isNotNull);
   });
 
   test('allAnchors 按创建时间全量返回（存档导出用）', () async {

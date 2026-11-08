@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/note.dart';
-import 'package:msgrepo_mobile/services/anchor_service.dart';
 import 'package:msgrepo_mobile/services/database.dart';
 import 'package:msgrepo_mobile/ui/notes/note_editor_page.dart';
 import 'package:msgrepo_mobile/ui/shared/anchored_markdown.dart';
@@ -9,15 +8,13 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'anchor_service_test.dart' show createSchema;
 
-/// 笔记编辑器双模式回归（design-v3 §3.3、details §1.3）：
-/// - markdown 笔记：编辑态 TextField ↔ 预览态锚点渲染管线切换；
+/// 笔记编辑器双模式回归（anchors-v2 §5 废弃后）：
+/// - markdown 笔记：编辑态 TextField ↔ 预览态 markdown 渲染切换；
 /// - plain 笔记预览维持纯文本（星号原文显示）；
-/// - plain 笔记加锚点先弹「转为 Markdown」一次性确认，转换后插 marker + 写表；
 /// - 新建笔记 content_format 默认 markdown。
 ///
-/// 说明：纯 UI 用例用 [AnchoredMarkdownBody.debugData] 注入联查数据；
-/// 涉及真实 DB 的用例必须在 tester.runAsync 真异步区里跑
-/// （widget 测试的 FakeAsync 区会让 sqflite_ffi 调用挂死）。
+/// 对象级锚点 UI 在章节列表/任务面板（LinkedTasksSection），
+/// 编辑器内不再有锚点入口。
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   sqfliteFfiInit();
@@ -32,13 +29,12 @@ void main() {
         updatedAt: 1000,
       );
 
-  group('纯 UI（联查数据注入，不碰 DB）', () {
+  group('纯 UI（不碰 DB）', () {
     setUp(() {
-      AnchoredMarkdownBody.debugData =
-          (anchors: const {}, tasks: const {}, files: const {});
+      AnchoredMarkdownBody.debugFiles = const {};
     });
 
-    tearDown(() => AnchoredMarkdownBody.debugData = null);
+    tearDown(() => AnchoredMarkdownBody.debugFiles = null);
 
     testWidgets('markdown 笔记：编辑/预览切换，预览按 markdown 渲染',
         (tester) async {
@@ -66,7 +62,8 @@ void main() {
 
     testWidgets('plain 笔记预览维持纯文本渲染（不解析 markdown）', (tester) async {
       await tester.pumpWidget(MaterialApp(
-          home: NoteEditorPage(existing: note('n2', '**不是加粗**', format: 'plain'))));
+          home: NoteEditorPage(
+              existing: note('n2', '**不是加粗**', format: 'plain'))));
       await tester.pumpAndSettle();
 
       await tester.tap(find.byIcon(Icons.visibility_outlined));
@@ -81,118 +78,15 @@ void main() {
     late Database db;
     final appDb = AppDatabase.instance;
 
-    Future<void> insertNote(Note n) => db.insert('notes', n.toRow());
-
-    Future<Note> noteFromDb(String id) async => (await appDb.getNoteById(id))!;
-
     /// runAsync 区内没有 fake clock，pumpAndSettle 不可用；
-    /// 用 pump + 真实延时让异步落库/底部弹层动画落地。
-    /// runAsync 区内：真实延时让 DB 等真异步落地，pump(duration)
-    /// 推进 fake 动画时钟（底部弹层/页面转场靠它）。
-    Future<void> settle(WidgetTester tester,
-        [int times = 10]) async {
+    /// 用 pump + 真实延时让异步落库落地。
+    Future<void> settle(WidgetTester tester, [int times = 10]) async {
       for (var i = 0; i < times; i++) {
         await Future.delayed(const Duration(milliseconds: 30));
         await tester.pump(const Duration(milliseconds: 60));
       }
       await tester.pump();
     }
-
-    testWidgets('plain 笔记加锚点：先确认转 Markdown，再插 marker 写表',
-        (tester) async {
-      await tester.runAsync(() async {
-        db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
-        await createSchema(db);
-        appDb.debugAttachDatabase(db);
-        AnchorService.instance.clearCache();
-        await db.insert('tasks', {
-          'id': 't1',
-          'title': '买菜',
-          'kind': 'point',
-          'priority': 'normal',
-          'status': 'active',
-          'created_at': 1000,
-          'updated_at': 1000,
-        });
-        await insertNote(note('n3', '记得买菜', format: 'plain'));
-
-        await tester.pumpWidget(MaterialApp(
-            home: NoteEditorPage(existing: await noteFromDb('n3'))));
-        await settle(tester);
-
-        // 编辑态工具栏「添加任务锚点」（无选中 → 追加正文末尾）
-        await tester.tap(find.byIcon(Icons.add_link));
-        await settle(tester);
-
-        // 一次性确认「转为 Markdown」
-        expect(find.text('转为 Markdown'), findsOneWidget);
-        await tester.tap(find.text('转换'));
-        await settle(tester);
-
-        // 任务选择器：选已有任务「买菜」
-        expect(find.text('买菜'), findsOneWidget, reason: '选择器列出活动任务');
-        await tester.tap(find.text('买菜'));
-        await settle(tester);
-
-        final saved = await noteFromDb('n3');
-        expect(saved.contentFormat, 'markdown', reason: '已确认转换格式');
-        final m =
-            RegExp(r'⟦task:([0-9a-f-]{36})⟧').firstMatch(saved.content);
-        expect(m, isNotNull, reason: '正文末尾追加了 marker');
-        expect(saved.content, startsWith('记得买菜'));
-
-        final anchor = await appDb.getAnchorById(m!.group(1)!);
-        expect(anchor, isNotNull);
-        expect(anchor!.taskId, 't1');
-        expect(anchor.targetType, 'note');
-        expect(anchor.targetId, 'n3');
-
-        // 编辑器正文与库内同步（含 marker）
-        expect(find.textContaining('⟦task:'), findsOneWidget);
-
-        appDb.debugDetachDatabase();
-        await db.close();
-      });
-    });
-
-    testWidgets('markdown 笔记加锚点：不弹转换确认，直接进任务选择器',
-        (tester) async {
-      await tester.runAsync(() async {
-        db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
-        await createSchema(db);
-        appDb.debugAttachDatabase(db);
-        AnchorService.instance.clearCache();
-        await db.insert('tasks', {
-          'id': 't1',
-          'title': '买菜',
-          'kind': 'point',
-          'priority': 'normal',
-          'status': 'active',
-          'created_at': 1000,
-          'updated_at': 1000,
-        });
-        await insertNote(note('n4', '记得买菜'));
-
-        await tester.pumpWidget(MaterialApp(
-            home: NoteEditorPage(existing: await noteFromDb('n4'))));
-        await settle(tester);
-
-        await tester.tap(find.byIcon(Icons.add_link));
-        await settle(tester);
-
-        expect(find.text('转为 Markdown'), findsNothing);
-        expect(find.text('买菜'), findsOneWidget);
-        await tester.tap(find.text('买菜'));
-        await settle(tester);
-
-        final saved = await noteFromDb('n4');
-        expect(saved.contentFormat, 'markdown');
-        expect(saved.content, contains('⟦task:'));
-
-        appDb.debugDetachDatabase();
-        await db.close();
-      });
-    });
 
     testWidgets('新建笔记默认 content_format = markdown', (tester) async {
       await tester.runAsync(() async {

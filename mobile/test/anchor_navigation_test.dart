@@ -2,25 +2,23 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/message.dart';
 import 'package:msgrepo_mobile/models/task.dart';
-import 'package:msgrepo_mobile/services/anchor_service.dart';
 import 'package:msgrepo_mobile/services/app_ui_state.dart';
 import 'package:msgrepo_mobile/services/assistant/models.dart';
 import 'package:msgrepo_mobile/services/database.dart';
 import 'package:msgrepo_mobile/ui/messages/message_detail_sheet.dart';
-import 'package:msgrepo_mobile/ui/notes/note_editor_page.dart';
-import 'package:msgrepo_mobile/ui/shared/anchored_markdown.dart';
+import 'package:msgrepo_mobile/ui/notes/chapters_page.dart';
+import 'package:msgrepo_mobile/ui/shared/linked_tasks_section.dart';
 import 'package:msgrepo_mobile/ui/tasks/task_detail_panel.dart';
 import 'package:msgrepo_mobile/ui/tasks/task_list_view.dart';
-import 'package:msgrepo_mobile/ui/tasks/task_navigation.dart';
 import 'package:msgrepo_mobile/ui/tasks/tasks_page.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'anchor_service_test.dart' show createSchema;
 
-/// 锚点双向跳转回归（design-v3 §3.4）：
-/// - 正向：锚点 chip 点击 → 任务详情面板（bottom sheet）；
-/// - 反向：任务详情「来源锚点」列表（图标区分 message/note/file）点击 →
-///   笔记跳编辑器（预览态高亮该 chip）/ 消息跳详情 / 文件跳库·文件区。
+/// 锚点双向跳转回归（anchors-v2.md §3，v12 对象级重写）：
+/// - 正向：对象详情「关联任务」区 chip 点击 → 任务详情面板（bottom sheet）；
+/// - 反向：任务详情「来源锚点」列表（图标区分 message/chapter/file）点击 →
+///   章节跳笔记列表页 / 消息跳详情 / 文件跳库·文件区。
 ///
 /// 全部用例在 tester.runAsync 真异步区里跑：widget 测试默认的 FakeAsync
 /// 区会让 sqflite_ffi 的 DB 调用挂死。
@@ -28,7 +26,7 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   sqfliteFfiInit();
 
-  const anchorNoteId = '11111111-1111-1111-1111-111111111111';
+  const anchorChapterId = '11111111-1111-1111-1111-111111111111';
   const anchorMsgId = '22222222-2222-2222-2222-222222222222';
   const anchorFileId = '33333333-3333-3333-3333-333333333333';
 
@@ -75,7 +73,6 @@ void main() {
     );
     await createSchema(db);
     appDb.debugAttachDatabase(db);
-    AnchorService.instance.clearCache();
     AppUiState.instance.setTab(AppUiState.tasksTabIndex);
     AppUiState.instance.setLibrarySection(AppUiState.librarySectionNotes);
     await db.insert('tasks', {
@@ -90,18 +87,26 @@ void main() {
     return db;
   }
 
-  testWidgets('正向：chip 点击弹出任务详情', (tester) async {
+  testWidgets('正向：「关联任务」区 chip 点击弹出任务详情', (tester) async {
     await tester.runAsync(() async {
       final db = await setupDb();
       await insertAnchor(db, anchorMsgId, AnchorTargetType.message, 'm1');
+      await db.insert('messages', {
+        'id': 'm1',
+        'package_name': 'com.test',
+        'title': '家庭群',
+        'body': '下班记得买菜',
+        'posted_at': 2000,
+        'capture_type': 'notification',
+        'content_hash': 'h-m1',
+        'created_at': 2000,
+      });
 
-      await tester.pumpWidget(MaterialApp(
+      await tester.pumpWidget(const MaterialApp(
         home: Scaffold(
-          body: Builder(
-            builder: (context) => AnchoredMarkdownBody(
-              data: '今天要 ⟦task:$anchorMsgId⟧',
-              onOpenTask: (t) => showTaskDetailSheet(context, t),
-            ),
+          body: LinkedTasksSection(
+            targetType: AnchorTargetType.message,
+            targetId: 'm1',
           ),
         ),
       ));
@@ -121,24 +126,21 @@ void main() {
   testWidgets('反向：详情面板列出三类来源锚点，点击各自跳转', (tester) async {
     await tester.runAsync(() async {
       final db = await setupDb();
-      await insertAnchor(db, anchorNoteId, AnchorTargetType.note, 'n1');
+      await insertAnchor(db, anchorChapterId, AnchorTargetType.chapter, 'c1');
       await insertAnchor(db, anchorMsgId, AnchorTargetType.message, 'm1');
       await insertAnchor(db, anchorFileId, AnchorTargetType.file, 'f1');
-      await db.insert('notes', {
-        'id': 'n1',
-        'chapter_id': 'c1',
-        'title': '购物清单',
-        'content': '记得 ⟦task:$anchorNoteId⟧ 别忘',
-        'content_format': 'markdown',
-        'attachments': '[]',
+      await db.insert('chapters', {
+        'id': 'c1',
+        'notebook_id': 'nb1',
+        'name': '购物清单',
+        'sort': 0,
         'created_at': 1000,
-        'updated_at': 1000,
       });
       await db.insert('messages', {
         'id': 'm1',
         'package_name': 'com.test',
         'title': '家庭群',
-        'body': '下班 ⟦task:$anchorMsgId⟧',
+        'body': '下班记得买菜',
         'posted_at': 2000,
         'capture_type': 'notification',
         'content_hash': 'h-m1',
@@ -167,25 +169,15 @@ void main() {
       expect(find.byIcon(Icons.message_outlined), findsOneWidget);
       expect(find.byIcon(Icons.insert_drive_file_outlined), findsOneWidget);
 
-      // 笔记 → 编辑器（预览态 + 锚点 chip 已渲染）
+      // 章节 → 章节笔记列表页
       await tester.tap(find.text('购物清单'));
       await settle(tester);
-      expect(find.byType(NoteEditorPage), findsOneWidget);
-      expect(
-          find.descendant(
-              of: find.byType(NoteEditorPage),
-              matching: find.byType(AnchoredMarkdownBody)),
-          findsOneWidget,
-          reason: '反向跳转落到预览态');
-      expect(
-          find.descendant(
-              of: find.byType(NoteEditorPage), matching: find.text('买菜')),
-          findsOneWidget,
-          reason: '编辑器预览里的锚点 chip');
+      expect(find.byType(NotesListPage), findsOneWidget,
+          reason: '章节锚点反向跳转落到章节笔记列表');
       await tester.pageBack();
       await settle(tester);
 
-      // 消息 → 消息详情面板（底部弹出，正文走锚点渲染管线）
+      // 消息 → 消息详情面板（底部弹出，含「关联任务」区）
       await tester.tap(find.text('家庭群'));
       await settle(tester);
       expect(find.textContaining('下班', findRichText: true), findsOneWidget,
@@ -193,8 +185,8 @@ void main() {
       expect(
           find.descendant(
               of: find.byType(BottomSheet), matching: find.text('买菜')),
-          findsNWidgets(2),
-          reason: '正文锚点 chip + 关联待办行各一处');
+          findsOneWidget,
+          reason: '「关联任务」区 chip（正文里不再有锚点 chip）');
       // 底部弹层没有返回按钮，pageBack 不适用，直接 pop 掉
       tester.state<NavigatorState>(find.byType(Navigator).first).pop();
       await settle(tester);
@@ -239,11 +231,10 @@ void main() {
     return db;
   }
 
-  testWidgets('F14：消息关联待办点击 → 切任务页并投递定位请求', (tester) async {
+  testWidgets('消息详情「关联任务」chip 点击 → 弹任务详情（v12 对象级）',
+      (tester) async {
     await tester.runAsync(() async {
       final db = await seedLinkedMessage(await setupDb());
-      AppUiState.instance.setTab(AppUiState.libraryTabIndex);
-      AppUiState.instance.clearTaskFocus();
 
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
@@ -259,16 +250,13 @@ void main() {
       await tester.tap(find.text('打开详情'));
       await settle(tester);
 
-      expect(find.text('关联待办'), findsOneWidget, reason: '消息详情有关联待办段');
+      expect(find.text('关联任务'), findsOneWidget, reason: '消息详情有关联任务区');
 
       await tester.tap(find.text('买菜').first);
       await settle(tester);
 
-      expect(AppUiState.instance.tabIndex, AppUiState.tasksTabIndex,
-          reason: '点击关联待办要切到任务页');
-      expect(AppUiState.instance.pendingTaskFocusId, 't1',
-          reason: '定位请求留给任务页消费（本用例没挂任务页）');
-      expect(find.byType(BottomSheet), findsNothing, reason: '详情面板应已收起');
+      expect(find.byType(TaskDetailPanel), findsOneWidget,
+          reason: 'chip 点击弹任务详情（anchors-v2 §3 双向跳转）');
 
       appDb.debugDetachDatabase();
       await db.close();

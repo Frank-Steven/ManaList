@@ -2,13 +2,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/message.dart';
 import 'package:msgrepo_mobile/services/anchor_service.dart';
 import 'package:msgrepo_mobile/services/assistant/models.dart';
+import 'package:msgrepo_mobile/services/crdt.dart';
 import 'package:msgrepo_mobile/services/database.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
-/// 锚点服务回归（design-v3-details §1.5）：
-/// 插入（anchorText 首次出现处之后 / 多处取第一处并注明 / 定位失败报错 /
-/// 缺省追加到末尾）、移除（marker 清除 + edited_at 留痕 + content_hash 重算）、
-/// 文件锚点只落表、残迹化、渲染预取缓存。
+/// 锚点服务回归（anchors-v2.md §2，v12 重写）：
+/// 对象级锚点只落 task_anchors 表——插入（存在性校验 / 同三元组幂等去重 /
+/// label 缺省取任务标题）、移除（只删行，正文不动）、op_log 双写
+/// （or_add / or_remove，crdt.md §4.3）。
 /// 用 sqflite_common_ffi 内存库注入 AppDatabase 单例。
 Future<void> createSchema(Database db) async {
   await db.execute('''
@@ -51,8 +52,11 @@ Future<void> createSchema(Database db) async {
     )
   ''');
   await db.execute(
+      "CREATE TABLE chapters(id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL, name TEXT NOT NULL, sort INTEGER NOT NULL, created_at INTEGER NOT NULL)");
+  await db.execute(
       "CREATE TABLE notes(id TEXT PRIMARY KEY, chapter_id TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', content_format TEXT NOT NULL DEFAULT 'plain', attachments TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   await createV8Tables(db);
+  await createOpLogTable(db);
 }
 
 void main() {
@@ -67,7 +71,6 @@ void main() {
     db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
     await createSchema(db);
     appDb.debugAttachDatabase(db);
-    svc.clearCache();
     await db.insert('tasks', {
       'id': 't1',
       'title': '买菜',
@@ -99,100 +102,90 @@ void main() {
       (await db.query('messages', columns: ['body'], where: 'id = ?', whereArgs: [id]))
           .single['body'] as String;
 
-  test('插入：anchorText 首次出现处之后插入 marker', () async {
+  test('插入：只落表行，正文不动、edited_at 不留痕', () async {
     await insertMessage('m1', '记得买菜，顺路取快递');
     final r = await svc.insertAnchor(
         taskId: 't1',
         targetType: AnchorTargetType.message,
-        targetId: 'm1',
-        anchorText: '买菜');
+        targetId: 'm1');
     expect(r.ok, isTrue);
-    expect(r.multipleMatches, isFalse);
-    expect(await bodyOf('m1'), '记得买菜⟦task:${r.anchor!.id}⟧，顺路取快递');
+    expect(await bodyOf('m1'), '记得买菜，顺路取快递', reason: '正文完全只读');
 
     final row = await appDb.getAnchorById(r.anchor!.id);
     expect(row?.taskId, 't1');
     expect(row?.label, '买菜', reason: 'label 缺省取任务标题快照');
     expect(row?.createdBy, AnchorCreatedBy.user);
-    // 受限写入留痕
-    final msg = await appDb.getMessageById('m1');
-    expect(msg, isNotNull);
-    final edited = (await db.query('messages', where: "id = 'm1'"))
-        .single['edited_at'];
-    expect(edited, isNotNull);
+    expect(
+        (await db.query('messages', where: "id = 'm1'")).single['edited_at'],
+        isNull,
+        reason: '受限写入通道已取消');
   });
 
-  test('插入：多处出现取第一处并注明', () async {
-    await insertMessage('m1', '买牛奶和买面包都要买');
-    final r = await svc.insertAnchor(
-        taskId: 't1',
-        targetType: AnchorTargetType.message,
-        targetId: 'm1',
-        anchorText: '买');
-    expect(r.ok, isTrue);
-    expect(r.multipleMatches, isTrue, reason: '多处出现要在结果里注明');
-    expect(await bodyOf('m1'), '买⟦task:${r.anchor!.id}⟧牛奶和买面包都要买');
-  });
-
-  test('插入：定位失败返回错误，不落任何写入', () async {
-    await insertMessage('m1', '正文里没有那个词');
-    final r = await svc.insertAnchor(
-        taskId: 't1',
-        targetType: AnchorTargetType.message,
-        targetId: 'm1',
-        anchorText: '不存在');
-    expect(r.ok, isFalse);
-    expect(r.error, contains('定位失败'));
-    expect(await bodyOf('m1'), '正文里没有那个词');
-    expect(await appDb.anchorsForTask('t1'), isEmpty);
-  });
-
-  test('插入：anchorText 缺省时追加到正文末尾（空格分隔）', () async {
-    await insertMessage('m1', '记得买菜');
-    final r = await svc.insertAnchor(
+  test('插入：同三元组幂等去重，返回既有行', () async {
+    await insertMessage('m1', '正文');
+    final r1 = await svc.insertAnchor(
         taskId: 't1',
         targetType: AnchorTargetType.message,
         targetId: 'm1');
-    expect(await bodyOf('m1'), '记得买菜 ⟦task:${r.anchor!.id}⟧');
-
-    await insertMessage('m2', '');
     final r2 = await svc.insertAnchor(
         taskId: 't1',
         targetType: AnchorTargetType.message,
-        targetId: 'm2');
-    expect(await bodyOf('m2'), '⟦task:${r2.anchor!.id}⟧',
-        reason: '空正文直接放 marker，不留前导空格');
+        targetId: 'm1');
+    expect(r2.ok, isTrue);
+    expect(r2.alreadyExists, isTrue);
+    expect(r2.anchor!.id, r1.anchor!.id);
+    expect((await appDb.anchorsForTask('t1')).length, 1);
   });
 
-  test('笔记锚点：写入 notes.content 并刷新 updated_at', () async {
-    await db.insert('notes', {
-      'id': 'n1',
-      'chapter_id': 'c1',
-      'title': '笔记',
-      'content': '周三之前交初稿',
+  test('插入：目标/任务不存在返回错误，不落任何写入', () async {
+    final r = await svc.insertAnchor(
+        taskId: 't1',
+        targetType: AnchorTargetType.message,
+        targetId: 'ghost');
+    expect(r.ok, isFalse);
+    expect(r.error, contains('不存在'));
+
+    await insertMessage('m1', '正文');
+    final r2 = await svc.insertAnchor(
+        taskId: 'ghost-task',
+        targetType: AnchorTargetType.message,
+        targetId: 'm1');
+    expect(r2.ok, isFalse);
+    expect(await appDb.anchorsForTask('t1'), isEmpty);
+  });
+
+  test('章节锚点：锚到 chapters.id，不写 notes.content', () async {
+    await db.insert('chapters', {
+      'id': 'c1',
+      'notebook_id': 'nb1',
+      'name': '章节',
+      'sort': 0,
       'created_at': 1000,
-      'updated_at': 1000,
     });
     final r = await svc.insertAnchor(
         taskId: 't1',
-        targetType: AnchorTargetType.note,
-        targetId: 'n1',
-        anchorText: '初稿');
+        targetType: AnchorTargetType.chapter,
+        targetId: 'c1');
     expect(r.ok, isTrue);
-    final note = (await db.query('notes')).single;
-    expect(note['content'], '周三之前交初稿⟦task:${r.anchor!.id}⟧');
-    expect((note['updated_at'] as int) > 1000, isTrue);
+    expect(r.anchor!.targetType, AnchorTargetType.chapter);
   });
 
-  test('文件锚点：只落表行，不动内容', () async {
+  test('文件锚点：只落表行', () async {
+    await db.insert('files', {
+      'id': 'f1',
+      'name': '报销单.pdf',
+      'local_path': '/tmp/f1',
+      'source': 'import',
+      'created_at': 1000,
+    });
     final r = await svc.insertAnchor(
         taskId: 't1', targetType: AnchorTargetType.file, targetId: 'f1');
     expect(r.ok, isTrue);
-    final row = await appDb.getAnchorById(r.anchor!.id);
-    expect(row?.targetType, AnchorTargetType.file);
+    expect((await appDb.getAnchorById(r.anchor!.id))?.targetType,
+        AnchorTargetType.file);
   });
 
-  test('移除：marker 清除、锚点行删除，正文与 content_hash 复原', () async {
+  test('移除：只删锚点行，正文与 content_hash 不变', () async {
     const original = '记得买菜';
     await insertMessage('m1', original);
     final hashBefore = (await db.query('messages', where: "id = 'm1'"))
@@ -202,15 +195,12 @@ void main() {
         taskId: 't1',
         targetType: AnchorTargetType.message,
         targetId: 'm1');
-    expect(await bodyOf('m1'), isNot(original));
-
     final removed = await svc.removeAnchor(r.anchor!.id);
     expect(removed, isTrue);
-    expect(await bodyOf('m1'), original);
     expect(await appDb.getAnchorById(r.anchor!.id), isNull);
     final row = (await db.query('messages', where: "id = 'm1'")).single;
-    expect(row['content_hash'], hashBefore,
-        reason: '插入→移除往返后 content_hash 不变（§1.4 测试点）');
+    expect(row['body'], original);
+    expect(row['content_hash'], hashBefore);
   });
 
   test('移除不存在的锚点返回 false', () async {
@@ -218,44 +208,20 @@ void main() {
         isFalse);
   });
 
-  test('残迹化：该任务所有 marker 替换为 [任务:label] 纯文本', () async {
-    await insertMessage('m1', '记得买菜');
-    await insertMessage('m2', '别忘了买菜');
-    final r1 = await svc.insertAnchor(
-        taskId: 't1',
-        targetType: AnchorTargetType.message,
-        targetId: 'm1');
-    final r2 = await svc.insertAnchor(
-        taskId: 't1',
-        targetType: AnchorTargetType.message,
-        targetId: 'm2',
-        anchorText: '买菜');
-
-    await svc.residualizeForTask('t1');
-
-    expect(await bodyOf('m1'), '记得买菜 [任务:买菜]');
-    expect(await bodyOf('m2'), '别忘了买菜[任务:买菜]');
-    expect(anchorMarkerPattern.hasMatch(await bodyOf('m1')), isFalse,
-        reason: '不留死 id');
-    expect(await appDb.anchorsForTask('t1'), isEmpty);
-    expect(r1.anchor, isNotNull);
-    expect(r2.anchor, isNotNull);
-  });
-
-  test('渲染预取：按正文批量提取 marker id → 批量联查入缓存', () async {
-    await insertMessage('m1', '记得买菜');
+  test('op_log 双写：or_add / or_remove 落账（crdt.md §4.3）', () async {
+    await insertMessage('m1', '正文');
     final r = await svc.insertAnchor(
         taskId: 't1',
         targetType: AnchorTargetType.message,
         targetId: 'm1');
-    svc.clearCache();
+    await svc.removeAnchor(r.anchor!.id);
 
-    final map = await svc.prefetchForBodies(
-        [await bodyOf('m1'), '没有 marker 的正文']);
-    expect(map.keys, [r.anchor!.id]);
-    expect(map[r.anchor!.id]?.taskId, 't1');
-    // 二次预取命中缓存（id 仍返回）
-    final again = await svc.prefetchForBodies([await bodyOf('m1')]);
-    expect(again.keys, [r.anchor!.id]);
+    final ops = await appDb.recentOps();
+    expect(ops.length, 2);
+    expect(ops[1]['kind'], OpKind.orAdd, reason: '新的在前，旧的是 or_add');
+    expect(ops[1]['target'], 'anchors:t1');
+    expect(ops[0]['kind'], OpKind.orRemove);
+    // lamport 单调递增
+    expect((ops[0]['lamport'] as int) > (ops[1]['lamport'] as int), isTrue);
   });
 }

@@ -63,6 +63,8 @@ DDL 变化（v8 → v12 迁移时一并调整）：无新增列；`target_type` 
 
 ## 5. 废弃清单（实现层）
 
+> 2026-11-08：本节已全部落地（批次 A）。`stripAnchorMarkers`/`anchorMarkerPattern` 仅保留给旧版撤销 payload 的兼容读取；删除任务撤销快照的 bodies 恒为空（旧快照兼容回写前剥离 marker）。
+
 随 v12 一并移除/改写：
 
 - `TaskAnchorInlineSyntax`、`MarkdownElementBuilder` 锚点 chip 分支、`AnchorHighlightController`、`AnchoredMarkdownBody` 中的 marker 渲染（组件本身保留给 markdown 正文渲染，去掉锚点职责）；
@@ -74,6 +76,7 @@ DDL 变化（v8 → v12 迁移时一并调整）：无新增列；`target_type` 
 ## 6. v12 迁移（行内 marker → 对象级锚点）
 
 > 2026-11-08：v11 已被批次 D 的 `conversations.pinned` 占用，本节迁移顺延至 v12，与 `crdt.md` §7 同窗口。
+> 2026-11-08：已落地（`migrateToV12` / `normalizeAnchorsToObjectLevel`），迁移测试 `db_v12_migration_test.dart` 全绿 ✅。
 
 1. 扫描 `messages` / `notes` 正文，剥离全部 `⟦task:<id>⟧` marker（纯文本替换，正文恢复原貌）；
 2. 每条被剥离的 marker 转为对象级锚点行：所在消息 → `target_type='message', target_id=messages.id`；所在笔记 → 其所属章节 `target_type='chapter', target_id=chapters.id`（同一对象多个 marker 去重为一条，保留最早 `created_at`）；

@@ -130,12 +130,19 @@ SSA（`assistant.md` §7.1）保持不动：**正文本体不可变**。在此�
 ## 7. 实施与迁移（DB v12 增量）
 
 > 2026-11-08：v11 已被批次 D 的 `conversations.pinned` 占用，本节顺延至 v12。
+> 2026-11-08：本节已全部落地（批次 A），见下方各项 ✅ 与「落地决策」。
 
-1. 新增 `op_log` 表（§2.2 结构）+ `change_proposals.status` 枚举加 `superseded` + payload 加 `base` 字段约定；
-2. 写路径改造：`proposal_executor` 三态裁决管线（§3.2）；人工写路径（任务编辑、完成勾选、锚点增删、优先级标记）统一经 `OpService.apply(op)` 落 log + 更新物化表（先行双写，物化表仍是读路径）；
-3. `UndoService` 换底为逆 op；
-4. 迁移：现有物化表状态视为「lamport=0 的初始折叠」，不补历史 op；`anchors-v2.md` §6 的锚点迁移与本表同批进行；
-5. 测试：`crdt_merge_test`（LWW/OR-Set/追加集纯函数性质：交换、结合、幂等）、`proposal_rebase_test`（三态裁决全分支）、`undo_inverse_op_test`（撤销与并发交叉）、`db_v12_migration_test`。
+1. ✅ 新增 `op_log` 表（§2.2 结构，`createOpLogTable`）+ `change_proposals.status` 枚举加 `superseded` + payload 加 `base` 字段约定（落库时 `ProposalService.captureBase` 捕获）；
+2. ✅ 写路径改造：`proposal_executor` 三态裁决管线（§3.2）；人工写路径（任务编辑、完成勾选、锚点增删、优先级标记）统一带 `actor` 参数经 `recordOp` 落 log + 更新物化表（双写，物化表仍是读路径；未引入独立 OpService，op 落账收敛在 `AppDatabase.recordOp`）；
+3. ✅ `UndoService` 换底为逆 op（`ProposalExecutor._applyUndo` 全部以 `OpActor.user` 经 op 路径）；
+4. ✅ 迁移：现有物化表状态视为「lamport=0 的初始折叠」，不补历史 op；`anchors-v2.md` §6 的锚点迁移与本表同批进行（`migrateToV12` = 建 op_log + `normalizeAnchorsToObjectLevel`）；
+5. ✅ 测试：`crdt_merge_test`（LWW 决胜序与全序性质）、`proposal_rebase_test`（三态裁决全分支）、`undo_inverse_op_test`（撤销与并发交叉）、`db_v12_migration_test`。
+
+### 落地决策（实现时收窄，2026-11-08）
+
+- **superseded 粒度 = 整提案**：只要任一涉及字段的 base 漂移且冲突方是人/系统，整条提案置 superseded（卡片提供「以当前状态重新提交」），不做「部分字段生效、部分字段驳回」的逐字段部分生效——整提案语义更简单，也不会产生半执行状态。
+- **note.append 的撤销 = 内容寄存器回写**：撤销笔记追加按 lww_set 逆 op 把正文写回追加前内容，不做 §5 设想的「追加段灰显删除线」UI（首版简化；追加集单调性让渡给可读的撤销体验）。
+- **审计视图已落地**：设置页「最近错误」旁新增「最近变更」只读页（`RecentOpsPage`，`recentOps(50)`，actor 标注「你 / 助理·对话名 / 系统」）。
 
 ## 8. 不变量重申
 

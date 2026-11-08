@@ -36,8 +36,8 @@ class ArchiveExportResult {
 /// v3 存档导出（格式定稿见 design-v3-details §5，导出流程 §5.2）。
 ///
 /// 纯新增、只读：事务快照读全量表 → 组装 v3 格式 zip → 落盘到应用文档目录，
-/// 不写回任何数据。基于 DB v8：锚点直读 `task_anchors`（正文中的 marker 天然
-/// 随正文导出，无转换步骤）；notes 的 attachments 从列读取。
+/// 不写回任何数据。锚点直读 `task_anchors`（v12 起为对象级关联，正文不含
+/// marker）；notes 的 attachments 从列读取。
 class ArchiveExportService {
   ArchiveExportService._();
 
@@ -74,8 +74,7 @@ class ArchiveExportService {
       );
     });
 
-    // 2. 锚点直读 task_anchors 写 anchors.json（§5.2-2）：marker 已在正文里，
-    //    随 messages.json 原样导出，无需转换。
+    // 2. 锚点直读 task_anchors 写 anchors.json（§5.2-2）。
     // 3. messages.json：attachments 列解码为 JSON 数组导出（导入侧直接结构化
     //    读取，不必再解一层字符串）。
     final messagesJson = [

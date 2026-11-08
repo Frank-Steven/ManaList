@@ -1,6 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/conversation.dart';
-import 'package:msgrepo_mobile/models/message.dart';
 import 'package:msgrepo_mobile/models/task.dart';
 import 'package:msgrepo_mobile/services/assistant/models.dart';
 import 'package:msgrepo_mobile/services/assistant/proposal_executor.dart';
@@ -35,8 +34,6 @@ void main() {
     await createBaseTables(db);
     await db.execute(
         'CREATE TABLE notebooks(id TEXT PRIMARY KEY, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)');
-    await db.execute(
-        'CREATE TABLE chapters(id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)');
     appDb.debugAttachDatabase(db);
     UndoService.instance.clear();
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -177,15 +174,12 @@ void main() {
       expect((await appDb.getTaskById('t1'))?.title, '要删的');
     });
 
-    test('task.delete 带锚点：撤销恢复任务行 + 锚点行 + 正文 marker/content_hash/edited_at',
+    test('task.delete 带锚点：撤销恢复任务行 + 锚点行，正文全程不动（对象级锚点）',
         () async {
-      const origBody = '记得买菜 ⟦task:$anchorId1⟧';
-      await insertMessage(db, 'm1', origBody);
-      await db.update('messages', {'edited_at': 12345},
-          where: 'id = ?', whereArgs: ['m1']);
+      const body = '记得买菜';
+      await insertMessage(db, 'm1', body);
       await insertTask(db, 't1', title: '买菜');
       await appDb.insertAnchor(anchor(anchorId1, 't1', 'm1', label: '买菜'));
-      final hashBefore = computeContentHash('com.test', '标题m1', origBody, 2000);
 
       await service.handleToolBlock(
         conversationId: convId,
@@ -194,26 +188,21 @@ void main() {
       );
       final exec = await executor.approve('amsg-da_b0');
       expect(exec.ok, isTrue);
-      expect(exec.message, contains('撤销将一并恢复'));
+      expect(exec.message, contains('撤销将恢复'));
 
-      // 删除后：任务行/锚点行删除，正文残迹化
+      // 删除后：任务行/锚点行删除，正文不受影响
       expect(await appDb.getTaskById('t1'), isNull);
       expect(await appDb.anchorsForTask('t1'), isEmpty);
-      expect((await appDb.getMessageById('m1'))!.body, '记得买菜 [任务:买菜]');
+      expect((await appDb.getMessageById('m1'))!.body, body);
 
       // 撤销（_undo 快照经 change_proposals 落库 JSON 往返后仍完整）
       expect(await executor.undoApplied('amsg-da_b0'), isTrue);
       expect((await appDb.getTaskById('t1'))?.title, '买菜');
       expect((await appDb.anchorsForTask('t1')).single.id, anchorId1);
-      final restored =
-          (await db.query('messages', where: 'id = ?', whereArgs: ['m1']))
-              .single;
-      expect(restored['body'], origBody, reason: 'marker 精确复原');
-      expect(restored['content_hash'], hashBefore);
-      expect(restored['edited_at'], 12345);
+      expect((await appDb.getMessageById('m1'))!.body, body);
     });
 
-    test('note.append 与 note.replace_section', () async {
+    test('note.create 与 note.append（replace_section 已在 v12 移除）', () async {
       await db.insert('notebooks',
           {'id': 'nb1', 'name': '本', 'sort': 0, 'created_at': 1000});
       await db.insert('chapters',
@@ -234,32 +223,18 @@ void main() {
       expect((await executor.approve('amsg-n2_b0')).ok, isTrue);
       expect((await appDb.getNoteById(noteId))?.content, contains('## 周二\n雨'));
 
-      await service.handleToolBlock(
-        conversationId: convId,
-        batchId: 'amsg-n3',
-        block: block(0, 'note.replace_section',
-            {'noteId': noteId, 'heading': '周一', 'content': '阴天'}),
-      );
-      expect((await executor.approve('amsg-n3_b0')).ok, isTrue);
-      final content = (await appDb.getNoteById(noteId))!.content;
-      expect(content, contains('## 周一\n阴天'));
-      expect(content, contains('## 周二\n雨'), reason: '只替换标题界定的区段');
-
-      // 找不到标题 → 执行失败置 failed
-      await service.handleToolBlock(
+      // note.replace_section 已废弃（anchors-v2 §5）→ 校验失败不落库
+      final outcome = await service.handleToolBlock(
         conversationId: convId,
         batchId: 'amsg-n4',
         block: block(0, 'note.replace_section',
-            {'noteId': noteId, 'heading': '周三', 'content': 'x'}),
+            {'noteId': noteId, 'heading': '周一', 'content': '阴天'}),
       );
-      final exec = await executor.approve('amsg-n4_b0');
-      expect(exec.ok, isFalse);
-      expect(exec.message, contains('找不到'));
-      expect((await appDb.getProposalById('amsg-n4_b0'))?.status,
-          ProposalStatus.failed);
+      expect(outcome, isA<ProposalValidationFailure>());
+      expect(await appDb.getProposalById('amsg-n4_b0'), isNull);
     });
 
-    test('anchor.create 走 AnchorService，定位失败置 failed', () async {
+    test('anchor.create 对象级：幂等成功；目标不存在 → 校验失败', () async {
       await insertMessage(db, 'm1', '记得买菜的正文');
       await insertTask(db, 't1', title: '买菜');
       await service.handleToolBlock(
@@ -269,29 +244,27 @@ void main() {
           'targetType': 'message',
           'targetId': 'm1',
           'taskId': 't1',
-          'anchorText': '买菜',
         }),
       );
       expect((await executor.approve('amsg-a1_b0')).ok, isTrue);
       final anchors = await appDb.anchorsForTask('t1');
       expect(anchors.single.targetId, 'm1');
-      expect((await appDb.getMessageById('m1'))?.body, contains('⟦task:'));
+      expect(anchors.single.label, '买菜', reason: 'label 缺省任务标题');
+      expect((await appDb.getMessageById('m1'))?.body, '记得买菜的正文',
+          reason: '对象级锚点不写正文');
 
-      // 定位失败：anchorText 不存在 → failed
-      await service.handleToolBlock(
+      // 目标不存在 → 校验期拒绝，不落库
+      final outcome = await service.handleToolBlock(
         conversationId: convId,
         batchId: 'amsg-a2',
         block: block(0, 'anchor.create', {
           'targetType': 'message',
-          'targetId': 'm1',
+          'targetId': 'ghost',
           'taskId': 't1',
-          'anchorText': '不存在的文本',
         }),
       );
-      final exec = await executor.approve('amsg-a2_b0');
-      expect(exec.ok, isFalse);
-      expect((await appDb.getProposalById('amsg-a2_b0'))?.status,
-          ProposalStatus.failed);
+      expect(outcome, isA<ProposalValidationFailure>());
+      expect(await appDb.getProposalById('amsg-a2_b0'), isNull);
     });
 
     test('message.set_priority 执行与撤销', () async {
@@ -418,7 +391,7 @@ void main() {
       expect(await appDb.getProposals(), hasLength(1));
     });
 
-    test('anchor.create 目标为未选消息同样被拒（marker 会写进该消息正文）', () async {
+    test('anchor.create 目标为未选消息同样被拒（守卫不误伤对象级锚点）', () async {
       await insertMessage(db, 'm-sel', '选中的消息');
       await insertMessage(db, 'm-other', '未选中的消息');
       await insertTask(db, 't1', title: '任务一');
@@ -430,13 +403,12 @@ void main() {
           'targetType': 'message',
           'targetId': 'm-other',
           'taskId': 't1',
-          'anchorText': '消息',
         }),
         selectedMessageIds: const ['m-sel'],
       );
 
       expect(outcome, isA<ProposalValidationFailure>(),
-          reason: '对未选消息建锚点等同于改它的正文');
+          reason: '对未选消息建锚点超出选中范围');
       expect(await appDb.getProposals(), isEmpty);
     });
   });

@@ -8,6 +8,7 @@ import '../assistant/attachment_pick_controller.dart';
 import '../assistant/send_to_assistant.dart';
 import '../messages/message_widgets.dart'
     show SelectionAction, SelectionActionBar;
+import '../shared/linked_tasks_section.dart';
 import 'note_editor_page.dart';
 import 'notes_page.dart';
 
@@ -35,6 +36,9 @@ class _ChaptersPageState extends State<ChaptersPage> {
   List<Chapter> _chapters = [];
   Map<String, int> _noteCounts = {};
 
+  /// 章节级锚点计数（anchors-v2 §3 列表行轻标记）。
+  Map<String, int> _anchorCounts = {};
+
   @override
   void initState() {
     super.initState();
@@ -47,12 +51,19 @@ class _ChaptersPageState extends State<ChaptersPage> {
     final rawDb = await db.database;
     final countRows = await rawDb.rawQuery(
         'SELECT chapter_id, COUNT(*) AS c FROM notes GROUP BY chapter_id');
+    final anchorRows = await rawDb.rawQuery(
+        "SELECT target_id, COUNT(*) AS c FROM task_anchors "
+        "WHERE target_type = 'chapter' GROUP BY target_id");
     if (mounted) {
       setState(() {
         _chapters = chapters;
         _noteCounts = {
           for (final r in countRows)
             r['chapter_id'] as String: (r['c'] as num).toInt(),
+        };
+        _anchorCounts = {
+          for (final r in anchorRows)
+            r['target_id'] as String: (r['c'] as num).toInt(),
         };
       });
     }
@@ -174,7 +185,20 @@ class _ChaptersPageState extends State<ChaptersPage> {
                   key: ValueKey(chapter.id),
                   leading: const Icon(Icons.folder_outlined),
                   title: Text(chapter.name),
-                  subtitle: Text('${_noteCounts[chapter.id] ?? 0} 条笔记'),
+                  subtitle: Row(
+                    children: [
+                      Text('${_noteCounts[chapter.id] ?? 0} 条笔记'),
+                      if ((_anchorCounts[chapter.id] ?? 0) > 0) ...[
+                        const SizedBox(width: 6),
+                        Icon(Icons.link,
+                            size: 13,
+                            color:
+                                Theme.of(context).colorScheme.onSurfaceVariant),
+                        Text(' ${_anchorCounts[chapter.id]}',
+                            style: Theme.of(context).textTheme.bodySmall),
+                      ],
+                    ],
+                  ),
                   trailing: PopupMenuButton<String>(
                     onSelected: (action) => switch (action) {
                       'rename' => _renameChapter(chapter),
@@ -410,9 +434,22 @@ class _NotesListPageState extends State<NotesListPage> {
             IconButton(icon: const Icon(Icons.add), onPressed: _addNote),
         ],
       ),
-      body: _notes.isEmpty
-          ? const Center(child: Text('暂无笔记，点右上角 + 新建'))
-          : ListView.builder(
+      body: Column(
+        children: [
+          // 章节级「关联任务」区（anchors-v2 §3：章节是笔记集合的锚点粒度）
+          if (!widget.pickMode)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+              child: LinkedTasksSection(
+                targetType: AnchorTargetType.chapter,
+                targetId: widget.chapter.id,
+                seedTitle: widget.chapter.name,
+              ),
+            ),
+          Expanded(
+            child: _notes.isEmpty
+                ? const Center(child: Text('暂无笔记，点右上角 + 新建'))
+                : ListView.builder(
               itemCount: _notes.length,
               itemBuilder: (context, index) {
                 final note = _notes[index];
@@ -469,6 +506,9 @@ class _NotesListPageState extends State<NotesListPage> {
                 );
               },
             ),
+          ),
+        ],
+      ),
       // B13：pick 模式下本页是独立路由，附件选择页的「已选 + 确认」栏在上一层
       // 看不到，所以这里补一个确认入口（把选择带回选择页，由它统一确认并返回结果）；
       // 普通模式仍只有多选态的「发送给助理」，行为不变。
