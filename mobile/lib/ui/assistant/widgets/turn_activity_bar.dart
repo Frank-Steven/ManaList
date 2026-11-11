@@ -85,12 +85,18 @@ class TurnActivityBar extends StatelessWidget {
   const TurnActivityBar({
     super.key,
     required this.phase,
+    this.active = true,
     this.completedSteps = 0,
     this.pendingCount = 0,
     this.onStop,
   });
 
   final TurnPhase phase;
+
+  /// B22：**是否有在途回合**的显式门控。
+  /// 回合结束后 phase 可能残留 generate/thinking，仅靠阶段判断会让
+  /// 活动条在空对话里常驻（真机缺陷）；busy 必须同时满足 active。
+  final bool active;
 
   /// 本回合已完成的工具步数（真实计数，只增不减到回合结束）。
   final int completedSteps;
@@ -103,7 +109,8 @@ class TurnActivityBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final busy = activityIsBusy(phase);
+    // B22：active && 阶段在进行中，才算「进行中」。
+    final busy = active && activityIsBusy(phase);
     if (!busy && pendingCount <= 0) return const SizedBox.shrink();
 
     final secondary = busy ? activitySecondaryText(completedSteps) : null;
@@ -154,20 +161,26 @@ class TurnActivityBar extends StatelessWidget {
             ),
           ),
           if (busy && onStop != null)
-            SizedBox(
-              width: 48,
-              height: 48,
-              child: TextButton.icon(
-                key: const ValueKey("turn-activity-stop"),
-                onPressed: onStop,
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  foregroundColor: cs.error,
-                ),
-                icon: Icon(Icons.stop, size: 16, color: cs.error),
-                label: Text(
-                  "停止",
-                  style: TextStyle(fontSize: 12, color: cs.error),
+            // B23：停止键 ≥72×48、单行不挤压主文案、右侧留 8dp。
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: SizedBox(
+                width: 72,
+                height: 48,
+                child: TextButton.icon(
+                  key: const ValueKey("turn-activity-stop"),
+                  onPressed: onStop,
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    foregroundColor: cs.error,
+                  ),
+                  icon: Icon(Icons.stop, size: 16, color: cs.error),
+                  label: Text(
+                    "停止",
+                    maxLines: 1,
+                    softWrap: false,
+                    style: TextStyle(fontSize: 12, color: cs.error),
+                  ),
                 ),
               ),
             ),

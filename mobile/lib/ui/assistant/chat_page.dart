@@ -614,6 +614,8 @@ class _ChatPageState extends State<ChatPage> {
     _turn?.phase.removeListener(_onTurnPhaseChanged);
     _turn = null;
     _statusTimer?.cancel();
+    // B22：回合结束把阶段落到 done，避免活动条按残留阶段常驻。
+    _phase = TurnPhase.done;
   }
 
   void _onTurnEvent(AssistantEvent ev) {
@@ -1043,6 +1045,8 @@ class _ChatPageState extends State<ChatPage> {
           // 不随消息滚走；停止键唯一在这里。
           TurnActivityBar(
             phase: _phase,
+            // B22：显式门控——回合结束后即使 phase 残留也不再显示进行中。
+            active: _busy,
             completedSteps: _completedToolSteps,
             pendingCount: _pendingProposalCount,
             onStop: _busy ? _cancel : null,

@@ -198,13 +198,31 @@ class _AutoScrollTitleState extends State<AutoScrollTitle>
                             child: child,
                           );
                         },
-                        child: Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            widget.text,
-                            maxLines: 1,
-                            softWrap: false,
-                            style: style,
+                        // B24：滚动层子 Text 之前受视口 maxWidth 约束 → 被 ellipsis/
+                        // 裁剪，平移时末端出现空白帧。这里按 TextPainter 的**完整宽度**
+                        // 布局（OverflowBox 水平解除视口约束 + SizedBox 定宽），
+                        // 滚动分支**不使用 ellipsis**，端点处内容刚好覆盖视口。
+                        // ⚠️ 高度必须显式给定：OverflowBox 若高度无界，外层 ClipRect
+                        // 会变成 180×Infinity，导致 RenderClipRect 无穷高、坐标 NaN
+                        // （真机/测试都炸）。所以外层先钉住文本行高，再解除宽度约束。
+                        child: SizedBox(
+                          height: painter.height,
+                          child: OverflowBox(
+                            alignment: Alignment.centerLeft,
+                            minWidth: 0,
+                            maxWidth: double.infinity,
+                            minHeight: painter.height,
+                            maxHeight: painter.height,
+                            child: SizedBox(
+                              width: painter.width,
+                              child: Text(
+                                widget.text,
+                                maxLines: 1,
+                                softWrap: false,
+                                overflow: TextOverflow.clip,
+                                style: style,
+                              ),
+                            ),
                           ),
                         ),
                       ),
