@@ -25,6 +25,8 @@ import 'widgets/input_bar.dart';
 import 'widgets/proposal_card.dart';
 import 'widgets/streaming_blocks.dart';
 import 'widgets/suggestion_chips.dart';
+import 'widgets/tool_steps_group.dart';
+import 'widgets/turn_activity_bar.dart';
 
 /// F03（2026-11-03）：从相册批量加截图的单批上限。
 const int maxScreenshotsPerBatch = 6;
@@ -125,6 +127,21 @@ class _ChatPageState extends State<ChatPage> {
   List<String> _suggestions = [];
 
   bool get _busy => _turn != null;
+
+  // F21 第②阶段：主进行态条的状态（真实阶段 + 真实已完成步数）。
+  TurnPhase _phase = TurnPhase.starting;
+  int _completedToolSteps = 0;
+
+  /// 当前已加载的 pending 提案真实条数（主进行态条的静态文案用）。
+  int get _pendingProposalCount {
+    var count = 0;
+    for (final list in _proposalsByBatch.values) {
+      for (final p in list) {
+        if (p.status == ProposalStatus.pending) count++;
+      }
+    }
+    return count;
+  }
 
   @override
   void initState() {
@@ -559,13 +576,24 @@ class _ChatPageState extends State<ChatPage> {
   void _attachTurn(AssistantTurnHandle handle) {
     _turnSub?.cancel();
     _turn = handle;
+    _phase = handle.phase.value;
+    handle.phase.addListener(_onTurnPhaseChanged);
     _startStatusTimer();
     _turnSub = handle.events.listen(_onTurnEvent);
+  }
+
+  /// 阶段变化 → 主进行态条文案（ValueNotifier 回调，可能在 build 之外）。
+  void _onTurnPhaseChanged() {
+    if (!mounted) return;
+    final next = _turn?.phase.value;
+    if (next == null || next == _phase) return;
+    setState(() => _phase = next);
   }
 
   void _detachTurn() {
     _turnSub?.cancel();
     _turnSub = null;
+    _turn?.phase.removeListener(_onTurnPhaseChanged);
     _turn = null;
     _statusTimer?.cancel();
   }
@@ -575,6 +603,7 @@ class _ChatPageState extends State<ChatPage> {
     switch (ev) {
       case AssistantTurnStarted():
         // 用户消息与 assistant 占位已落库：立即刷新，自己的消息马上上屏
+        setState(() => _completedToolSteps = 0);
         _reload();
       case AssistantThinkingDelta():
         setState(() => _updateThinkingSegment(ev));
@@ -601,6 +630,8 @@ class _ChatPageState extends State<ChatPage> {
         _reload();
       case AssistantToolMessage():
         final failed = ev.content.startsWith('一个动作未能理解');
+        // 主进行态条的次级「已完成 N 步」只认真实成功的工具回注。
+        if (!failed) setState(() => _completedToolSteps++);
         setState(() => _settleToolSegment(
               index: ev.blockIndex,
               status: failed ? '未能理解，已跳过' : '已回注',
@@ -985,11 +1016,21 @@ class _ChatPageState extends State<ChatPage> {
               child: empty ? _buildEmpty(cs) : _buildMessageList(cs),
             ),
           ),
+          // F21 第②阶段：全页唯一主进行态条——固定在消息流与输入栏之间，
+          // 不随消息滚走；停止键唯一在这里。
+          TurnActivityBar(
+            phase: _phase,
+            completedSteps: _completedToolSteps,
+            pendingCount: _pendingProposalCount,
+            onStop: _busy ? _cancel : null,
+          ),
           // F03 Step2（2026-11-03）：草稿含图片时显示「单张成条 + 敏感信息离设备」提示。
           if (_hasScreenshotAttachments) _buildScreenshotsHint(cs),
           ChatInputBar(
             controller: _input,
             busy: _busy,
+            // 停止键已在主进行态条上：这里只留 48dp 占位，避免布局跳动。
+            showStopButton: false,
             attachments: _pendingAttachments,
             metaOf: _metaOf,
             attachmentTokens:
@@ -1033,7 +1074,21 @@ class _ChatPageState extends State<ChatPage> {
       controller: _scroll,
       padding: const EdgeInsets.all(12),
       children: [
-        for (final m in _messages) ..._buildMessageWrapped(m, cs),
+        // F21 第①阶段·历史侧（task-80）：连续成功 tool 消息折成一条摘要，
+        // 否则回合结束 _reload() 后聚合就消失了。失败回注/搜索命中/普通消息
+        // 都会切断连续段并保持原样（见 tool_steps_group.dart 的纯分组函数）。
+        for (final item in groupToolMessages(
+          _messages,
+          protectedMessageIds: {
+            if (_searchHitMessageId != null) _searchHitMessageId!,
+          },
+        ))
+          ...switch (item) {
+            SingleMessage(:final message) =>
+              _buildMessageWrapped(message, cs),
+            FoldedToolMessages(:final messages) =>
+              _buildFoldedToolMessages(messages),
+          },
         if (_busy) _buildStreaming(cs),
         if (_errorText != null) _buildError(cs),
       ],
@@ -1125,30 +1180,62 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  /// 历史 tool 消息 → 渲染段（回注结果作为 detail，不发裸 JSON）。
+  ChatStreamSegment _toolSegmentFor(ChatMessage m) {
+    final failed = m.content.startsWith('一个动作未能理解');
+    return ChatStreamSegment(
+        kind: ChatStreamSegmentKind.tool,
+        startedAt: DateTime.fromMillisecondsSinceEpoch(m.createdAt))
+      ..active = false
+      ..endedAt = DateTime.fromMillisecondsSinceEpoch(m.createdAt)
+      ..summary = '工具回注'
+      ..status = failed ? '未能理解，已跳过' : '已回注'
+      ..failed = failed
+      ..detail = m.content
+      ..expanded = _expandedToolMsgIds.contains(m.id);
+  }
+
+  /// 展开/收起状态统一存进 [_expandedToolMsgIds]，reload 后仍保持。
+  void _toggleToolExpanded(String id) {
+    setState(() {
+      if (!_expandedToolMsgIds.remove(id)) {
+        _expandedToolMsgIds.add(id);
+      }
+    });
+  }
+
+  /// 连续成功 tool 消息的折叠组（复用 ToolStepsGroup，样式与流式侧一致）。
+  /// 组自身的展开状态用 `group:<首条消息id>` 存进同一集合，切换后保持。
+  List<Widget> _buildFoldedToolMessages(List<ChatMessage> messages) {
+    final segments = <ChatStreamSegment>[
+      for (final m in messages) _toolSegmentFor(m),
+    ];
+    final groupKey = 'group:${messages.first.id}';
+    return [
+      ToolStepsGroup(
+        key: ValueKey(groupKey),
+        headerKey: ValueKey('$groupKey-header'),
+        steps: segments,
+        expanded: _expandedToolMsgIds.contains(groupKey),
+        onToggleGroup: () => _toggleToolExpanded(groupKey),
+        onStepToggle: (segment) {
+          final idx = segments.indexOf(segment);
+          if (idx < 0) return;
+          _toggleToolExpanded(messages[idx].id);
+        },
+      ),
+    ];
+  }
+
   List<Widget> _buildMessage(ChatMessage m, ColorScheme cs) {
     final isUser = m.role == ChatRole.user;
     final isTool = m.role == ChatRole.tool;
     // 工具消息：渲染为可展开/收起的工具块（历史默认收起），全宽
     if (isTool) {
-      final failed = m.content.startsWith('一个动作未能理解');
-      final seg = ChatStreamSegment(
-          kind: ChatStreamSegmentKind.tool,
-          startedAt: DateTime.fromMillisecondsSinceEpoch(m.createdAt))
-        ..active = false
-        ..endedAt = DateTime.fromMillisecondsSinceEpoch(m.createdAt)
-        ..summary = '工具回注'
-        ..status = failed ? '未能理解，已跳过' : '已回注'
-        ..failed = failed
-        ..detail = m.content
-        ..expanded = _expandedToolMsgIds.contains(m.id);
       return [
         ToolCallBlock(
-          segment: seg,
-          onToggle: () => setState(() {
-            if (!_expandedToolMsgIds.remove(m.id)) {
-              _expandedToolMsgIds.add(m.id);
-            }
-          }),
+          segment: _toolSegmentFor(m),
+          onToggle: () => _toggleToolExpanded(m.id),
         ),
       ];
     }
@@ -1236,45 +1323,45 @@ class _ChatPageState extends State<ChatPage> {
   /// 正文段直接显示（淡入 + 按住末尾两词）；活动中的尾部文本段
   /// 末尾挂呼吸圆点光标。全宽时间线（与落定的助理消息同一形态）。
   Widget _buildStreaming(ColorScheme cs) {
-    ChatStreamSegment? lastText;
-    for (final s in _segments.reversed) {
-      if (s.kind == ChatStreamSegmentKind.text) {
-        lastText = s;
-        break;
-      }
-    }
-    final cursorInText = lastText != null && lastText.active;
+    // F21 第②阶段：正文末尾的循环光标已移除（全页动态只留主进行态条），
+    // 因此这里不再计算 lastText/cursorInText。
+    // F21 第①阶段：同一阶段连续的成功工具回注合成一条「完成 N 步 · 全部成功」；
+    // 待确认（含破坏性审批）/ 失败 / 执行中一律独立、永不折叠（见 tool_steps_group.dart）。
+    final items = groupStreamSegments(_segments);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          for (final seg in _segments)
-            switch (seg.kind) {
-              ChatStreamSegmentKind.text => FadeInStreamingText(
-                  text: seg.text,
-                  settled: !seg.active,
-                  showCursor: identical(seg, lastText) && cursorInText,
+          for (final item in items)
+            switch (item) {
+              FoldedToolSteps(:final steps) => ToolStepsGroup(
+                  steps: steps,
+                  onStepToggle: (step) =>
+                      setState(() => step.expanded = !step.expanded),
                 ),
-              ChatStreamSegmentKind.thinking => ThinkingBlock(
-                  segment: seg,
-                  onToggle: () =>
-                      setState(() => seg.expanded = !seg.expanded),
-                ),
-              ChatStreamSegmentKind.tool => ToolCallBlock(
-                  segment: seg,
-                  onToggle: () =>
-                      setState(() => seg.expanded = !seg.expanded),
-                ),
+              SingleSegment(:final segment) => switch (segment.kind) {
+                  ChatStreamSegmentKind.text => FadeInStreamingText(
+                    text: segment.text,
+                    settled: !segment.active,
+                    // 光标动效已收敂到主进行态条，这里不再画。
+                    showCursor: false,
+                  ),
+                  ChatStreamSegmentKind.thinking => ThinkingBlock(
+                    segment: segment,
+                    onToggle: () =>
+                        setState(() => segment.expanded = !segment.expanded),
+                  ),
+                  ChatStreamSegmentKind.tool => ToolCallBlock(
+                    segment: segment,
+                    onToggle: () =>
+                        setState(() => segment.expanded = !segment.expanded),
+                  ),
+                },
             },
-          // 回合进行中但尾部不是正文段（思考中/工具中/等首个 token）：
-          // 光标单独成行
-          if (!cursorInText)
-            const Padding(
-              padding: EdgeInsets.only(top: 6, left: 2),
-              child: BreathingDot(),
-            ),
+          // F21 第②阶段：原先这里的独立呼吸光标已移除——
+          // 「回合进行中」只由输入栏上方的主进行态条表达。
         ],
       ),
     );

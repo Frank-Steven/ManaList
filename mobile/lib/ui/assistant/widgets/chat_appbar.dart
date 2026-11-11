@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'auto_scroll_title.dart';
+
 /// 对话页顶栏（assistant-v4-ui §3.2 组件拆分决策）：
 /// 标题（1 行省略）+ 模型状态行（点击唤模型选择器）+ ⋮ 溢出菜单。
 ///
@@ -36,7 +38,14 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+          // F21 审批稿「标题方案③」：溢出才自动滚动，可手动拖、hover/触摸/
+          // 聚焦即停；非溢出静止、系统「减少动态效果」时也不自动滚。
+          AutoScrollTitle(
+            text: title,
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+          ),
           InkWell(
             onTap: onModelTap,
             child: Padding(

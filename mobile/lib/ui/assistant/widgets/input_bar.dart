@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../../services/assistant/models.dart';
 import 'attachment_cards.dart';
+import 'context_meter.dart';
 
 /// `/` 快捷指令集（assistant-v4-ui §3.6）：指令名 → 提示词模板。
 /// 固定集，不做自定义命令编辑器；模板插入输入框后可继续编辑。
@@ -47,6 +48,11 @@ class ChatInputBar extends StatefulWidget {
   /// 模型上下文上限（token）；无数据时按 32k。
   final int tokenLimit;
 
+  /// 回合中是否显示「停止」键。
+  /// F21 第②阶段起主进行态条上有唯一停止键，输入栏 busy 时只留占位
+  /// （不显示第二个停止键、也不让布局跳动）。
+  final bool showStopButton;
+
   const ChatInputBar({
     super.key,
     required this.controller,
@@ -60,6 +66,7 @@ class ChatInputBar extends StatefulWidget {
     required this.onCancel,
     this.attachmentTokens,
     this.tokenLimit = kDefaultContextTokenLimit,
+    this.showStopButton = true,
   });
 
   @override
@@ -158,52 +165,24 @@ class _ChatInputBarState extends State<ChatInputBar> {
               ],
             ),
           ),
-          if (widget.attachmentTokens != null) _buildBudgetBar(cs),
+          if (widget.attachmentTokens != null) _buildContextIndicator(),
         ],
       ),
     );
   }
 
-  /// 预算条（§3.6）：48 宽细条 + 百分比；≤80% 灰、>80% amber、
-  /// >100% 红且发送键禁用。
-  Widget _buildBudgetBar(ColorScheme cs) {
-    final used = widget.attachmentTokens!;
-    final level = budgetLevel(used, widget.tokenLimit);
-    final pct = widget.tokenLimit > 0
-        ? (used / widget.tokenLimit * 100).clamp(0, 999).round()
-        : 0;
-    final color = switch (level) {
-      BudgetLevel.normal => cs.onSurfaceVariant,
-      BudgetLevel.warning => Colors.amber.shade800,
-      BudgetLevel.over => cs.error,
-    };
-    return Tooltip(
-      message: level == BudgetLevel.over
-          ? '附件超出模型上下文，请移除部分附件'
-          : '附件约占上下文 $pct%（≈$used / ${widget.tokenLimit} tokens）',
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            SizedBox(
-              width: 48,
-              child: LinearProgressIndicator(
-                value: widget.tokenLimit > 0
-                    ? (used / widget.tokenLimit).clamp(0.0, 1.0)
-                    : 0,
-                minHeight: 4,
-                borderRadius: BorderRadius.circular(2),
-                color: color,
-                backgroundColor: cs.surfaceContainerHighest,
-              ),
-            ),
-            const SizedBox(height: 2),
-            Text('$pct%',
-                style: TextStyle(
-                    fontSize: 10, color: color, fontFeatures: const [])),
-          ],
-        ),
+  /// 上下文指示器（F21 审批稿 / DSH ContextMeter 实证最小版）：
+  /// 折叠态 = 14px 圆环 + NN%；点击 → 底部 sheet（只有「附件（估算）」一行）。
+  ///
+  /// 数据口径见 context_meter.dart：上限是 App 现值 32768（模型未声明窗口），
+  /// 面板明确写「按 32k 估算」，不伪造系统提示词/工具定义/对话三类。
+  /// 超预算时发送键仍由 budgetLevel 拦截（见 _buildSendButton），行为不变。
+  Widget _buildContextIndicator() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      child: ContextMeter(
+        usedTokens: widget.attachmentTokens!,
+        limitTokens: widget.tokenLimit,
       ),
     );
   }
@@ -281,6 +260,14 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   Widget _buildSendButton(ColorScheme cs) {
+    if (widget.busy && !widget.showStopButton) {
+      // 主进行态条已提供唯一停止键：这里只保留等宽占位，防止布局跳动。
+      return const SizedBox(
+        key: ValueKey("input-stop-placeholder"),
+        width: 48,
+        height: 48,
+      );
+    }
     final overBudget = !widget.busy &&
         budgetLevel(widget.attachmentTokens ?? 0, widget.tokenLimit) ==
             BudgetLevel.over;

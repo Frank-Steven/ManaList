@@ -285,14 +285,8 @@ class ThinkingBlock extends StatelessWidget {
                         : '已思考 ${segment.elapsedSeconds}s',
                     style: statusStyle,
                   ),
-                  if (segment.active) ...[
-                    const SizedBox(width: 6),
-                    SizedBox(
-                        width: 10,
-                        height: 10,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 1.5, color: cs.onSurfaceVariant)),
-                  ],
+                  // F21 第②阶段：全页只保留主进行态条一个循环动效，
+                  // 思考块的转圈已移除（状态文案「思考中 Ns」仍在）。
                   const Spacer(),
                   Icon(
                       segment.expanded
@@ -384,10 +378,8 @@ class ToolCallBlock extends StatelessWidget {
                         : segment.status,
                     style: statusStyle,
                   ),
-                  if (segment.active) ...[
-                    const SizedBox(width: 6),
-                    const BreathingDot(size: 6),
-                  ],
+                  // F21 第②阶段：工具块的呼吸点已移除（状态文案仍在），
+                  // 进行中的动效只留给主进行态条。
                   const Spacer(),
                   if (hasDetail)
                     Icon(

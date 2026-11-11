@@ -1,0 +1,274 @@
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+
+/// 上下文上限的**现值**：ManaList 没有 per-model `contextWindow`，
+/// 全 App 沿用 32,768（assistant-v4-ui §3.6 的 kDefaultContextTokenLimit）。
+/// 因此圆环百分比只是「按 32k 估算」，不是模型真实窗口。
+const int kAssumedContextWindow = 32768;
+
+/// 上下文占用百分比（= 附件估算 tokens / 上限）。边界：上限 ≤0 或用量 ≤0 → 0；
+/// 不做上限截断（超限要能显示 >100%），负数按 0。
+int contextPercent(int usedTokens, int limitTokens) {
+  if (usedTokens <= 0 || limitTokens <= 0) return 0;
+  return (usedTokens / limitTokens * 100).round();
+}
+
+/// token 数的人类可读格式：<1000 原样；<1e6 `~x.xK`；≥1e6 `x.xM`。
+String formatTokenCount(int tokens) {
+  if (tokens <= 0) return '0';
+  if (tokens < 1000) return '$tokens';
+  if (tokens < 1000000) {
+    final k = tokens / 1000;
+    final text = k >= 100 ? k.round().toString() : k.toStringAsFixed(1);
+    return '~${text}K';
+  }
+  final m = tokens / 1000000;
+  final text = m >= 10 ? m.round().toString() : m.toStringAsFixed(1);
+  final trimmed =
+      text.endsWith('.0') ? text.substring(0, text.length - 2) : text;
+  return '${trimmed}M';
+}
+
+/// F21 审批稿：**上下文指示器（DSH ContextMeter 实证最小版）**。
+///
+/// 参照 DSH 真实组件（`@deepseek-ai/dsh-client-ui-conversation/lib/client.js`
+/// :21481 起）：14×14 圆环、2px 描边、从 12 点顺时针、pill 里显示百分比、
+/// 点击展开面板。
+///
+/// ⚠️ 与 DSH 的**刻意差异**（不照抄，因为数据不成立）：
+/// - DSH 面板分「系统提示词 / 工具定义 / 对话消息」三类；本 App 只真实拥有
+///   「**附件（估算）**」一项（正文字符估算）。工具定义已并入
+///   `buildToolSpecPrompt` 的请求前言、系统提示词与对话历史都没有单独计量，
+///   照抄三类会**重复计或编造** —— 因此面板只显示这一行；
+/// - 上限是 `kAssumedContextWindow = 32768`（App 现值，非模型窗口），所以
+///   百分比与文案都明确写「按 32k 估算」。
+///
+/// 交互（移动端）：点击 → `showModalBottomSheet`，不做 hover 浮层。
+/// 超预算时发送键仍由 input_bar 的 budgetLevel 逻辑禁用（本组件不接管）。
+class ContextMeter extends StatelessWidget {
+  const ContextMeter({
+    super.key,
+    required this.usedTokens,
+    this.limitTokens = kAssumedContextWindow,
+    this.onTap,
+  });
+
+  /// 附件估算 tokens（真实数据；0 = 无附件）。
+  final int usedTokens;
+  final int limitTokens;
+
+  /// 测试注入；默认打开底部 sheet。
+  final VoidCallback? onTap;
+
+  static const double ringSize = 14;
+  static const double ringStroke = 2;
+  static const double hitSize = 48;
+
+  int get percent => contextPercent(usedTokens, limitTokens);
+
+  Color _arcColor(ColorScheme cs) {
+    if (limitTokens > 0 && usedTokens > limitTokens) return cs.error;
+    if (limitTokens > 0 && usedTokens > limitTokens * 0.8) {
+      return Colors.amber.shade800;
+    }
+    return cs.primary;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final color = _arcColor(cs);
+    final ratio = limitTokens > 0
+        ? (usedTokens / limitTokens).clamp(0.0, 1.0).toDouble()
+        : 0.0;
+
+    final pill = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: cs.outlineVariant),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: ringSize,
+            height: ringSize,
+            child: CustomPaint(
+              // 稳定的定位锚（测试断言用；不影响绘制与布局）。
+              key: const ValueKey('context-meter-ring'),
+              painter: _MeterRingPainter(
+                ratio: ratio,
+                track: cs.outlineVariant,
+                color: color,
+                strokeWidth: ringStroke,
+              ),
+            ),
+          ),
+          const SizedBox(width: 5),
+          Text(
+            '$percent%',
+            style: TextStyle(
+              fontSize: 11.5,
+              height: 1.1,
+              color: cs.onSurfaceVariant,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
+      ),
+    );
+
+    return Semantics(
+      label: '上下文已用 $percent%（仅附件估算，按 32k 估算）',
+      button: true,
+      child: InkResponse(
+        onTap: onTap ??
+            () => showContextMeterSheet(
+                  context,
+                  usedTokens: usedTokens,
+                  limitTokens: limitTokens,
+                ),
+        radius: hitSize / 2,
+        // 命中区至少 48×48，但**宽度必须让 pill 自然增长**：
+        // 之前用 SizedBox(width: 48) 把 pill 的内部可用宽度压到 48-2*8-2*1=30，
+        // ring 14 + gap 5 + 「214%」≈ 26 就溢出（F21 宿主实测 13px / 超限 36px）。
+        // 这里只给**最小**尺寸，宽度随内容增长；文字与圆环都不缩小。
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(
+            minWidth: hitSize,
+            minHeight: hitSize,
+          ),
+          child: Center(
+            widthFactor: 1,
+            heightFactor: 1,
+            child: pill,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 展开面板（底部 sheet）：**只展示真实可得的「附件（估算）」一行**。
+Future<void> showContextMeterSheet(
+  BuildContext context, {
+  required int usedTokens,
+  int limitTokens = kAssumedContextWindow,
+}) {
+  return showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    builder: (sheetContext) {
+      final cs = Theme.of(sheetContext).colorScheme;
+      final theme = Theme.of(sheetContext).textTheme;
+      final percent = contextPercent(usedTokens, limitTokens);
+      final hasLimit = limitTokens > 0;
+      return SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('上下文已用 $percent%',
+                  style: theme.titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Container(
+                    width: 10,
+                    height: 10,
+                    decoration: BoxDecoration(
+                      color: cs.primary,
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text('附件（估算）',
+                        style: TextStyle(fontSize: 13, color: cs.onSurface)),
+                  ),
+                  Text(
+                    formatTokenCount(usedTokens),
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      color: cs.onSurfaceVariant,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                hasLimit
+                    ? '按 32k 估算（$limitTokens tokens）。'
+                        '本次仅统计草稿附件估算；'
+                        '系统说明（含工具定义）与对话历史未计入。'
+                    : '上限未知（模型未配置），分母按 32k 估算、百分比按 0 处理。'
+                        '本次仅统计草稿附件估算；'
+                        '系统说明（含工具定义）与对话历史未计入。',
+                style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+class _MeterRingPainter extends CustomPainter {
+  _MeterRingPainter({
+    required this.ratio,
+    required this.track,
+    required this.color,
+    required this.strokeWidth,
+  });
+
+  final double ratio;
+  final Color track;
+  final Color color;
+  final double strokeWidth;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = (math.min(size.width, size.height) - strokeWidth) / 2;
+    final rect = Rect.fromCircle(center: center, radius: radius);
+
+    // 灰色底环（2px）
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth
+        ..color = track,
+    );
+    if (ratio <= 0) return;
+    // 从 12 点（-pi/2）顺时针画占用弧，linecap round
+    canvas.drawArc(
+      rect,
+      -math.pi / 2,
+      2 * math.pi * ratio,
+      false,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth
+        ..strokeCap = StrokeCap.round
+        ..color = color,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _MeterRingPainter old) =>
+      old.ratio != ratio ||
+      old.color != color ||
+      old.track != track ||
+      old.strokeWidth != strokeWidth;
+}
