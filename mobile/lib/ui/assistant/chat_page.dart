@@ -21,6 +21,8 @@ import 'attachment_picker.dart';
 import 'conversation_export.dart';
 import 'widgets/attachment_cards.dart';
 import 'widgets/chat_appbar.dart';
+import 'widgets/code_block.dart';
+import 'widgets/collapsible_content.dart';
 import 'widgets/input_bar.dart';
 import 'widgets/proposal_card.dart';
 import 'widgets/streaming_blocks.dart';
@@ -1126,9 +1128,9 @@ class _ChatPageState extends State<ChatPage> {
         ),
       );
 
-  /// 用户 pill 最大宽度：不超过屏宽 82%（小屏不溢出，大屏不拉满）。
+  /// 用户 pill 最大宽度：不超过屏宽 86%（F21 第③阶段口径；小屏不溢出）。
   double _pillMaxWidth(BuildContext context) =>
-      (MediaQuery.of(context).size.width * 0.82).clamp(0.0, 560.0);
+      (MediaQuery.of(context).size.width * 0.86).clamp(0.0, 560.0);
 
   static String _fmtFullTime(int ms) {
     final d = DateTime.fromMillisecondsSinceEpoch(ms);
@@ -1140,13 +1142,23 @@ class _ChatPageState extends State<ChatPage> {
   /// Agent 正文：Markdown 渲染（代码块/引用/列表）；用户消息保持纯文本。
   Widget _messageText(BuildContext context, ChatMessage m, ColorScheme cs) {
     if (m.role == ChatRole.user) {
-      return Text(m.content,
-          style: TextStyle(fontSize: 16, height: 1.5, color: cs.onPrimary));
+      // F21 第③阶段：pill 内长文默认 3 行，**真实超过 3 行才**给「展开全文」。
+      return CollapsibleLines(
+        text: m.content,
+        maxLines: 3,
+        style: TextStyle(fontSize: 16, height: 1.5, color: cs.onPrimary),
+      );
     }
-    return MarkdownBody(
+    return CollapsibleContent(
+      fadeSurface: cs.surface,
+      child: MarkdownBody(
       data: m.content,
       selectable: true,
       softLineBreak: true,
+      // F21 第③阶段：fenced code 横向滚动 + 常驻复制按钮（普通 markdown 不动）。
+      builders: {
+        "pre": FencedCodeBuilder(cs),
+      },
       styleSheet: MarkdownStyleSheet(
         p: TextStyle(fontSize: 16, height: 1.6, color: cs.onSurface),
         h1: TextStyle(
@@ -1177,6 +1189,9 @@ class _ChatPageState extends State<ChatPage> {
           border: Border(top: BorderSide(color: cs.outlineVariant)),
         ),
       ),
+      ),
+      // F21 第③阶段：长报告默认限高 200dp + 底部渐变 + 「查看全文」；
+      // 只有真实越过 200dp 才出现按钮（见 CollapsibleContent 的溢出检测）。
     );
   }
 
