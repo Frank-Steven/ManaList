@@ -42,8 +42,6 @@ void main() {
 
       // F27：默认展开，显示「收起」
       expect(find.text("收起"), findsOneWidget);
-      final expandedHeight =
-          tester.getSize(find.byType(CollapsibleContent)).height;
 
       // 手动折叠
       await tester.ensureVisible(
