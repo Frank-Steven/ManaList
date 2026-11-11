@@ -1116,7 +1116,7 @@ class _ChatPageState extends State<ChatPage> {
             FoldedToolMessages(:final messages) =>
               _buildFoldedToolMessages(messages),
           },
-        if (_busy) _buildStreaming(cs),
+        if (_busy || _segments.isNotEmpty) _buildStreaming(cs), // F28：输出结束后保留思考/工具入口
         if (_errorText != null) _buildError(cs),
       ],
     );

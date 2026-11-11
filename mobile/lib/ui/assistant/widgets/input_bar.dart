@@ -203,7 +203,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
     return SafeArea(
       top: false,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+        padding: const EdgeInsets.fromLTRB(12, 4, 12, 6), // F29：减少垂直留白
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -216,7 +216,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
                   child: Container(
                     decoration: BoxDecoration(
                       color: cs.surfaceContainerHigh,
-                      borderRadius: BorderRadius.circular(22),
+                      borderRadius: BorderRadius.circular(12), // F29：更紧凑的圆角
                       border: Border.all(color: cs.outlineVariant),
                     ),
                     child: Row(

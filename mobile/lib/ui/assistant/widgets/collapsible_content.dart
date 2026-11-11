@@ -30,7 +30,7 @@ class CollapsibleContent extends StatefulWidget {
 class _CollapsibleContentState extends State<CollapsibleContent> {
   final ScrollController _scroll = ScrollController();
   bool _overflowing = false;
-  bool _expanded = false;
+  bool _expanded = true; // F27：默认展开，用户可手动折叠
 
   @override
   void initState() {
@@ -62,6 +62,7 @@ class _CollapsibleContentState extends State<CollapsibleContent> {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     if (_expanded) {
+      // F27：默认展开，始终显示「收起」供用户手动折叠
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,

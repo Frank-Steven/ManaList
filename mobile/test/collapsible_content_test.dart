@@ -26,39 +26,42 @@ Widget tallColumn() => Column(
 
 void main() {
   group("CollapsibleContent（助理长报告）", () {
-    testWidgets("短内容：不出现「查看全文」", (tester) async {
+    testWidgets("短内容：默认展开，显示「收起」供手动折叠", (tester) async {
       await tester.pumpWidget(wrap(const CollapsibleContent(
         child: SizedBox(height: 40, child: Text("短回复")),
       )));
       await tester.pumpAndSettle();
-      expect(find.byKey(const ValueKey("collapsible-toggle")), findsNothing);
-      expect(find.text("查看全文"), findsNothing);
+      // F27：默认展开，显示「收起」供用户手动折叠
+      expect(find.byKey(const ValueKey("collapsible-toggle")), findsOneWidget);
+      expect(find.text("收起"), findsOneWidget);
     });
 
-    testWidgets("长内容：限高 + 出现按钮；展开变大、可再收起", (tester) async {
+    testWidgets("长内容：默认展开；手动折叠后限高、可再展开", (tester) async {
       await tester.pumpWidget(wrap(CollapsibleContent(child: tallColumn())));
       await tester.pumpAndSettle();
 
-      expect(find.text("查看全文"), findsOneWidget);
-      final collapsedHeight =
-          tester.getSize(find.byType(CollapsibleContent)).height;
-      expect(collapsedHeight, lessThanOrEqualTo(260),
-          reason: "折叠态 = 200dp 内容 + 按钮");
-
-      await tester.tap(find.byKey(const ValueKey("collapsible-toggle")));
-      await tester.pumpAndSettle();
+      // F27：默认展开，显示「收起」
       expect(find.text("收起"), findsOneWidget);
-      expect(find.text("查看全文"), findsNothing);
       final expandedHeight =
           tester.getSize(find.byType(CollapsibleContent)).height;
-      expect(expandedHeight, greaterThan(collapsedHeight + 100),
-          reason: "展开后应露出全部内容");
 
+      // 手动折叠
       await tester.ensureVisible(
           find.byKey(const ValueKey("collapsible-toggle")));
       await tester.tap(find.byKey(const ValueKey("collapsible-toggle")));
       await tester.pumpAndSettle();
       expect(find.text("查看全文"), findsOneWidget);
+      final collapsedHeight =
+          tester.getSize(find.byType(CollapsibleContent)).height;
+      expect(collapsedHeight, lessThanOrEqualTo(260),
+          reason: "手动折叠后 = 200dp 内容 + 按钮");
+
+      // 再展开
+      await tester.ensureVisible(
+          find.byKey(const ValueKey("collapsible-toggle")));
+      await tester.tap(find.byKey(const ValueKey("collapsible-toggle")));
+      await tester.pumpAndSettle();
+      expect(find.text("收起"), findsOneWidget);
     });
   });
 
