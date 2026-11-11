@@ -126,6 +126,24 @@ class _ChatInputBarState extends State<ChatInputBar> {
     );
   }
 
+  /// F03：草稿附件 chip。图片 chip 点按 → 全屏预览（与附件卡片共用
+  /// [showImagePreview]）；非图片 chip 保持原样（不可点）。
+  /// 删除按钮与批量上限语义完全不变。
+  Widget _buildDraftChip(ChatAttachment a, ColorScheme cs) {
+    final meta = widget.metaOf(a);
+    final file = meta?.file;
+    return InputChip(
+      avatar: Icon(meta?.icon ?? Icons.attach_file, size: 16),
+      label: Text(meta?.title ?? a.id, style: const TextStyle(fontSize: 11)),
+      visualDensity: VisualDensity.compact,
+      side: BorderSide(color: cs.outlineVariant),
+      onPressed: isPreviewableImage(meta)
+          ? () => showImagePreview(context, file!)
+          : null,
+      onDeleted: () => widget.onRemoveAttachment(a),
+    );
+  }
+
   Widget _buildAttachmentBar(ColorScheme cs) {
     return Container(
       height: 44,
@@ -143,17 +161,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
                 for (final a in widget.attachments)
                   Padding(
                     padding: const EdgeInsets.only(right: 6),
-                    child: InputChip(
-                      avatar: Icon(
-                          widget.metaOf(a)?.icon ?? Icons.attach_file,
-                          size: 16),
-                      label: Text(
-                          widget.metaOf(a)?.title ?? a.id,
-                          style: const TextStyle(fontSize: 11)),
-                      visualDensity: VisualDensity.compact,
-                      side: BorderSide(color: cs.outlineVariant),
-                      onDeleted: () => widget.onRemoveAttachment(a),
-                    ),
+                    child: _buildDraftChip(a, cs),
                   ),
               ],
             ),
@@ -211,6 +219,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final hasImageDraft =
+        widget.attachments.any((a) => isPreviewableImage(widget.metaOf(a)));
     return SafeArea(
       top: false,
       child: Padding(
@@ -254,12 +264,16 @@ class _ChatInputBarState extends State<ChatInputBar> {
                             controller: widget.controller,
                             minLines: 1,
                             maxLines: 4,
-                            decoration: const InputDecoration(
-                              hintText: '和助理说点什么，或输入 / 快捷指令…',
+                            decoration: InputDecoration(
+                              // F03：有截图草稿时可留空直接发（默认指令见
+                              // chat_page.outgoingTextFor），否则维持原文案。
+                              hintText: hasImageDraft
+                                  ? '可留空：直接发送这些截图'
+                                  : '和助理说点什么，或输入 / 快捷指令…',
                               isDense: true,
                               border: InputBorder.none,
                               contentPadding:
-                                  EdgeInsets.symmetric(vertical: 10),
+                                  const EdgeInsets.symmetric(vertical: 10),
                             ),
                             onSubmitted: (_) => widget.onSend(),
                           ),
