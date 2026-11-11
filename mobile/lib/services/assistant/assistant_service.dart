@@ -134,6 +134,10 @@ class AssistantTurnHandle {
 
   bool _closed = false;
 
+  /// 用户主动取消了本回合（B19：续跑前必须检查——否则点了「停止」
+  /// 之后循环还会再发一轮请求）。
+  bool cancelledByUser = false;
+
   void _emit(AssistantEvent ev) {
     switch (ev) {
       case AssistantThinkingDelta():
@@ -323,12 +327,14 @@ class AssistantService {
   void cancelTurn(String conversationId) {
     final handle = activeTurns[conversationId];
     if (handle == null) return;
+    handle.cancelledByUser = true;
     handle.channel.cancelActive();
   }
 
   /// 中断全部在途回合（旧 API；未闭合工具块丢弃，已落库提案保留）。
   void cancelActive() {
     for (final h in activeTurns.values) {
+      h.cancelledByUser = true;
       h.channel.cancelActive();
     }
   }
@@ -451,23 +457,6 @@ class AssistantService {
     // 用户消息与占位已落库：让对话页立即刷新上屏（不等首个 token）
     handle._emit(const AssistantTurnStarted());
 
-    // 请求消息序列：说明书前言（schema 的 role 枚举无 system，前言作为
-    // 首条 user 消息注入，details §2.4 说明书由 mobile 组装）+ 历史
-    // （streaming/error 占位与空消息不进上下文）。
-    final history = (await db.getChatMessages(conversation.id))
-        .where((m) =>
-            m.id != assistantMsg.id &&
-            m.status == ChatMessageStatus.done &&
-            m.content.isNotEmpty)
-        .map((m) => ChatMessageModel(
-            role: m.role, content: m.content, attachments: m.attachments))
-        .toList();
-    final requestMessages = [
-      ChatMessageModel(
-          role: ChatRole.user,
-          content: '[系统说明]\n${buildToolSpecPrompt(DateTime.now())}'),
-      ...history,
-    ];
     final vision = await handle.channel.isVisionCapable(conversation.modelConfigId);
     final expanded =
         await expandAttachments(handle.attachments, visionCapable: vision);
@@ -476,42 +465,97 @@ class AssistantService {
     // 未选中的消息不进 triage、不产提案。
     final selectedMessageIds = selectedMessageIdsOf(handle.attachments);
 
-    final thinkParser = ThinkTagParser();
-    final parser = ToolBlockParser();
     final visible = StringBuffer();
     var interrupted = false;
     String? errorText;
 
-    /// 已播报「开始流入」的工具块序号（parser 只在块闭合时产出块，
-    /// 开始状态靠 inBlock + blockCount 组合探测）。
-    int announcedBlockStart = -1;
+    // B19（2026-11-10）：只读工具回注后的**有界续跑**。
+    //
+    // 背景：一个回合原本只发一次请求，而工具结果是以 role=tool 的消息落库的
+    // （ProposalExecutor.reportToolMessage）。若不在此刻再请求一次，模型要等
+    // 用户下一句话才看得到「[工具执行结果]」——表现出来就是「工具回注后
+    // Agent 停住，需要用户再问一句」。
+    //
+    // 规则（用户批准的最小方案）：
+    // 1. 只有**只读工具结果**（ReadToolResult）触发续跑；本轮一旦产出待审批
+    //    提案（ProposalCreated / ProposalDuplicate）立刻停止，等审批；
+    // 2. 每轮**重建历史与请求**（否则第二轮看不到上一轮的 [工具执行结果]）；
+    // 3. 续跑上限 [maxToolContinuations] 轮（首轮之外），防连环只读烧额度；
+    // 4. 出错 / 中断早退；**审批通过后的续跑属 Q13，本轮不做**。
+    const maxToolContinuations = 2;
+    var continuationRound = 0;
 
-    /// 闭包产出的事件中转队列（每回合独立，并行回合互不串扰）。
-    final pendingEvents = <AssistantEvent>[];
-
-    Future<void> handleBlock(ParsedToolBlock block) async {
-      final outcome = await ProposalService.instance.handleToolBlock(
-        conversationId: conversation.id,
-        batchId: assistantMsg.id,
-        block: block,
-        selectedMessageIds: selectedMessageIds,
-      );
-      switch (outcome) {
-        case ProposalCreated():
-          pendingEvents.add(AssistantProposalCreated(outcome.proposal));
-        case ProposalDuplicate():
-          break; // 重放命中去重键：跳过
-        case ProposalValidationFailure():
-          final content = '一个动作未能理解，已跳过：${outcome.reason}';
-          await ProposalExecutor.instance
-              .reportToolMessage(conversation.id, content);
-          pendingEvents.add(AssistantToolMessage(block.index, content));
-        case ReadToolResult():
-          await ProposalExecutor.instance
-              .reportToolMessage(conversation.id, outcome.text);
-          pendingEvents.add(AssistantToolMessage(block.index, outcome.text));
+    while (true) {
+      final isContinuation = continuationRound > 0;
+      if (isContinuation) {
+        // 续跑前把本轮已生成的正文先落库：第二轮请求要带上这段 narration，
+        // 否则模型看不到自己上一轮说过什么，容易重复生成同一段。
+        await db.updateChatMessageContent(assistantMsg.id, visible.toString());
       }
-    }
+      // ---- 每轮：重建历史与请求（续跑必须看到上一轮回注的工具结果）----
+      final history = (await db.getChatMessages(conversation.id))
+          .where((m) {
+            if (m.content.isEmpty) return false;
+            // 本回合的 assistant 消息在 DB 里仍是 streaming（收尾才置 done）：
+            // 首轮按既有规则排除；续跑轮**纳入**，且时间戳早于工具消息，
+            // 顺序天然是 [user] → [assistant 正文] → [tool 结果]。
+            if (m.id == assistantMsg.id) return isContinuation;
+            return m.status == ChatMessageStatus.done;
+          })
+          .map((m) => ChatMessageModel(
+              role: m.role, content: m.content, attachments: m.attachments))
+          .toList();
+      // 请求消息序列：说明书前言（schema 的 role 枚举无 system，前言作为
+      // 首条 user 消息注入，details §2.4 说明书由 mobile 组装）+ 历史
+      // （streaming/error 占位与空消息不进上下文）。
+      final requestMessages = [
+        ChatMessageModel(
+            role: ChatRole.user,
+            content: '[系统说明]\n${buildToolSpecPrompt(DateTime.now())}'),
+        ...history,
+      ];
+
+      final thinkParser = ThinkTagParser();
+      final parser = ToolBlockParser();
+
+      /// 本轮只读工具结果条数 / 本轮待审批提案条数（B19 续跑判据）。
+      var readResultsThisRound = 0;
+      var proposalsThisRound = 0;
+
+      /// 已播报「开始流入」的工具块序号（parser 只在块闭合时产出块，
+      /// 开始状态靠 inBlock + blockCount 组合探测）。
+      int announcedBlockStart = -1;
+
+      /// 闭包产出的事件中转队列（每回合独立，并行回合互不串扰）。
+      final pendingEvents = <AssistantEvent>[];
+
+      Future<void> handleBlock(ParsedToolBlock block) async {
+        final outcome = await ProposalService.instance.handleToolBlock(
+          conversationId: conversation.id,
+          batchId: assistantMsg.id,
+          block: block,
+          selectedMessageIds: selectedMessageIds,
+        );
+        switch (outcome) {
+          case ProposalCreated():
+            proposalsThisRound++;
+            pendingEvents.add(AssistantProposalCreated(outcome.proposal));
+          case ProposalDuplicate():
+            // 重放命中去重键：已有待确认项，等同于「本轮有提案」→ 不续跑。
+            proposalsThisRound++;
+            break;
+          case ProposalValidationFailure():
+            final content = '一个动作未能理解，已跳过：${outcome.reason}';
+            await ProposalExecutor.instance
+                .reportToolMessage(conversation.id, content);
+            pendingEvents.add(AssistantToolMessage(block.index, content));
+          case ReadToolResult():
+            readResultsThisRound++;
+            await ProposalExecutor.instance
+                .reportToolMessage(conversation.id, outcome.text);
+            pendingEvents.add(AssistantToolMessage(block.index, outcome.text));
+        }
+      }
 
     try {
       await for (final ev in handle.channel.chat(
@@ -582,8 +626,24 @@ class AssistantService {
     for (final block in tail.blocks) {
       await handleBlock(block);
     }
-    while (pendingEvents.isNotEmpty) {
-      handle._emit(pendingEvents.removeAt(0));
+      while (pendingEvents.isNotEmpty) {
+        handle._emit(pendingEvents.removeAt(0));
+      }
+
+      // ---- B19 续跑判定 ----
+      // 只读回注过（readResultsThisRound > 0）、本轮没有待审批提案、
+      // 还有轮数余额、且没有错误/中断时才继续。
+      final shouldContinue = errorText == null &&
+          !interrupted &&
+          !handle.cancelledByUser &&
+          readResultsThisRound > 0 &&
+          proposalsThisRound == 0 &&
+          continuationRound < maxToolContinuations;
+      if (!shouldContinue) break;
+      continuationRound++;
+      // 续跑沿用**同一个** handle 与 assistantMsg：阶段拨回「思考中」，
+      // 界面继续显示同一个进行态；不新增事件类型（避免 UI 改动）。
+      handle.phase.value = TurnPhase.thinking;
     }
 
     if (errorText != null) {
