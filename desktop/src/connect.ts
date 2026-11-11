@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { loadConfig } from "./config.js";
+import { resolveServerLaunch } from "./launch.js";
 import { DESKTOP_ROOT } from "./registry.js";
 import { loadOrCreatePairing } from "./auth.js";
 import { deviceState, ensureReverse } from "./adb.js";
@@ -35,13 +36,22 @@ async function serverUp(): Promise<boolean> {
 async function ensureServer(): Promise<void> {
   if (await serverUp()) return;
   if (!serverChild) {
-    log("服务未运行，正在拉起…");
-    serverChild = spawn("npx", ["tsx", "src/index.ts", "start"], {
+    // B20：不 spawn 裸 npx（Windows 上是 npx.cmd → ENOENT）。
+    // 统一 = 当前 Node 可执行文件 + 本地 tsx CLI（或已构建 dist）。
+    const launch = resolveServerLaunch();
+    log(`服务未运行，正在拉起…（${launch.source}）`);
+    serverChild = spawn(launch.command, launch.args, {
       cwd: DESKTOP_ROOT,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
     serverChild.stdout?.on("data", (d: Buffer) => process.stdout.write(`  [server] ${d}`));
     serverChild.stderr?.on("data", (d: Buffer) => process.stderr.write(`  [server] ${d}`));
+    serverChild.on("error", (err: Error) => {
+      // spawn 本身失败（路径错/权限）不再静默崩，交给下一轮重试。
+      log(`服务拉起失败：${err.message}`);
+      serverChild = null;
+    });
     serverChild.on("exit", () => {
       serverChild = null;
     });

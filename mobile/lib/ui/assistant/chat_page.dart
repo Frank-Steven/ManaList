@@ -9,6 +9,7 @@ import '../../models/conversation.dart';
 import '../../models/message.dart';
 import '../../services/assistant/assistant_service.dart';
 import '../../services/assistant/models.dart';
+import '../../services/assistant/screenshot_convention.dart';
 import '../../services/app_log.dart';
 import '../../services/ai_client.dart';
 import '../../services/assistant/assistant_client.dart';
@@ -39,10 +40,26 @@ List<T> clampScreenshotBatch<T>(List<T> picked) =>
         ? List<T>.of(picked)
         : picked.sublist(0, maxScreenshotsPerBatch);
 
-/// F03 Step2：截图整理约定 + 敏感信息提示（纯函数，测试断言关键片段）。
-String screenshotsConventionHint() =>
-    '每张截图单独成条：能确定时间的出待办（task.create），纯信息出笔记（note.create），'
-    '不跨图合并。截图可能含敏感信息，远程模型会离开设备。';
+// F03 Step2/3：截图整理约定已下沉到
+// services/assistant/screenshot_convention.dart（UI 横幅与模型系统前言共用）。
+
+/// F03：空文本 + 含截图时的默认可发送指令（此前空文本会被 _send 直接吞掉，
+/// 用户面对「点了发送没反应」）。
+const String kScreenshotOnlyDefaultText = '帮我整理这些截图。';
+
+/// F03：决定本回合要发送的文本（纯函数，便于单测）。
+///
+/// - 有文本 → 原文；
+/// - 无文本但含截图附件 → [kScreenshotOnlyDefaultText]；
+/// - 无文本也无截图 → null，调用方应拒绝发送（保持既有语义：纯空不可发）。
+String? outgoingTextFor({
+  required String typed,
+  required bool hasScreenshotAttachments,
+}) {
+  final text = typed.trim();
+  if (text.isNotEmpty) return text;
+  return hasScreenshotAttachments ? kScreenshotOnlyDefaultText : null;
+}
 
 /// 对话页（assistant-v4-ui §3，2026-11-08 重设计）：
 ///
@@ -299,14 +316,18 @@ class _ChatPageState extends State<ChatPage> {
     switch (a.type) {
       case ChatAttachmentType.file:
         final f = await db.getFileById(a.id);
+        final isImage = f != null && isImageAttachment(f);
         return AttachmentMeta(
           title: f?.name ?? '文件',
           icon: f != null
               ? libraryFileIcon(f)
               : Icons.insert_drive_file_outlined,
           file: f,
-          // 文本文件按字节数近似字符数（预算条保守估算）
-          chars: f?.size,
+          // 文本文件按字节数近似字符数（预算条保守估算）。
+          // F22：图片**绝不**用字节数——50KB JPEG 会被算成 2.5 万 token；
+          // 图片改走 imageTokens（按内联后 1024 长边的像素面积估算）。
+          chars: isImage ? null : f?.size,
+          imageTokens: isImage ? estimateImageTokens() : null,
         );
       case ChatAttachmentType.note:
         final n = await db.getNoteById(a.id);
@@ -327,15 +348,11 @@ class _ChatPageState extends State<ChatPage> {
       _attachmentMeta['${a.type}:${a.id}'];
 
   /// 草稿附件的 token 估算合计（assistant-v4-ui §3.6 预算条）：
-  /// 字符数/2（CJK 保守估计）；元数据未解析或对象已删的按 0 计。
-  int get _pendingAttachmentTokens {
-    var sum = 0;
-    for (final a in _pendingAttachments) {
-      final chars = _metaOf(a)?.chars;
-      if (chars != null) sum += estimateTokensFromChars(chars);
-    }
-    return sum;
-  }
+  /// 图片走 imageTokens（内联后像素估算，F22），其余类型字符/2（CJK 保守估计）；
+  /// 元数据未解析或对象已删的按 0 计。
+  int get _pendingAttachmentTokens => sumAttachmentTokens(
+        _pendingAttachments.map(_metaOf),
+      );
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -440,10 +457,9 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   /// 草稿里是否含图片附件（决定是否显示 F03 的截图约定/敏感信息提示）。
-  bool get _hasScreenshotAttachments => _pendingAttachments.any((a) {
-        final f = _metaOf(a)?.file;
-        return f != null && (f.mimeType ?? '').startsWith('image/');
-      });
+  /// 与草稿 chip 能否预览共用 [isPreviewableImage]，避免两处 mime 判断漂移。
+  bool get _hasScreenshotAttachments =>
+      _pendingAttachments.any((a) => isPreviewableImage(_metaOf(a)));
 
   Widget _buildScreenshotsHint(ColorScheme cs) {
     return Container(
@@ -759,8 +775,13 @@ class _ChatPageState extends State<ChatPage> {
   // ---- 发送 / 取消 / 消息操作 ----
 
   void _send() {
-    final text = _input.text.trim();
-    if (text.isEmpty || _busy) return;
+    if (_busy) return;
+    // F03：空文本 + 截图 → 默认指令（其它空文本仍不可发）。
+    final text = outgoingTextFor(
+      typed: _input.text,
+      hasScreenshotAttachments: _hasScreenshotAttachments,
+    );
+    if (text == null) return;
     _input.clear();
     final attachments = List<ChatAttachment>.of(_pendingAttachments);
     setState(() {

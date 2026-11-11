@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:msgrepo_mobile/services/assistant/screenshot_convention.dart';
 import 'package:msgrepo_mobile/ui/assistant/chat_page.dart';
 
 /// F03（2026-11-03）Step1+2 的纯函数守卫：单批上限、超限截断、约定文案。
@@ -26,6 +27,28 @@ void main() {
     test('空列表与超上限的边界', () {
       expect(clampScreenshotBatch<int>(const []), isEmpty);
       expect(clampScreenshotBatch<int>(List.generate(7, (i) => i)).length, 6);
+    });
+  });
+
+  group('F03 空文本 + 截图可发送', () {
+    test('有文本：用原文（仅 trim）', () {
+      expect(
+          outgoingTextFor(
+              typed: '  帮我看看这几张  ', hasScreenshotAttachments: true),
+          '帮我看看这几张');
+    });
+
+    test('无文本但有截图：给出默认指令（否则点发送没反应）', () {
+      final text = outgoingTextFor(typed: '   ', hasScreenshotAttachments: true);
+      expect(text, kScreenshotOnlyDefaultText);
+      expect(text, isNotEmpty);
+      expect(text!.trim(), isNotEmpty);
+    });
+
+    test('无文本也无截图：null，调用方拒绝发送（保持原有不可发语义）', () {
+      expect(outgoingTextFor(typed: '', hasScreenshotAttachments: false), isNull);
+      expect(outgoingTextFor(typed: '   ', hasScreenshotAttachments: false),
+          isNull);
     });
   });
 

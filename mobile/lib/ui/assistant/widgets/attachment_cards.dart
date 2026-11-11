@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
@@ -16,20 +17,76 @@ class AttachmentMeta {
   final LibraryFile? file;
 
   /// 正文字符数估算（token 预算条用，assistant-v4-ui §3.6）：
-  /// 消息 = body 长度，笔记 = content 长度，文件 = 字节数（文本文件近似）；
+  /// 消息 = body 长度，笔记 = content 长度，**文本文件** = 字节数（近似）；
   /// 对象已被删除/不可读时为 null（按 0 计）。
+  ///
+  /// ⚠️ 图片附件**不得**再用字节数（F22）：见 [imageTokens]。
   final int? chars;
+
+  /// 图片附件的 token 估算（F22）：按**内联后的像素**算，不用文件字节。
+  /// 非图片附件为 null。
+  final int? imageTokens;
 
   const AttachmentMeta({
     required this.title,
     required this.icon,
     this.file,
     this.chars,
+    this.imageTokens,
   });
 }
 
 /// token 估算（§3.6）：字符数 / 2（CJK 保守估计）。
 int estimateTokensFromChars(int chars) => (chars / 2).ceil();
+
+/// 图片内联口径：encodeInlineImage 默认把长边缩到 [kInlineImageMaxSide]
+/// （services/assistant/image_encoder.dart:16）。视觉开销与**像素面积**相关、
+/// 与文件字节数无关 —— 用字节数会把 50KB JPEG 算成 2.5 万 token（F22）。
+const int kInlineImageMaxSide = 1024;
+
+/// 视觉 token ≈ 缩放后像素面积 / 750（业界常用近似，仅用于预算提示）。
+const int kImageTokenAreaDivisor = 750;
+
+/// 宽高未知时的**保守上界**：1024×1024 / 750 ≈ 1398.1 → 取 1400。
+const int kConservativeImageTokens = 1400;
+
+/// 图片附件的 token 估算（F22 修复）：按长边 [maxSide] 等比缩放后的面积算，
+/// 不用文件字节数。宽/高未知或非法 → 回退 [kConservativeImageTokens]。
+int estimateImageTokens({
+  int? width,
+  int? height,
+  int maxSide = kInlineImageMaxSide,
+}) {
+  if (width == null || height == null || width <= 0 || height <= 0) {
+    return kConservativeImageTokens;
+  }
+  var w = width;
+  var h = height;
+  final longest = math.max(w, h);
+  if (maxSide > 0 && longest > maxSide) {
+    final scale = maxSide / longest;
+    w = math.max(1, (w * scale).round());
+    h = math.max(1, (h * scale).round());
+  }
+  return math.max(1, (w * h / kImageTokenAreaDivisor).ceil());
+}
+
+/// 草稿附件 token 估算合计（§3.6）：图片走 [AttachmentMeta.imageTokens]，
+/// 其余类型沿用「字符/2」；元数据缺失按 0 计。
+int sumAttachmentTokens(Iterable<AttachmentMeta?> metas) {
+  var sum = 0;
+  for (final meta in metas) {
+    if (meta == null) continue;
+    final imageTokens = meta.imageTokens;
+    if (imageTokens != null) {
+      sum += imageTokens;
+      continue;
+    }
+    final chars = meta.chars;
+    if (chars != null) sum += estimateTokensFromChars(chars);
+  }
+  return sum;
+}
 
 /// 附件预算档（§3.6）：≤80% 灰、>80% amber、>100% 红且禁用发送。
 enum BudgetLevel { normal, warning, over }
@@ -52,7 +109,34 @@ String formatAttachmentSize(int? bytes) {
   return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
 }
 
-bool _isImage(LibraryFile f) => (f.mimeType ?? '').startsWith('image/');
+/// 是否图片附件（按 mime 前缀判定；chat_page 的预算分流也用它）。
+bool isImageAttachment(LibraryFile f) =>
+    (f.mimeType ?? '').startsWith('image/');
+
+bool _isImage(LibraryFile f) => isImageAttachment(f);
+
+/// 是否为可全屏预览的图片附件：附件卡片与草稿 chip（input_bar）共用同一判定，
+/// 避免两处各写一份 mime 判断导致行为漂移（F03）。
+bool isPreviewableImage(AttachmentMeta? meta) {
+  final f = meta?.file;
+  return f != null && _isImage(f);
+}
+
+/// 全屏图片查看器（可缩放）：附件卡片点按与草稿 chip 点按共用。
+Future<void> showImagePreview(BuildContext context, LibraryFile file) {
+  return showDialog<void>(
+    context: context,
+    builder: (dialogContext) => Dialog(
+      insetPadding: const EdgeInsets.all(12),
+      child: InteractiveViewer(
+        child: Image.file(File(file.localPath),
+            errorBuilder: (_, __, ___) =>
+                const Icon(Icons.broken_image_outlined, size: 64)),
+      ),
+    ),
+  );
+}
+
 bool _isVideo(LibraryFile f) => (f.mimeType ?? '').startsWith('video/');
 bool _isAudio(LibraryFile f) => (f.mimeType ?? '').startsWith('audio/');
 
@@ -185,17 +269,7 @@ class _ImagePreview extends StatelessWidget {
           icon: Icons.broken_image_outlined, label: file.name),
     );
     return GestureDetector(
-      onTap: () => showDialog<void>(
-        context: context,
-        builder: (dialogContext) => Dialog(
-          insetPadding: const EdgeInsets.all(12),
-          child: InteractiveViewer(
-            child: Image.file(File(file.localPath),
-                errorBuilder: (_, __, ___) =>
-                    const Icon(Icons.broken_image_outlined, size: 64)),
-          ),
-        ),
-      ),
+      onTap: () => showImagePreview(context, file),
       child: SizedBox.expand(child: image),
     );
   }

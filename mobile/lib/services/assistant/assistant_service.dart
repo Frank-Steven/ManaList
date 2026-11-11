@@ -11,6 +11,7 @@ import 'image_encoder.dart';
 import 'models.dart';
 import 'proposal_executor.dart';
 import 'proposal_service.dart';
+import 'screenshot_convention.dart';
 import 'think_parser.dart';
 import 'tool_parser.dart';
 import 'tool_spec.dart';
@@ -281,6 +282,21 @@ class AssistantService {
     return out;
   }
 
+  /// F03 Step3：本回合附件里是否含**截图**（图片文件）。
+  ///
+  /// 与 [visionCapable] 解耦：非 vision 模型看不到图，但用户「整理截图」的
+  /// 意图仍成立，整理约定照样要注入系统前言，避免模型按纯文本瞎猜。
+  /// 只看 `file` 类型引用（笔记/消息引用不可能是截图）。
+  Future<bool> attachmentsContainScreenshot(List<ChatAttachment> refs) async {
+    final db = AppDatabase.instance;
+    for (final ref in refs) {
+      if (ref.type != ChatAttachmentType.file) continue;
+      final file = await db.getFileById(ref.id);
+      if ((file?.mimeType ?? '').startsWith('image/')) return true;
+    }
+    return false;
+  }
+
   static String _cap(String text) => text.length > _attachmentMaxChars
       ? '${text.substring(0, _attachmentMaxChars)}…（已截断）'
       : text;
@@ -462,15 +478,22 @@ class AssistantService {
         .map((m) => ChatMessageModel(
             role: m.role, content: m.content, attachments: m.attachments))
         .toList();
-    final requestMessages = [
-      ChatMessageModel(
-          role: ChatRole.user,
-          content: '[系统说明]\n${buildToolSpecPrompt(DateTime.now())}'),
-      ...history,
-    ];
     final vision = await handle.channel.isVisionCapable(conversation.modelConfigId);
     final expanded =
         await expandAttachments(handle.attachments, visionCapable: vision);
+    // F03 Step3/4：有截图时把「整理约定」注入系统前言（唯一拼接点见
+    // screenshot_convention.dart）。约定**只进模型侧**：用户消息正文仍是
+    // handle.text 原文（或 UI 的默认指令），不受影响、也不会重复拼。
+    final hasScreenshot =
+        await attachmentsContainScreenshot(handle.attachments);
+    final requestMessages = [
+      ChatMessageModel(
+          role: ChatRole.user,
+          content: systemPreambleWithConvention(
+              buildToolSpecPrompt(DateTime.now()),
+              hasScreenshots: hasScreenshot)),
+      ...history,
+    ];
 
     // B15：本回合用户**选中**的消息（附件里的 message 引用）= inbox.triage 范围。
     // 未选中的消息不进 triage、不产提案。

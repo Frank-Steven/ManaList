@@ -59,6 +59,45 @@ export interface DeviceScan {
 }
 
 /**
+ * 纯解析：`adb devices -l` 的原始输出 → （状态 + 已授权设备列表）。
+ *
+ * B21（2026-11-11）：旧实现硬依赖 `line.includes("\tdevice")`。本机 adb 37.0.1
+ * 用**空格**分隔列（`R58M...   device product:...`），于是有设备仍被判 absent、
+ * reverse 不执行。现在改为按空白分隔解析：
+ * - 设备判定 `\s+device\b`（tab/多空格/CRLF 都适用，且不误伤 `devices`/`offline`）；
+ * - serial = 首个空白分隔字段；
+ * - 忽略 header（List of devices attached）、daemon 提示（`* daemon ...`）、
+ *   adb server 版本提示与 error 行；
+ * - state 由**首个可判定行**决定（与旧「先命中先返回」一致）：device → ok，
+ *   unauthorized → unauthorized。
+ */
+export function parseDevicesList(output: string): DeviceScan {
+  let state: DeviceState | null = null;
+  const devices: DeviceInfo[] = [];
+  for (const raw of output.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("List of devices attached")) continue;
+    if (line.startsWith("*")) continue; // daemon 启动/结束提示
+    if (line.startsWith("adb server")) continue; // 版本不匹配提示
+    if (line.startsWith("error:")) continue;
+    const parts = line.split(/\s+/);
+    const serial = parts[0];
+    if (!serial) continue;
+    const isDevice = /\s+device\b/.test(line);
+    const isUnauthorized = /\bunauthorized\b/.test(line);
+    if (state === null) {
+      if (isDevice) state = "ok";
+      else if (isUnauthorized) state = "unauthorized";
+    }
+    if (!isDevice) continue;
+    const modelMatch = /\bmodel:(\S+)/.exec(line);
+    devices.push({ serial, model: modelMatch?.[1] ?? "未知型号" });
+  }
+  return { state: state ?? "absent", devices };
+}
+
+/**
  * 单次 `adb devices -l` 同时得到连接状态与设备列表（O07，2026-11-03）。
  *
  * 原先看护 tick 每个 5s 周期先 deviceState()（`adb devices`）再 listDevices()
@@ -73,22 +112,7 @@ export async function scanDevices(): Promise<DeviceScan> {
   } catch {
     return { state: "absent", devices: [] };
   }
-  let state: DeviceState | null = null;
-  const devices: DeviceInfo[] = [];
-  for (const line of out.trim().split("\n").slice(1)) {
-    const isDevice = line.includes("\tdevice");
-    const isUnauthorized = line.includes("unauthorized");
-    // 首个可判定的行决定 state（与原 deviceState 的「先命中先返回」一致）
-    if (state === null) {
-      if (isDevice) state = "ok";
-      else if (isUnauthorized) state = "unauthorized";
-    }
-    if (!isDevice) continue;
-    const serial = line.split("\t")[0]!.trim();
-    const modelMatch = /\bmodel:([^\s]+)/.exec(line);
-    devices.push({ serial, model: modelMatch?.[1] ?? "未知型号" });
-  }
-  return { state: state ?? "absent", devices };
+  return parseDevicesList(out);
 }
 
 /** 已授权设备列表（含型号/序列号）；adb 缺失或无设备时返回空数组。 */
