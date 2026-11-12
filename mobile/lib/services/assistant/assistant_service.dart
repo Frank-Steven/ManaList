@@ -574,9 +574,14 @@ class AssistantService {
             pendingEvents.add(AssistantToolMessage(block.index, content));
           case ReadToolResult():
             readResultsThisRound++;
+            // F31：回注正文带上工具名，历史回合的过程步骤才能显示
+            // 「读取任务列表」而不是笼统的「工具回注」。
+            final tool = block.tool ?? 'tool';
+            final resultText = outcome.text;
+            final content = '[$tool] $resultText';
             await ProposalExecutor.instance
-                .reportToolMessage(conversation.id, outcome.text);
-            pendingEvents.add(AssistantToolMessage(block.index, outcome.text));
+                .reportToolMessage(conversation.id, content);
+            pendingEvents.add(AssistantToolMessage(block.index, content));
         }
       }
 

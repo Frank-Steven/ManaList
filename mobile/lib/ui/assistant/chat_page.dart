@@ -1159,11 +1159,18 @@ class _ChatPageState extends State<ChatPage> {
     ];
     if (tools.isEmpty || !hasAnswer || protectedHit) return asIs;
 
-    final body = <Widget>[
-      for (final m in turn)
-        if (m.role != ChatRole.tool) ..._buildMessageWrapped(m, cs),
-    ];
+    // 顺序：用户气泡 → 过程折叠行 → 助理正文（过程不能跑到用户气泡上方）。
+    final leading = <Widget>[];
+    final rest = <Widget>[];
+    for (final m in turn) {
+      if (m.role == ChatRole.user) {
+        leading.addAll(_buildMessageWrapped(m, cs));
+      } else if (m.role != ChatRole.tool) {
+        rest.addAll(_buildMessageWrapped(m, cs));
+      }
+    }
     return [
+      ...leading,
       ProcessSection(
         summary: _historyProcessSummary(tools),
         children: [
@@ -1174,7 +1181,7 @@ class _ChatPageState extends State<ChatPage> {
             ),
         ],
       ),
-      ...body,
+      ...rest,
     ];
   }
 
@@ -1288,15 +1295,21 @@ class _ChatPageState extends State<ChatPage> {
   /// 历史 tool 消息 → 渲染段（回注结果作为 detail，不发裸 JSON）。
   ChatStreamSegment _toolSegmentFor(ChatMessage m) {
     final failed = m.content.startsWith('一个动作未能理解');
+    // F31：回注正文前缀带工具名（'[task.list] …'）→ 步骤行显示人类可读名。
+    final prefix = RegExp(r'^\[([a-z0-9_.]+)\]\s*').firstMatch(m.content);
+    final tool = prefix?.group(1);
+    final detail =
+        prefix == null ? m.content : m.content.substring(prefix.end);
     return ChatStreamSegment(
         kind: ChatStreamSegmentKind.tool,
         startedAt: DateTime.fromMillisecondsSinceEpoch(m.createdAt))
       ..active = false
       ..endedAt = DateTime.fromMillisecondsSinceEpoch(m.createdAt)
-      ..summary = '工具回注'
+      ..toolName = tool
+      ..summary = tool == null ? '工具回注' : toolDisplay(tool).$1
       ..status = failed ? '未能理解，已跳过' : '已回注'
       ..failed = failed
-      ..detail = m.content
+      ..detail = detail
       ..expanded = _expandedToolMsgIds.contains(m.id);
   }
 
