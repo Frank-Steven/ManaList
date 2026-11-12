@@ -248,7 +248,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
                               // chat_page.outgoingTextFor），否则维持原文案。
                               hintText: hasImageDraft
                                   ? '可留空：直接发送这些截图'
-                                  : '和助理说点什么，或输入 / 快捷指令…',
+                                  : '和助理说点什么…', // F30：缩短hint避免折行
                               isDense: true,
                               border: InputBorder.none,
                               contentPadding:
