@@ -25,6 +25,7 @@ import 'widgets/chat_appbar.dart';
 import 'widgets/code_block.dart';
 import 'widgets/collapsible_content.dart';
 import 'widgets/input_bar.dart';
+import 'widgets/process_section.dart';
 import 'widgets/proposal_card.dart';
 import 'widgets/streaming_blocks.dart';
 import 'widgets/suggestion_chips.dart';
@@ -1368,43 +1369,84 @@ class _ChatPageState extends State<ChatPage> {
     // F21 第①阶段：同一阶段连续的成功工具回注合成一条「完成 N 步 · 全部成功」；
     // 待确认（含破坏性审批）/ 失败 / 执行中一律独立、永不折叠（见 tool_steps_group.dart）。
     final items = groupStreamSegments(_segments);
+    // F31：回合已结束且已输出正文时，思考/工具保留但收进默认折叠的「过程」。
+    final finished = !_busy;
+    final hasText = _segments.any((s) =>
+        s.kind == ChatStreamSegmentKind.text && s.text.trim().isNotEmpty);
+    final content = <Widget>[];
+    final process = <Widget>[];
+
+    for (final item in items) {
+      final isProcess = item is FoldedToolSteps ||
+          (item is SingleSegment &&
+              item.segment.kind != ChatStreamSegmentKind.text);
+      final widget = switch (item) {
+        FoldedToolSteps(:final steps) => ToolStepsGroup(
+            steps: steps,
+            onStepToggle: (step) =>
+                setState(() => step.expanded = !step.expanded),
+          ),
+        SingleSegment(:final segment) => switch (segment.kind) {
+            ChatStreamSegmentKind.text => FadeInStreamingText(
+              text: segment.text,
+              settled: !segment.active,
+              // 光标动效已收敛到主进行态条，这里不再画。
+              showCursor: false,
+            ),
+            ChatStreamSegmentKind.thinking => ThinkingBlock(
+              segment: segment,
+              onToggle: () =>
+                  setState(() => segment.expanded = !segment.expanded),
+            ),
+            ChatStreamSegmentKind.tool => ToolCallBlock(
+              segment: segment,
+              onToggle: () =>
+                  setState(() => segment.expanded = !segment.expanded),
+            ),
+          },
+      };
+      if (finished && hasText && isProcess) {
+        process.add(widget);
+      } else {
+        content.add(widget);
+      }
+    }
+    if (process.isNotEmpty) {
+      content.add(ProcessSection(
+        summary: _processSummaryText(),
+        children: process,
+      ));
+    }
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final item in items)
-            switch (item) {
-              FoldedToolSteps(:final steps) => ToolStepsGroup(
-                  steps: steps,
-                  onStepToggle: (step) =>
-                      setState(() => step.expanded = !step.expanded),
-                ),
-              SingleSegment(:final segment) => switch (segment.kind) {
-                  ChatStreamSegmentKind.text => FadeInStreamingText(
-                    text: segment.text,
-                    settled: !segment.active,
-                    // 光标动效已收敂到主进行态条，这里不再画。
-                    showCursor: false,
-                  ),
-                  ChatStreamSegmentKind.thinking => ThinkingBlock(
-                    segment: segment,
-                    onToggle: () =>
-                        setState(() => segment.expanded = !segment.expanded),
-                  ),
-                  ChatStreamSegmentKind.tool => ToolCallBlock(
-                    segment: segment,
-                    onToggle: () =>
-                        setState(() => segment.expanded = !segment.expanded),
-                  ),
-                },
-            },
-          // F21 第②阶段：原先这里的独立呼吸光标已移除——
-          // 「回合进行中」只由输入栏上方的主进行态条表达。
-        ],
+        children: content,
       ),
     );
+  }
+
+  /// 「过程」摘要：思考时长 + 工具步数 + 失败步数（F31）。
+  String _processSummaryText() {
+    var thinkSeconds = 0;
+    var toolCount = 0;
+    var failed = 0;
+    for (final s in _segments) {
+      if (s.kind == ChatStreamSegmentKind.thinking) {
+        thinkSeconds += s.elapsedSeconds;
+      } else if (s.kind == ChatStreamSegmentKind.tool) {
+        toolCount++;
+        if (s.failed) failed++;
+      }
+    }
+    final parts = <String>[];
+    if (thinkSeconds > 0) parts.add('思考 ${thinkSeconds}s');
+    if (toolCount > 0) {
+      parts.add('$toolCount 步工具${failed > 0 ? '（$failed 步失败）' : ''}');
+    }
+    return parts.isEmpty ? '过程' : '过程 · ${parts.join(' · ')}';
   }
 
   /// 解析当前生效端点的持久化诊断（§5.3）：绑定接口优先，否则默认路由的
