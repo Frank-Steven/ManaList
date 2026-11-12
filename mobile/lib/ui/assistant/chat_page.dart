@@ -677,7 +677,16 @@ class _ChatPageState extends State<ChatPage> {
       }
     });
     _detachTurn();
-    _reload();
+    // 回合结束：等历史重载完成后再清空流式段，避免与落定消息重复渲染。
+    _reload().then((_) {
+      if (!mounted) return;
+      setState(() {
+        _segments = [];
+        _currentTextSeg = null;
+        _textBaseOffset = 0;
+        _lastFullText = '';
+      });
+    });
   }
 
   /// 状态秒数（思考中 Ns / 执行中 Ns）随时间刷新。
@@ -1102,25 +1111,80 @@ class _ChatPageState extends State<ChatPage> {
       controller: _scroll,
       padding: const EdgeInsets.all(12),
       children: [
-        // F21 第①阶段·历史侧（task-80）：连续成功 tool 消息折成一条摘要，
-        // 否则回合结束 _reload() 后聚合就消失了。失败回注/搜索命中/普通消息
-        // 都会切断连续段并保持原样（见 tool_steps_group.dart 的纯分组函数）。
-        for (final item in groupToolMessages(
-          _messages,
-          protectedMessageIds: {
-            if (_searchHitMessageId != null) _searchHitMessageId!,
-          },
-        ))
-          ...switch (item) {
-            SingleMessage(:final message) =>
-              _buildMessageWrapped(message, cs),
-            FoldedToolMessages(:final messages) =>
-              _buildFoldedToolMessages(messages),
-          },
-        if (_busy || _segments.isNotEmpty) _buildStreaming(cs), // F28：输出结束后保留思考/工具入口
+        ..._buildHistoryItems(cs),
+        if (_busy || _segments.isNotEmpty) _buildStreaming(cs),
         if (_errorText != null) _buildError(cs),
       ],
     );
+  }
+
+  /// 历史消息按「回合」切开（用户消息开头），再逐回合渲染。
+  List<Widget> _buildHistoryItems(ColorScheme cs) {
+    final out = <Widget>[];
+    var turn = <ChatMessage>[];
+    void flush() {
+      if (turn.isEmpty) return;
+      out.addAll(_buildTurn(turn, cs));
+      turn = <ChatMessage>[];
+    }
+
+    for (final m in _messages) {
+      if (m.role == ChatRole.user && turn.isNotEmpty) flush();
+      turn.add(m);
+    }
+    flush();
+    return out;
+  }
+
+  /// 单回合渲染（F31 方案 B）：有工具回注 + 有正文时，
+  /// 工具收进正文【上方】的默认折叠「过程」行；否则维持逐条/连续折叠原样。
+  List<Widget> _buildTurn(List<ChatMessage> turn, ColorScheme cs) {
+    final tools = turn.where((m) => m.role == ChatRole.tool).toList();
+    final hasAnswer = turn.any(
+        (m) => m.role == ChatRole.assistant && m.content.trim().isNotEmpty);
+    final protectedHit = turn.any((m) => m.id == _searchHitMessageId);
+    final items = groupToolMessages(
+      turn,
+      protectedMessageIds: {
+        if (_searchHitMessageId != null) _searchHitMessageId!,
+      },
+    );
+    final asIs = <Widget>[
+      for (final item in items)
+        ...switch (item) {
+          SingleMessage(:final message) => _buildMessageWrapped(message, cs),
+          FoldedToolMessages(:final messages) =>
+            _buildFoldedToolMessages(messages),
+        },
+    ];
+    if (tools.isEmpty || !hasAnswer || protectedHit) return asIs;
+
+    final body = <Widget>[
+      for (final m in turn)
+        if (m.role != ChatRole.tool) ..._buildMessageWrapped(m, cs),
+    ];
+    return [
+      ProcessSection(
+        summary: _historyProcessSummary(tools),
+        children: [
+          for (final m in tools)
+            ToolCallBlock(
+              segment: _toolSegmentFor(m),
+              onToggle: () => _toggleToolExpanded(m.id),
+            ),
+        ],
+      ),
+      ...body,
+    ];
+  }
+
+  /// 历史回合的「过程」摘要（思考不落库，只统计工具步数与失败数）。
+  String _historyProcessSummary(List<ChatMessage> tools) {
+    final failed =
+        tools.where((m) => m.content.startsWith('一个动作未能理解')).length;
+    return failed > 0
+        ? '过程 · ${tools.length} 步工具（$failed 步失败）'
+        : '过程 · ${tools.length} 步工具';
   }
 
   /// 搜索命中的消息条：包一层高亮容器并挂定位 Key（§2.3）。
