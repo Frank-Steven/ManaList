@@ -111,6 +111,6 @@ void main() {
 
   testWidgets('无图片草稿时保持原文案', (tester) async {
     await tester.pumpWidget(harness(atts: const [noteAtt], onRemove: (_) {}));
-    expect(find.text('和助理说点什么，或输入 / 快捷指令…'), findsOneWidget);
+    expect(find.text('和助理说点什么…'), findsOneWidget);
   });
 }
