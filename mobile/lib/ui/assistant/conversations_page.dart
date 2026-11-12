@@ -9,6 +9,7 @@ import '../../services/assistant/assistant_client.dart';
 import '../../services/assistant/assistant_service.dart';
 import '../../services/database.dart';
 import 'approvals_page.dart';
+import 'demo/assistant_components_demo_page.dart';
 import 'chat_page.dart';
 import 'conversation_export.dart';
 import 'model_picker.dart';
@@ -422,6 +423,15 @@ class ConversationsPageState extends State<ConversationsPage> {
               icon: const Icon(Icons.model_training),
               onPressed: () => Navigator.of(context).push(
                 MaterialPageRoute(builder: (_) => const ModelPickerPage()),
+              ),
+            ),
+            // F31：组件展示页入口（debug/调试用）
+            IconButton(
+              tooltip: '组件展示',
+              icon: const Icon(Icons.widgets_outlined),
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                    builder: (_) => const AssistantComponentsDemoPage()),
               ),
             ),
           ],
