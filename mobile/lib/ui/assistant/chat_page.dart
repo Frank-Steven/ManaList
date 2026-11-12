@@ -1169,11 +1169,31 @@ class _ChatPageState extends State<ChatPage> {
         rest.addAll(_buildMessageWrapped(m, cs));
       }
     }
+    // F33：思考文本已落库 → 历史过程行里也能展开看思考。
+    final thinking = turn
+        .where((m) => m.role == ChatRole.assistant)
+        .map((m) => (m.thinking ?? '').trim())
+        .where((t) => t.isNotEmpty)
+        .join('\n\n');
+    final thinkSeg = thinking.isEmpty
+        ? null
+        : (ChatStreamSegment(
+            kind: ChatStreamSegmentKind.thinking,
+            startedAt: DateTime.fromMillisecondsSinceEpoch(turn.last.createdAt))
+          ..text = thinking
+          ..active = false
+          ..endedAt = DateTime.fromMillisecondsSinceEpoch(turn.last.createdAt));
     return [
       ...leading,
       ProcessSection(
-        summary: _historyProcessSummary(tools),
+        summary: _historyProcessSummary(tools, hasThinking: thinkSeg != null),
         children: [
+          if (thinkSeg != null)
+            ThinkingBlock(
+              segment: thinkSeg,
+              onToggle: () => setState(
+                  () => thinkSeg.expanded = !thinkSeg.expanded),
+            ),
           for (final m in tools)
             ToolCallBlock(
               segment: _toolSegmentFor(m),
@@ -1185,13 +1205,17 @@ class _ChatPageState extends State<ChatPage> {
     ];
   }
 
-  /// 历史回合的「过程」摘要（思考不落库，只统计工具步数与失败数）。
-  String _historyProcessSummary(List<ChatMessage> tools) {
+  /// 历史回合的「过程」摘要：思考（F33 落库后可读）+ 工具步数 + 失败数。
+  String _historyProcessSummary(List<ChatMessage> tools,
+      {bool hasThinking = false}) {
     final failed =
         tools.where((m) => m.content.startsWith('一个动作未能理解')).length;
-    return failed > 0
-        ? '过程 · ${tools.length} 步工具（$failed 步失败）'
-        : '过程 · ${tools.length} 步工具';
+    final parts = <String>[
+      if (hasThinking) '思考',
+      if (tools.isNotEmpty)
+        '${tools.length} 步工具${failed > 0 ? '（$failed 步失败）' : ''}',
+    ];
+    return parts.isEmpty ? '过程' : '过程 · ${parts.join(' · ')}';
   }
 
   /// 搜索命中的消息条：包一层高亮容器并挂定位 Key（§2.3）。
@@ -1248,15 +1272,24 @@ class _ChatPageState extends State<ChatPage> {
     }
     return CollapsibleContent(
       fadeSurface: cs.surface,
-      child: MarkdownBody(
-      data: m.content,
-      selectable: true,
-      softLineBreak: true,
-      // F21 第③阶段：fenced code 横向滚动 + 常驻复制按钮（普通 markdown 不动）。
-      builders: {
-        "pre": FencedCodeBuilder(cs),
-      },
-      styleSheet: MarkdownStyleSheet(
+      child: _markdownView(m.content, cs),
+    );
+  }
+
+  /// 统一的 Markdown 渲染（F34：历史与流式共用同一套样式）。
+  Widget _markdownView(String data, ColorScheme cs, {bool selectable = true}) =>
+      MarkdownBody(
+        data: data,
+        selectable: selectable,
+        softLineBreak: true,
+        // F21 第③阶段：fenced code 横向滚动 + 常驻复制按钮（普通 markdown 不动）。
+        builders: {
+          "pre": FencedCodeBuilder(cs),
+        },
+        styleSheet: _chatMarkdownSheet(cs),
+      );
+
+  MarkdownStyleSheet _chatMarkdownSheet(ColorScheme cs) => MarkdownStyleSheet(
         p: TextStyle(fontSize: 16, height: 1.6, color: cs.onSurface),
         h1: TextStyle(
             fontSize: 20, fontWeight: FontWeight.w700, color: cs.onSurface),
@@ -1285,12 +1318,7 @@ class _ChatPageState extends State<ChatPage> {
         horizontalRuleDecoration: BoxDecoration(
           border: Border(top: BorderSide(color: cs.outlineVariant)),
         ),
-      ),
-      ),
-      // F21 第③阶段：长报告默认限高 200dp + 底部渐变 + 「查看全文」；
-      // 只有真实越过 200dp 才出现按钮（见 CollapsibleContent 的溢出检测）。
-    );
-  }
+      );
 
   /// 历史 tool 消息 → 渲染段（回注结果作为 detail，不发裸 JSON）。
   ChatStreamSegment _toolSegmentFor(ChatMessage m) {
@@ -1414,11 +1442,19 @@ class _ChatPageState extends State<ChatPage> {
         ),
       ));
     }
-    // 提案卡片内联：挂在产出它们的 assistant 消息后面
+    // 提案卡片内联：挂在产出它们的 assistant 消息后面。
+    // F32：同批多条提案默认折叠成一行摘要（列表可长达十几条），点开才逐条看。
     final proposals = _proposalsByBatch[m.id];
-    if (proposals != null) {
-      for (final p in proposals) {
-        widgets.add(_buildProposalCard(p));
+    if (proposals != null && proposals.isNotEmpty) {
+      if (proposals.length == 1) {
+        widgets.add(_buildProposalCard(proposals.first));
+      } else {
+        final tools = proposals.map((p) => p.tool).toSet().toList();
+        final label = tools.length == 1 ? tools.first : '${tools.length} 类操作';
+        widgets.add(ProcessSection(
+          summary: '待确认提案 · ${proposals.length} 条（$label）',
+          children: [for (final p in proposals) _buildProposalCard(p)],
+        ));
       }
     }
     return widgets;
@@ -1465,11 +1501,11 @@ class _ChatPageState extends State<ChatPage> {
                 setState(() => step.expanded = !step.expanded),
           ),
         SingleSegment(:final segment) => switch (segment.kind) {
-            ChatStreamSegmentKind.text => FadeInStreamingText(
-              text: segment.text,
-              settled: !segment.active,
-              // 光标动效已收敛到主进行态条，这里不再画。
-              showCursor: false,
+            // F34：生成中的正文也走 Markdown 渲染（原先纯文本，会出现裸 ** 星号）。
+            ChatStreamSegmentKind.text => _markdownView(
+              segment.text,
+              cs,
+              selectable: false,
             ),
             ChatStreamSegmentKind.thinking => ThinkingBlock(
               segment: segment,

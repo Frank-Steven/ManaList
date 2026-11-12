@@ -128,6 +128,9 @@ class ChatMessage {
 
   /// ChatMessageStatus.streaming / done / error。
   final String status;
+
+  /// 助手思考文本（DB v13，F33）：落库后历史回合的「过程」行仍能展开看思考。
+  final String? thinking;
   final int createdAt;
 
   const ChatMessage({
@@ -137,6 +140,7 @@ class ChatMessage {
     required this.content,
     this.attachments = const [],
     this.status = ChatMessageStatus.done,
+    this.thinking,
     required this.createdAt,
   });
 
@@ -151,6 +155,7 @@ class ChatMessage {
                 .map((e) => ChatAttachment.fromJson(e as Map<String, dynamic>))
                 .toList(),
         status: row['status'] as String,
+        thinking: row['thinking'] as String?,
         createdAt: (row['created_at'] as num).toInt(),
       );
 
@@ -162,6 +167,7 @@ class ChatMessage {
         'attachments':
             jsonEncode(attachments.map((e) => e.toJson()).toList()),
         'status': status,
+        'thinking': thinking,
         'created_at': createdAt,
       };
 
@@ -172,6 +178,7 @@ class ChatMessage {
     String? content,
     List<ChatAttachment>? attachments,
     String? status,
+    String? thinking,
     int? createdAt,
   }) =>
       ChatMessage(
@@ -181,6 +188,7 @@ class ChatMessage {
         content: content ?? this.content,
         attachments: attachments ?? this.attachments,
         status: status ?? this.status,
+        thinking: thinking ?? this.thinking,
         createdAt: createdAt ?? this.createdAt,
       );
 }

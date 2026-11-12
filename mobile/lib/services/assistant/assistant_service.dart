@@ -505,6 +505,8 @@ class AssistantService {
     // 4. 出错 / 中断早退；**审批通过后的续跑属 Q13，本轮不做**。
     const maxToolContinuations = 2;
     var continuationRound = 0;
+    // F33：本轮各段思考文本（section → 文本），回合收尾落库到 assistant 消息。
+    final thinkingBySection = <int, String>{};
 
     while (true) {
       final isContinuation = continuationRound > 0;
@@ -597,6 +599,8 @@ class AssistantService {
             // 先剥思考块（<think> 标签），剩余文本再过工具块解析
             final thinkRes = thinkParser.feed(ev.delta);
             if (thinkRes.thinkingChanged || thinkRes.stateChanged) {
+              thinkingBySection[thinkParser.sectionIndex] =
+                  thinkParser.sectionThinking;
               handle._emit(AssistantThinkingDelta(thinkParser.sectionIndex,
                   thinkParser.sectionThinking, thinkParser.inThinking));
             }
@@ -635,6 +639,8 @@ class AssistantService {
     // 未闭合工具块整体丢弃（details §2.2），尾行文本仍上屏
     final thinkTail = thinkParser.finish();
     if (thinkTail.thinkingChanged || thinkTail.stateChanged) {
+      thinkingBySection[thinkParser.sectionIndex] =
+          thinkParser.sectionThinking;
       handle._emit(AssistantThinkingDelta(
           thinkParser.sectionIndex, thinkParser.sectionThinking, false));
     }
@@ -672,6 +678,15 @@ class AssistantService {
       // 续跑沿用**同一个** handle 与 assistantMsg：阶段拨回「思考中」，
       // 界面继续显示同一个进行态；不新增事件类型（避免 UI 改动）。
       handle.phase.value = TurnPhase.thinking;
+    }
+
+    // F33：思考文本落库（空则不写，保持 NULL）；历史「过程」行据此渲染思考块。
+    final thinkingText = thinkingBySection.values
+        .where((t) => t.trim().isNotEmpty)
+        .join('\n\n')
+        .trim();
+    if (thinkingText.isNotEmpty) {
+      await db.updateChatMessageThinking(assistantMsg.id, thinkingText);
     }
 
     if (errorText != null) {

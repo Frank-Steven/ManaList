@@ -116,6 +116,7 @@ Future<void> createV8Tables(DatabaseExecutor db) async {
       content TEXT NOT NULL,
       attachments TEXT,
       status TEXT NOT NULL,
+      thinking TEXT,
       created_at INTEGER NOT NULL
     )
   ''');
@@ -253,6 +254,15 @@ Future<void> migrateToV11(DatabaseExecutor db) async {
   if (!cols.any((c) => c['name'] == 'pinned')) {
     await db.execute(
         'ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
+  }
+}
+
+/// v13（F33）：chat_messages.thinking —— 助手思考文本落库。
+/// PRAGMA 守卫保证幂等（onCreate 的新表已带该列时跳过）。
+Future<void> migrateToV13(DatabaseExecutor db) async {
+  final cols = await db.rawQuery('PRAGMA table_info(chat_messages)');
+  if (!cols.any((c) => c['name'] == 'thinking')) {
+    await db.execute('ALTER TABLE chat_messages ADD COLUMN thinking TEXT');
   }
 }
 
@@ -596,7 +606,7 @@ class AppDatabase {
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'msgrepo.db'),
-      version: 12,
+      version: 13,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -647,6 +657,10 @@ class AppDatabase {
     if (oldVersion < 12) {
       // v12：op_log（crdt.md §7）+ 行内 marker → 对象级锚点迁移（anchors-v2 §6）。
       await migrateToV12(db);
+    }
+    if (oldVersion < 13) {
+      // v13（F33）：chat_messages.thinking —— 回合落定后过程行仍能展开看思考。
+      await migrateToV13(db);
     }
   }
 
@@ -2096,6 +2110,13 @@ class AppDatabase {
   Future<void> updateChatMessageContent(String id, String content) async {
     final db = await database;
     await db.update('chat_messages', {'content': content},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// F33：把本轮思考文本写进 assistant 消息（空串不写，保持 NULL）。
+  Future<void> updateChatMessageThinking(String id, String thinking) async {
+    final db = await database;
+    await db.update('chat_messages', {'thinking': thinking},
         where: 'id = ?', whereArgs: [id]);
   }
 
