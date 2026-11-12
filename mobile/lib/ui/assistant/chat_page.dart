@@ -1157,7 +1157,15 @@ class _ChatPageState extends State<ChatPage> {
             _buildFoldedToolMessages(messages),
         },
     ];
-    if (tools.isEmpty || !hasAnswer || protectedHit) return asIs;
+    // F33：只有思考、没有工具调用时也要有过程行（否则思考内容无处可看）。
+    final thinking = turn
+        .where((m) => m.role == ChatRole.assistant)
+        .map((m) => (m.thinking ?? '').trim())
+        .where((t) => t.isNotEmpty)
+        .join('\n\n');
+    if ((tools.isEmpty && thinking.isEmpty) || !hasAnswer || protectedHit) {
+      return asIs;
+    }
 
     // 顺序：用户气泡 → 过程折叠行 → 助理正文（过程不能跑到用户气泡上方）。
     final leading = <Widget>[];
@@ -1170,11 +1178,6 @@ class _ChatPageState extends State<ChatPage> {
       }
     }
     // F33：思考文本已落库 → 历史过程行里也能展开看思考。
-    final thinking = turn
-        .where((m) => m.role == ChatRole.assistant)
-        .map((m) => (m.thinking ?? '').trim())
-        .where((t) => t.isNotEmpty)
-        .join('\n\n');
     final thinkSeg = thinking.isEmpty
         ? null
         : (ChatStreamSegment(
@@ -1444,8 +1447,12 @@ class _ChatPageState extends State<ChatPage> {
     }
     // 提案卡片内联：挂在产出它们的 assistant 消息后面。
     // F32：同批多条提案默认折叠成一行摘要（列表可长达十几条），点开才逐条看。
-    final proposals = _proposalsByBatch[m.id];
-    if (proposals != null && proposals.isNotEmpty) {
+    // F32 修正：只把 pending 当「待确认提案」；已应用/已拒绝的批次不再内联成卡片，
+    // 否则会出现「库内 pending=0、界面却写 16 条待确认」的口径错乱。
+    final proposals = (_proposalsByBatch[m.id] ?? const <ChangeProposal>[])
+        .where((p) => p.status == ProposalStatus.pending)
+        .toList();
+    if (proposals.isNotEmpty) {
       if (proposals.length == 1) {
         widgets.add(_buildProposalCard(proposals.first));
       } else {
