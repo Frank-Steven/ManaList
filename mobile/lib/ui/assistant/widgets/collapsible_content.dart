@@ -173,23 +173,30 @@ class _CollapsibleLinesState extends State<CollapsibleLines> {
               : TextOverflow.ellipsis,
         );
         if (!overflows) return body;
+        // F31：展开/收起按钮留在气泡内，小字 + 下划线，不占一整个 44dp 触控块。
+        final tint = (widget.style?.color ?? Colors.white);
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
             body,
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton(
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: InkWell(
                 key: const ValueKey("pill-toggle"),
-                style: TextButton.styleFrom(
-                  minimumSize: const Size(44, 44),
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                ),
-                onPressed: () => setState(() => _expanded = !_expanded),
-                child: Text(
-                  _expanded ? widget.expandedLabel : widget.collapsedLabel,
-                  style: const TextStyle(fontSize: 12),
+                onTap: () => setState(() => _expanded = !_expanded),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 1),
+                  child: Text(
+                    _expanded ? widget.expandedLabel : widget.collapsedLabel,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      color: tint.withValues(alpha: 0.92),
+                      decoration: TextDecoration.underline,
+                      decorationColor: tint.withValues(alpha: 0.5),
+                      height: 1.3,
+                    ),
+                  ),
                 ),
               ),
             ),

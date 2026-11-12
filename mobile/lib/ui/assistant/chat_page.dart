@@ -1369,7 +1369,8 @@ class _ChatPageState extends State<ChatPage> {
     // F21 第①阶段：同一阶段连续的成功工具回注合成一条「完成 N 步 · 全部成功」；
     // 待确认（含破坏性审批）/ 失败 / 执行中一律独立、永不折叠（见 tool_steps_group.dart）。
     final items = groupStreamSegments(_segments);
-    // F31：回合已结束且已输出正文时，思考/工具保留但收进默认折叠的「过程」。
+    // F31（方案 B）：回合已结束且已输出正文时，思考/工具保留在正文【上方】，
+    // 收进一条默认折叠的「过程」行；点开可看完整思考与工具步骤。
     final finished = !_busy;
     final hasText = _segments.any((s) =>
         s.kind == ChatStreamSegmentKind.text && s.text.trim().isNotEmpty);
@@ -1412,10 +1413,14 @@ class _ChatPageState extends State<ChatPage> {
       }
     }
     if (process.isNotEmpty) {
-      content.add(ProcessSection(
-        summary: _processSummaryText(),
-        children: process,
-      ));
+      // 方案 B：过程在正文上方。
+      content.insert(
+        0,
+        ProcessSection(
+          summary: _processSummaryText(),
+          children: process,
+        ),
+      );
     }
 
     return Padding(
