@@ -149,6 +149,10 @@ class AssistantTurnHandle {
   /// 本回合的独立通道（取消时中断其 SSE）。
   late final AssistantClient channel;
 
+  /// F40：本回合最后一次**上游真实** token 用量（没有则 null → 上层回退估算）。
+  /// 本轮不落库，仅页面展示用。
+  ChatUsage? lastUsage;
+
   bool _closed = false;
 
   /// 用户主动取消了本回合（B19：续跑前必须检查——否则点了「停止」
@@ -668,6 +672,9 @@ class AssistantService {
           case ChatProposalEvent():
             // desktop 不透传 proposal 事件（提案由手机端落库）；忽略。
             break;
+          case ChatUsage():
+            // F40：真实 usage 只记录（末帧覆盖），不影响正文/工具解析。
+            handle.lastUsage = ev;
           case ChatDone():
             break;
           case ChatError():

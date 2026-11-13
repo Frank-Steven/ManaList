@@ -1,5 +1,7 @@
 import "package:flutter/material.dart";
 
+import "../../../services/assistant/models.dart";
+import "../../../services/context_window.dart";
 import "context_meter.dart";
 
 /// F36 方案A（2026-11-13）：输入区上方的「模型胶囊 + 思考强度胶囊 + 上下文圆环」行，
@@ -60,40 +62,22 @@ int estimateContextTokens({
 String contextEstimateText(int usedTokens, int limitTokens) =>
     "约 ${contextPercent(usedTokens, limitTokens)}%（字符估算）";
 
-/// 上下文用量说明（底部 sheet）：明确这是估算口径。
+/// 上下文用量说明（底部 sheet）。
+///
+/// F40：统一委托给 [showContextMeterSheet]——有真实 usage 时显示真实口径，
+/// 没有时保持「字符估算」口径（不伪装成真实值）。
 Future<void> showContextEstimateSheet(
   BuildContext context, {
   required int usedTokens,
   required int limitTokens,
-}) {
-  return showModalBottomSheet<void>(
-    context: context,
-    showDragHandle: true,
-    builder: (sheetContext) {
-      final cs = Theme.of(sheetContext).colorScheme;
-      return SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 0, 20, 18),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text("上下文已用 ${contextEstimateText(usedTokens, limitTokens)}",
-                  style: Theme.of(sheetContext).textTheme.titleMedium),
-              const SizedBox(height: 10),
-              Text(
-                "口径：历史消息字数 ÷ 4 + 草稿附件估算（按 32k 上下文计）。"
-                "这是**近似值**，不是模型侧的真实 token 用量。",
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-              ),
-            ],
-          ),
-        ),
-      );
-    },
-  );
-}
+  ChatUsage? usage,
+  ContextWindowInfo? window,
+}) =>
+    showContextMeterSheet(context,
+        usedTokens: usedTokens,
+        limitTokens: limitTokens,
+        usage: usage,
+        window: window);
 
 /// 输入区上方的一行：模型胶囊（最左）+ 思考强度胶囊 + 右侧上下文圆环。
 class ReasoningPillRow extends StatelessWidget {
@@ -107,6 +91,8 @@ class ReasoningPillRow extends StatelessWidget {
     required this.onReasoningTap,
     required this.usedTokens,
     required this.limitTokens,
+    this.usage,
+    this.window,
   });
 
   final String modelLabel;
@@ -122,6 +108,12 @@ class ReasoningPillRow extends StatelessWidget {
 
   final int usedTokens;
   final int limitTokens;
+
+  /// F40：本会话最近一次上游真实 usage（null → 圆环与 sheet 都用估算口径）。
+  final ChatUsage? usage;
+
+  /// F41：解析出来的上下文窗口（含来源），直接决定圆环分母与文案。
+  final ContextWindowInfo? window;
 
   @override
   Widget build(BuildContext context) {
@@ -182,10 +174,14 @@ class ReasoningPillRow extends StatelessWidget {
           ContextMeter(
             usedTokens: usedTokens,
             limitTokens: limitTokens,
+            usage: usage,
+            window: window,
             onTap: () => showContextEstimateSheet(
               context,
               usedTokens: usedTokens,
               limitTokens: limitTokens,
+              usage: usage,
+              window: window,
             ),
           ),
         ],

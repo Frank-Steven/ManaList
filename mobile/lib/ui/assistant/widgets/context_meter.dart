@@ -2,6 +2,9 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../../../services/assistant/models.dart';
+import '../../../services/context_window.dart';
+
 /// 上下文上限的**现值**：ManaList 没有 per-model `contextWindow`，
 /// 全 App 沿用 32,768（assistant-v4-ui §3.6 的 kDefaultContextTokenLimit）。
 /// 因此圆环百分比只是「按 32k 估算」，不是模型真实窗口。
@@ -37,10 +40,10 @@ String formatTokenCount(int tokens) {
 /// 点击展开面板。
 ///
 /// ⚠️ 与 DSH 的**刻意差异**（不照抄，因为数据不成立）：
-/// - DSH 面板分「系统提示词 / 工具定义 / 对话消息」三类；本 App 只真实拥有
-///   「**附件（估算）**」一项（正文字符估算）。工具定义已并入
-///   `buildToolSpecPrompt` 的请求前言、系统提示词与对话历史都没有单独计量，
-///   照抄三类会**重复计或编造** —— 因此面板只显示这一行；
+/// - DSH 面板分「系统提示词 / 工具定义 / 对话消息」三类；本 App 的估算口径是
+///   「**历史正文（字符数 ÷ 4）+ 草稿附件估算**」，面板只显示这一项合成值
+///   （F42 已把条目名与说明改成如实描述）。工具定义已并入 `buildToolSpecPrompt`
+///   的请求前言、系统提示词也没有单独计量，照抄三类会**重复计或编造**；
 /// - 上限是 `kAssumedContextWindow = 32768`（App 现值，非模型窗口），所以
 ///   百分比与文案都明确写「按 32k 估算」。
 ///
@@ -52,11 +55,22 @@ class ContextMeter extends StatelessWidget {
     required this.usedTokens,
     this.limitTokens = kAssumedContextWindow,
     this.onTap,
+    this.usage,
+    this.window,
   });
 
-  /// 附件估算 tokens（真实数据；0 = 无附件）。
+  /// 用于计算百分比的 token 数：有真实 usage 时是 promptTokens，否则是估算值。
   final int usedTokens;
   final int limitTokens;
+
+  /// F40：上游真实 usage（null = 本会话还没拿到，按字符估算并如实标注）。
+  final ChatUsage? usage;
+
+  /// F41：解析出来的上下文窗口（含来源）；null = 老调用按 [limitTokens] 处理。
+  final ContextWindowInfo? window;
+
+  /// 实际参与百分比计算的上限：优先 window.tokens。
+  int get effectiveLimitTokens => window?.tokens ?? limitTokens;
 
   /// 测试注入；默认打开底部 sheet。
   final VoidCallback? onTap;
@@ -71,11 +85,12 @@ class ContextMeter extends StatelessWidget {
   /// （旧值 48 曾让圆环行比其他胶囊高一截、并被压在行右边缘。）
   static const double hitSize = 36;
 
-  int get percent => contextPercent(usedTokens, limitTokens);
+  int get percent => contextPercent(usedTokens, effectiveLimitTokens);
 
   Color _arcColor(ColorScheme cs) {
-    if (limitTokens > 0 && usedTokens > limitTokens) return cs.error;
-    if (limitTokens > 0 && usedTokens > limitTokens * 0.8) {
+    final limit = effectiveLimitTokens;
+    if (limit > 0 && usedTokens > limit) return cs.error;
+    if (limit > 0 && usedTokens > limit * 0.8) {
       return Colors.amber.shade800;
     }
     return cs.primary;
@@ -85,8 +100,9 @@ class ContextMeter extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final color = _arcColor(cs);
-    final ratio = limitTokens > 0
-        ? (usedTokens / limitTokens).clamp(0.0, 1.0).toDouble()
+    final limit = effectiveLimitTokens;
+    final ratio = limit > 0
+        ? (usedTokens / limit).clamp(0.0, 1.0).toDouble()
         : 0.0;
 
     final pill = Container(
@@ -130,7 +146,14 @@ class ContextMeter extends StatelessWidget {
     );
 
     return Semantics(
-      label: '约 $percent%（字符估算）',
+      // F40/F41：真实 usage 与字符估算必须在无障碍层也能区分；
+      // 同时带上上下文上限来源（模型表 / 端点 / 手动 / 估算）。
+      label: [
+        usage != null
+            ? '上下文已用 $percent%（上次请求真实输入）'
+            : '约 $percent%（字符估算）',
+        if (window != null) window!.label,
+      ].join('；'),
       button: true,
       child: InkResponse(
         onTap: onTap ??
@@ -138,6 +161,8 @@ class ContextMeter extends StatelessWidget {
                   context,
                   usedTokens: usedTokens,
                   limitTokens: limitTokens,
+                  usage: usage,
+                  window: window,
                 ),
         radius: hitSize / 2,
         // F38 口径：命中高下限 36（= pill 32 + 行上下各 2），**不再为 48dp 撑高整行**；
@@ -159,11 +184,17 @@ class ContextMeter extends StatelessWidget {
   }
 }
 
-/// 展开面板（底部 sheet）：**只展示真实可得的「附件（估算）」一行**。
+/// 展开面板（底部 sheet）。
+///
+/// - [usage] != null：显示**上游真实口径**（prompt/completion/total，含缓存命中），
+///   明确写「真实」并注明上限仍按 32k 估算；
+/// - [usage] == null：字符估算口径（历史正文 ÷ 4 + 草稿附件），不伪装成真实值。
 Future<void> showContextMeterSheet(
   BuildContext context, {
   required int usedTokens,
   int limitTokens = kAssumedContextWindow,
+  ChatUsage? usage,
+  ContextWindowInfo? window,
 }) {
   return showModalBottomSheet<void>(
     context: context,
@@ -171,8 +202,9 @@ Future<void> showContextMeterSheet(
     builder: (sheetContext) {
       final cs = Theme.of(sheetContext).colorScheme;
       final theme = Theme.of(sheetContext).textTheme;
-      final percent = contextPercent(usedTokens, limitTokens);
-      final hasLimit = limitTokens > 0;
+      final limit = window?.tokens ?? limitTokens;
+      final percent = contextPercent(usedTokens, limit);
+      final hasLimit = limit > 0;
       return SafeArea(
         top: false,
         child: Padding(
@@ -185,47 +217,103 @@ Future<void> showContextMeterSheet(
                   style: theme.titleMedium
                       ?.copyWith(fontWeight: FontWeight.w600)),
               const SizedBox(height: 12),
-              Row(
-                children: [
-                  Container(
-                    width: 10,
-                    height: 10,
-                    decoration: BoxDecoration(
-                      color: cs.primary,
-                      borderRadius: BorderRadius.circular(3),
+              if (usage != null) ...[
+                _usageRow(sheetContext, cs,
+                    label: '真实输入（含系统提示词与历史）',
+                    tokens: usage.promptTokens),
+                const SizedBox(height: 6),
+                _usageRow(sheetContext, cs,
+                    label: '输出', tokens: usage.completionTokens),
+                const SizedBox(height: 6),
+                _usageRow(sheetContext, cs,
+                    label: '合计', tokens: usage.totalTokens),
+                const SizedBox(height: 10),
+                Text(
+                  '上次请求真实输入 ${usage.promptTokens} tokens（含系统提示词与历史）'
+                  ' · 输出 ${usage.completionTokens} · 合计 ${usage.totalTokens}'
+                  '${usage.cachedPromptTokens != null ? ' · 其中缓存命中 ${usage.cachedPromptTokens} tokens' : ''}'
+                  '\n${window != null ? window.label : '上限仍按 32k 估算（上游未提供模型窗口）。'}',
+                  style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
+                ),
+                const SizedBox(height: 12),
+              ],
+              if (usage == null) ...[
+                Row(
+                  children: [
+                    Container(
+                      width: 10,
+                      height: 10,
+                      decoration: BoxDecoration(
+                        color: cs.primary,
+                        borderRadius: BorderRadius.circular(3),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text('附件（估算）',
-                        style: TextStyle(fontSize: 13, color: cs.onSurface)),
-                  ),
-                  Text(
-                    formatTokenCount(usedTokens),
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: cs.onSurfaceVariant,
-                      fontFeatures: const [FontFeature.tabularFigures()],
+                    const SizedBox(width: 8),
+                    Expanded(
+                      // F42：这个数字是「历史正文 + 草稿附件」，条目名不能再只写附件。
+                      child: Text('字符估算（历史+附件）',
+                          style: TextStyle(fontSize: 13, color: cs.onSurface)),
                     ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Text(
-                hasLimit
-                    ? '按 32k 估算（$limitTokens tokens）。'
-                        '本次仅统计草稿附件估算；'
-                        '系统说明（含工具定义）与对话历史未计入。'
-                    : '上限未知（模型未配置），分母按 32k 估算、百分比按 0 处理。'
-                        '本次仅统计草稿附件估算；'
-                        '系统说明（含工具定义）与对话历史未计入。',
-                style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
-              ),
+                    Text(
+                      formatTokenCount(usedTokens),
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: cs.onSurfaceVariant,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  // F42：如实描述口径——历史已计入（历史正文 ÷ 4 + 草稿附件估算），
+                  // 只有「系统说明 + 工具定义（请求前言）」没有计入。
+                  // F41：上限与来源按解析结果写；window==null 的老调用保留 32k 说明。
+                  '${window != null ? window.label : (hasLimit ? '按 32k 估算（$limitTokens tokens）' : '上限未知（模型未配置），分母按 32k 估算、百分比按 0 处理')}。'
+                  '口径：历史正文（消息内容字符数 ÷ 4）+ 草稿附件估算。'
+                  '系统说明与工具定义（请求前言）未计入。',
+                  style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
+                ),
+              ],
             ],
           ),
         ),
       );
     },
+  );
+}
+
+/// 真实 usage 的一行：色块 + 标签 + 数字（tabular）。
+Widget _usageRow(
+  BuildContext context,
+  ColorScheme cs, {
+  required String label,
+  required int tokens,
+}) {
+  return Row(
+    children: [
+      Container(
+        width: 10,
+        height: 10,
+        decoration: BoxDecoration(
+          color: cs.primary,
+          borderRadius: BorderRadius.circular(3),
+        ),
+      ),
+      const SizedBox(width: 8),
+      Expanded(
+        child: Text(label,
+            style: TextStyle(fontSize: 13, color: cs.onSurface)),
+      ),
+      Text(
+        formatTokenCount(tokens),
+        style: TextStyle(
+          fontSize: 12.5,
+          color: cs.onSurfaceVariant,
+          fontFeatures: const [FontFeature.tabularFigures()],
+        ),
+      ),
+    ],
   );
 }
 

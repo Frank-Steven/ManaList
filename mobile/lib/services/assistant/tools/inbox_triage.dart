@@ -533,6 +533,8 @@ class InboxTriage {
           throw AiException(error);
         case ChatReasoningDelta():
           break; // 子调用只要最终判定文本，推理内容丢弃
+        case ChatUsage():
+          break; // F40：子调用不需要真实 usage
         case ChatDone():
         case ChatProposalEvent():
           break; // 子调用不产工具块；桌面端也不透传 proposal 事件

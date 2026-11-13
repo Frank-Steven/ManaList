@@ -70,6 +70,10 @@ class AiEndpoint {
   /// 最近一次测试成功的往返延迟（毫秒）；失败或从未测试时为 null。
   final int? lastLatencyMs;
 
+  /// F41：用户在端点上手动填的上下文窗口（tokens）；null = 未配置。
+  /// 本轮不提供向导 UI，只在解析层参与优先级（configured 最高）。
+  final int? contextWindow;
+
   static const reasoningOff = 'off';
   static const reasoningLevels = <String>['off', 'low', 'medium', 'high'];
 
@@ -82,6 +86,7 @@ class AiEndpoint {
     this.isDesktop = false,
     this.vision,
     this.reasoning,
+    this.contextWindow,
     this.lastError,
     this.lastLatencyMs,
   });
@@ -106,6 +111,7 @@ class AiEndpoint {
       model: json['model'] as String? ?? '',
       vision: vision,
       reasoning: json['reasoning'] as String?,
+      contextWindow: (json['contextWindow'] as num?)?.toInt(),
       lastError: json['lastError'] as String?,
       lastLatencyMs: json['lastLatencyMs'] as int?,
     );
@@ -122,6 +128,7 @@ class AiEndpoint {
         if (vision != null) 'vision': vision,
         if (vision != null) 'visionExplicit': true,
         if (reasoning != null) 'reasoning': reasoning,
+        if (contextWindow != null) 'contextWindow': contextWindow,
         if (lastError != null) 'lastError': lastError,
         if (lastLatencyMs != null) 'lastLatencyMs': lastLatencyMs,
       };
@@ -135,6 +142,7 @@ class AiEndpoint {
     String? model,
     bool? Function()? vision,
     String? Function()? reasoning,
+    int? Function()? contextWindow,
     String? Function()? lastError,
     int? Function()? lastLatencyMs,
   }) =>
@@ -147,6 +155,8 @@ class AiEndpoint {
         isDesktop: isDesktop,
         vision: vision != null ? vision() : this.vision,
         reasoning: reasoning != null ? reasoning() : this.reasoning,
+        contextWindow:
+            contextWindow != null ? contextWindow() : this.contextWindow,
         lastError: lastError != null ? lastError() : this.lastError,
         lastLatencyMs:
             lastLatencyMs != null ? lastLatencyMs() : this.lastLatencyMs,

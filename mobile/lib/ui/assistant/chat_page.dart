@@ -15,6 +15,7 @@ import '../../services/ai_client.dart';
 import '../../services/assistant/assistant_client.dart';
 import '../../services/database.dart';
 import '../../services/library_file_service.dart';
+import '../../services/context_window.dart';
 import '../../services/model_capabilities.dart';
 import '../library/files_page.dart' show libraryFileIcon;
 import 'approvals_page.dart';
@@ -152,6 +153,15 @@ class _ChatPageState extends State<ChatPage> {
   /// 端点自身配置的推理档位（null = 未配置/自动）。
   String? _endpointReasoning;
 
+  /// F41：端点手动配置的上下文窗口（tokens；null = 未配置）。
+  int? _endpointContextWindow;
+
+  /// F41：解析出的上下文窗口（上限 + 来源），圆环与面板都用它。
+  ContextWindowInfo get _contextWindow => resolveContextWindow(
+        model: _capabilityModel ?? '',
+        configured: _endpointContextWindow,
+      );
+
   /// 本对话的临时覆盖：null = 跟随端点默认；用户只改这里，不写回端点。
   String? _reasoningOverride;
 
@@ -183,6 +193,21 @@ class _ChatPageState extends State<ChatPage> {
 
   String? get _effectiveReasoning =>
       _reasoningOverride ?? _endpointReasoning;
+
+  /// F40：本会话最近一次**上游真实** usage（null = 还没有 → 圆环用估算）。
+  /// 不落库：重新进入对话页时从 null 开始，按估算显示（如实标注口径）。
+  ChatUsage? _realUsage;
+
+  /// F40：圆环实际使用的 token 数——真实 promptTokens 优先，否则回退估算。
+  /// 上游偶发回全 0（例如某些代理不填 usage），此时按估算显示，避免误报 0%。
+  int get _contextUsedTokens {
+    final real = _realUsage?.promptTokens ?? 0;
+    return real > 0 ? real : _approxContextTokens;
+  }
+
+  /// 传给圆环/sheet 的真实 usage（全 0 时按没有处理，口径与估算保持一致）。
+  ChatUsage? get _usageForDisplay =>
+      (_realUsage?.promptTokens ?? 0) > 0 ? _realUsage : null;
 
   /// 上下文圆环的**近似**用量：历史字符 / 4 + 草稿附件 token 估算。
   int get _approxContextTokens {
@@ -307,12 +332,14 @@ class _ChatPageState extends State<ChatPage> {
     final id = _conversation.modelConfigId;
     String? capModel;
     String? capReasoning;
+    int? capContextWindow;
     if (id == null || id.isEmpty) {
       // 默认模型：取默认远程端点（可能没有 → 能力判定按未知处理）。
       try {
         final ep = await AiClient.instance.defaultRemoteEndpoint();
         capModel = ep?.model;
         capReasoning = ep?.reasoning;
+        capContextWindow = ep?.contextWindow;
       } catch (e, st) {
         AppLog.instance.warn('chat.default-model', e, st);
       }
@@ -321,6 +348,7 @@ class _ChatPageState extends State<ChatPage> {
         _modelDisplayName = '默认模型';
         _capabilityModel = capModel;
         _endpointReasoning = capReasoning;
+        _endpointContextWindow = capContextWindow;
       });
       return;
     }
@@ -331,6 +359,7 @@ class _ChatPageState extends State<ChatPage> {
           name = e.name;
           capModel = e.model;
           capReasoning = e.reasoning;
+          capContextWindow = e.contextWindow;
           break;
         }
       }
@@ -355,6 +384,7 @@ class _ChatPageState extends State<ChatPage> {
           (trimmed != null && trimmed.isNotEmpty) ? trimmed : '模型配置已失效';
       _capabilityModel = capModel ?? id;
       _endpointReasoning = capReasoning;
+      _endpointContextWindow = capContextWindow;
     });
   }
 
@@ -639,6 +669,8 @@ class _ChatPageState extends State<ChatPage> {
     if (confirm != true || !mounted) return;
     await AppDatabase.instance.deleteChatMessages(
         _messages.map((m) => m.id).toList());
+    // F40：清空对话后旧的真实 usage 已无意义，回到估算口径。
+    _realUsage = null;
     await _reload();
   }
 
@@ -748,6 +780,9 @@ class _ChatPageState extends State<ChatPage> {
 
   /// 回合结束（done/error）：段落全部落定，退订并重载。
   void _finishTurn() {
+    // F40：usage 帧在 done 之前到达，这里取回本回合最后一次真实用量。
+    final usage = _turn?.lastUsage;
+    if (usage != null) _realUsage = usage;
     setState(() {
       for (final s in _segments) {
         s.settle();
@@ -1148,8 +1183,12 @@ class _ChatPageState extends State<ChatPage> {
             reasoningActive: _effectiveReasoning != null,
             showReasoning: _reasoningSupported,
             onReasoningTap: _openReasoningPanel,
-            usedTokens: _approxContextTokens,
-            limitTokens: kDefaultContextTokenLimit,
+            // F40：有真实 usage 时圆环直接用 promptTokens，否则回退字符估算。
+            usedTokens: _contextUsedTokens,
+            // F41：上限来自解析层（手动配置 > 端点上报 > 模型表 > 32k 兜底）。
+            limitTokens: _contextWindow.tokens,
+            window: _contextWindow,
+            usage: _usageForDisplay,
           ),
           // F03 Step2（2026-11-03）：草稿含图片时显示「单张成条 + 敏感信息离设备」提示。
           if (_hasScreenshotAttachments) _buildScreenshotsHint(cs),

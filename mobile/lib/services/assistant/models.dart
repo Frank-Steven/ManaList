@@ -197,6 +197,13 @@ sealed class ChatEvent {
         return ChatTokenDelta(json['delta'] as String);
       case 'reasoning_delta':
         return ChatReasoningDelta(json['delta'] as String);
+      case 'usage':
+        return ChatUsage(
+          promptTokens: _asInt(json['promptTokens']),
+          completionTokens: _asInt(json['completionTokens']),
+          totalTokens: _asInt(json['totalTokens']),
+          cachedPromptTokens: _asIntOrNull(json['cachedPromptTokens']),
+        );
       case 'proposal':
         return ChatProposalEvent(
           proposalId: json['proposalId'] as String,
@@ -236,6 +243,58 @@ class ChatReasoningDelta extends ChatEvent {
   @override
   Map<String, dynamic> toJson() => {'type': 'reasoning_delta', 'delta': delta};
 }
+
+/// 上游真实 token 用量（F40，2026-11-13）。
+///
+/// 两种来源统一成同一事件：
+/// - desktop `/v1/chat` 的 `{"type":"usage", ...}` 帧；
+/// - remote（OpenAI 兼容）SSE 末帧的 `usage` 对象（需请求体带
+///   `stream_options: {include_usage: true}`）。
+/// 缺字段一律按 0 处理，不抛异常（上游实现参差）。
+class ChatUsage extends ChatEvent {
+  final int promptTokens;
+  final int completionTokens;
+  final int totalTokens;
+
+  /// 缓存命中的 prompt token（部分上游提供）。
+  final int? cachedPromptTokens;
+
+  const ChatUsage({
+    required this.promptTokens,
+    required this.completionTokens,
+    required this.totalTokens,
+    this.cachedPromptTokens,
+  });
+
+  /// OpenAI 兼容通道的 `usage` 对象 → 统一事件（字段缺失按 0）。
+  factory ChatUsage.fromOpenAi(Map<dynamic, dynamic> usage) {
+    final details = usage['prompt_tokens_details'];
+    final cached = details is Map
+        ? _asIntOrNull(details['cached_tokens'])
+        : _asIntOrNull(usage['cached_tokens']);
+    return ChatUsage(
+      promptTokens: _asInt(usage['prompt_tokens']),
+      completionTokens: _asInt(usage['completion_tokens']),
+      totalTokens: _asInt(usage['total_tokens']),
+      cachedPromptTokens: cached,
+    );
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+        'type': 'usage',
+        'promptTokens': promptTokens,
+        'completionTokens': completionTokens,
+        'totalTokens': totalTokens,
+        if (cachedPromptTokens != null)
+          'cachedPromptTokens': cachedPromptTokens,
+      };
+}
+
+int _asInt(Object? v) => v is int ? v : (v is num ? v.toInt() : 0);
+
+int? _asIntOrNull(Object? v) =>
+    v is int ? v : (v is num ? v.toInt() : null);
 
 /// 原子工具调用提案事件：proposalId 由客户端生成，对应 change_proposals 落库。
 class ChatProposalEvent extends ChatEvent {

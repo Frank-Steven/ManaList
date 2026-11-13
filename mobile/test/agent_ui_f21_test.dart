@@ -50,17 +50,22 @@ void main() {
       expect(find.byKey(const ValueKey('context-meter-ring')), findsOneWidget);
     });
 
-    testWidgets('点击展开 sheet：只有「附件（估算）」+ 按 32k 估算说明',
+    testWidgets('点击展开 sheet：「字符估算（历史+附件）」+ 按 32k 估算说明',
         (tester) async {
       await tester.pumpWidget(wrap(const ContextMeter(usedTokens: 2400)));
       await tester.tap(find.text('7%'));
       await tester.pumpAndSettle();
 
       expect(find.text('上下文已用 7%'), findsOneWidget);
-      expect(find.text('附件（估算）'), findsOneWidget);
+      // F42：这个数是「历史正文 + 草稿附件」，条目名如实写成字符估算。
+      expect(find.text('字符估算（历史+附件）'), findsOneWidget);
+      expect(find.text('附件（估算）'), findsNothing, reason: 'F42：旧措辞不得回潮');
       expect(find.text('~2.4K'), findsOneWidget);
       expect(find.textContaining('按 32k 估算'), findsOneWidget);
+      expect(find.textContaining('历史正文'), findsOneWidget);
       expect(find.textContaining('未计入'), findsOneWidget);
+      expect(find.textContaining('对话历史未计入'), findsNothing,
+          reason: 'F42：历史其实已计入，不能再说未计入');
 
       // 不得照抄 DSH 三分类
       expect(find.text('系统提示词'), findsNothing);

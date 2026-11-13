@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../ai_client.dart';
+import '../app_log.dart';
 import '../model_capabilities.dart';
 import 'models.dart';
 
@@ -372,32 +373,60 @@ class AssistantClient {
       return;
     }
     final url = AiClient.joinEndpointUrl(endpoint.baseUrl, 'chat/completions');
-    final req = http.Request('POST', Uri.parse(url));
-    req.headers['Content-Type'] = 'application/json';
-    if (endpoint.apiKey.isNotEmpty) {
-      req.headers['Authorization'] = 'Bearer ${endpoint.apiKey}';
-    }
     // F36：对话级临时覆盖优先；未覆盖时回落到端点配置。
     final effective = reasoning ?? endpoint.reasoning;
     final reasoningOn =
         effective != null && effective != AiEndpoint.reasoningOff;
-    req.body = jsonEncode({
-      'model': endpoint.model,
-      // 推理模型不接受 temperature=0（部分端点直接 400），开启推理时省略。
-      if (!reasoningOn) 'temperature': 0,
-      'stream': true,
-      if (reasoningOn) 'reasoning_effort': effective,
-      'messages': buildRemoteMessages(messages,
-          attachments: attachments,
-          vision: visionAllowsImages(
-              resolveVisionSupport(model: endpoint.model, configured: endpoint.vision))),
-    });
+    final remoteMessages = buildRemoteMessages(messages,
+        attachments: attachments,
+        vision: visionAllowsImages(
+            resolveVisionSupport(model: endpoint.model, configured: endpoint.vision)));
+
+    /// 每次重试都要新建 Request（同一个 Request 不能发两次）。
+    http.Request buildRequest({required bool includeUsage}) {
+      final req = http.Request('POST', Uri.parse(url));
+      req.headers['Content-Type'] = 'application/json';
+      if (endpoint.apiKey.isNotEmpty) {
+        req.headers['Authorization'] = 'Bearer ${endpoint.apiKey}';
+      }
+      req.body = jsonEncode({
+        'model': endpoint.model,
+        // 推理模型不接受 temperature=0（部分端点直接 400），开启推理时省略。
+        if (!reasoningOn) 'temperature': 0,
+        'stream': true,
+        if (reasoningOn) 'reasoning_effort': effective,
+        // F40：让上游在末帧回真实 usage（OpenAI stream_options 协议）。
+        if (includeUsage) 'stream_options': {'include_usage': true},
+        'messages': remoteMessages,
+      });
+      return req;
+    }
 
     final client = _client;
     _activeClient = client;
     try {
-      final streamed =
-          await client.send(req).timeout(const Duration(seconds: 30));
+      var includeUsage = true;
+      var streamed = await client
+          .send(buildRequest(includeUsage: includeUsage))
+          .timeout(const Duration(seconds: 30));
+      // F40 兼容性重试：个别上游不认 stream_options（4xx），去掉它重发一次。
+      // 只重试一次；401/403/429 是鉴权/限流问题，重试没意义，直接报错。
+      final usageRejected = streamed.statusCode >= 400 &&
+          streamed.statusCode < 500 &&
+          streamed.statusCode != 401 &&
+          streamed.statusCode != 403 &&
+          streamed.statusCode != 429;
+      if (usageRejected) {
+        final firstBody = await streamed.stream.bytesToString();
+        AppLog.instance.warn('chat.stream-options',
+            '上游 ${streamed.statusCode} 不接受 stream_options，去掉后重试一次；'
+            '本轮将没有真实 usage（上层回退估算）: '
+            '${AiClient.describeUpstreamError(firstBody)}');
+        includeUsage = false;
+        streamed = await client
+            .send(buildRequest(includeUsage: false))
+            .timeout(const Duration(seconds: 30));
+      }
       if (streamed.statusCode != 200) {
         final errBody = await streamed.stream.bytesToString();
         yield ChatError('远程接口返回 ${streamed.statusCode} @ $url：'
@@ -415,6 +444,9 @@ class AssistantClient {
         } catch (_) {
           continue;
         }
+        // F40：末帧 usage（通常伴随 choices: []）——绝不能当正文。
+        final usage = json['usage'];
+        if (usage is Map) yield ChatUsage.fromOpenAi(usage);
         final choices = json['choices'] as List?;
         if (choices == null || choices.isEmpty) continue;
         final delta = (choices.first as Map)['delta'];
