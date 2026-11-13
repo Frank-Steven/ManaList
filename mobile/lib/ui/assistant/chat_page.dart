@@ -155,7 +155,7 @@ class _ChatPageState extends State<ChatPage> {
   /// 本对话的临时覆盖：null = 跟随端点默认；用户只改这里，不写回端点。
   String? _reasoningOverride;
 
-  bool _reasoningPanelOpen = false;
+
 
   /// 该模型是否支持推理强度（不支持时隐藏思考强度胶囊）。
   bool get _reasoningSupported => resolveReasoningSupport(
@@ -164,6 +164,23 @@ class _ChatPageState extends State<ChatPage> {
       );
 
   /// 本回合真正生效的档位：对话级覆盖优先，其次端点配置。
+  /// 打开档位面板（标准底部弹层：点空白即可关闭，且不会因为内联插入
+  /// 导致布局位移/状态错乱——真机曾出现「只能打开一次」）。
+  Future<void> _openReasoningPanel() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => ReasoningPanel(
+        selected: _effectiveReasoning,
+        onSelect: (level) {
+          setState(() => _reasoningOverride = level);
+          Navigator.of(sheetContext).pop();
+        },
+        onClose: () => Navigator.of(sheetContext).pop(),
+      ),
+    );
+  }
+
   String? get _effectiveReasoning =>
       _reasoningOverride ?? _endpointReasoning;
 
@@ -1130,31 +1147,13 @@ class _ChatPageState extends State<ChatPage> {
             reasoningText: reasoningPillText(_effectiveReasoning),
             reasoningActive: _effectiveReasoning != null,
             showReasoning: _reasoningSupported,
-            onReasoningTap: () => setState(
-                () => _reasoningPanelOpen = !_reasoningPanelOpen),
+            onReasoningTap: _openReasoningPanel,
             usedTokens: _approxContextTokens,
             limitTokens: kDefaultContextTokenLimit,
           ),
-          // 档位面板：整宽贴在输入区上方（不是跟随胶囊的浮层）。
-          if (_reasoningPanelOpen && _reasoningSupported)
-            ReasoningPanel(
-              selected: _effectiveReasoning,
-              onSelect: (level) => setState(() {
-                _reasoningOverride = level;
-                _reasoningPanelOpen = false;
-              }),
-              onClose: () => setState(() => _reasoningPanelOpen = false),
-            ),
           // F03 Step2（2026-11-03）：草稿含图片时显示「单张成条 + 敏感信息离设备」提示。
           if (_hasScreenshotAttachments) _buildScreenshotsHint(cs),
-          // 点输入区即收起档位面板（Listener 不消费事件，不影响输入框交互）。
-          Listener(
-            onPointerDown: (_) {
-              if (_reasoningPanelOpen) {
-                setState(() => _reasoningPanelOpen = false);
-              }
-            },
-            child: ChatInputBar(
+          ChatInputBar(
             controller: _input,
             busy: _busy,
             // 停止键已在主进行态条上：这里只留 48dp 占位，避免布局跳动。
@@ -1168,7 +1167,6 @@ class _ChatPageState extends State<ChatPage> {
             onPickScreenshots: _pickScreenshots,
             onSend: _send,
             onCancel: _cancel,
-            ),
           ),
           // F36：输入框下方一行灰字免责声明。
           Padding(

@@ -110,6 +110,11 @@ bool isKnownReasoningModel(String model) {
   if (m.isEmpty) return false;
   if (m.contains('deepseek-reasoner')) return true;
   if (m.contains('deepseek-r1')) return true;
+  // DeepSeek V4.1 Flash 系（F35 真机实测：返回 reasoning_content，
+  // 2026-11-13 f36b 复核 thinking_ms=10887）。别名 1017 是内部代号。
+  if (m.contains('deepseek-flash')) return true;
+  if (m.contains('deepseek-v4.1-flash')) return true;
+  if (m.contains('1017')) return true;
   // kimi / qwen / glm 的 thinking 型号（如 kimi-k2-thinking、glm-4.6-thinking）
   if (m.contains('thinking')) return true;
   // QwQ（阿里推理系列）
