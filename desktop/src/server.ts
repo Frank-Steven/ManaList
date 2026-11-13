@@ -250,6 +250,18 @@ export function createServer(opts: ServerOptions): http.Server {
             onToken: (delta) => send({ type: "token_delta", delta }),
             onReasoning: (delta) => send({ type: "reasoning_delta", delta }),
             reasoning: body.reasoning,
+            // F40：真实 token 用量（只有上游给了才回调）——追加进同一个帧缓冲，
+            // done 在同一缓冲末尾，天然保证 usage 先于 done 发出。
+            onUsage: (u) =>
+              send({
+                type: "usage",
+                promptTokens: u.promptTokens,
+                completionTokens: u.completionTokens,
+                totalTokens: u.totalTokens,
+                ...(u.cachedPromptTokens === undefined
+                  ? {}
+                  : { cachedPromptTokens: u.cachedPromptTokens }),
+              }),
           });
           send({ type: "done" });
           console.log(`[chat] 完成：${modelId}，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);

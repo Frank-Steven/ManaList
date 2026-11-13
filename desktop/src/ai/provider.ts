@@ -25,6 +25,18 @@ export function contentImageCount(content: string | ProviderContentPart[]): numb
   return content.filter((p) => p.type === "image_url").length;
 }
 
+/**
+ * 上游返回的 token 用量（F40）：字段全部按「可能缺省」处理 —— 各家兼容实现
+ * 只保证 prompt/completion/total 里的部分字段，cached 只有支持的端点才给。
+ */
+export interface ProviderUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  /** 命中缓存的 prompt token（prompt_tokens_details.cached_tokens），上游不给则 undefined */
+  cachedPromptTokens?: number;
+}
+
 /** v3 统一对话选项（design-v3 §6.3）。 */
 export interface ChatOptions {
   /** 每生成一段 delta 回调一次，供 /v1/chat 透传 token_delta 事件 */
@@ -33,6 +45,12 @@ export interface ChatOptions {
   onReasoning?: (delta: string) => void;
   /** 推理强度（F35）：缺省/'off' 不发参数；low/medium/high → reasoning_effort */
   reasoning?: "off" | "low" | "medium" | "high";
+  /**
+   * 上游真实 token 用量（F40），供 /v1/chat 透传 usage 事件。
+   * **上游不返回 usage 时不会调用**（例如未支持 stream_options 的后端、mock/ollama），
+   * 因此调用方必须容忍回调一次都没发生。
+   */
+  onUsage?: (usage: ProviderUsage) => void;
 }
 
 /**

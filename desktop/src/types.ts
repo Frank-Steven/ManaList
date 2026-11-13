@@ -103,6 +103,18 @@ export type ChatEvent =
       tool: string;
       args: Record<string, unknown>;
     }
+  | {
+      /**
+       * F40：上游真实 token 用量，紧跟 done 之前发出。
+       * **不返回 usage 时该事件根本不出现**（旧客户端不受影响）。
+       */
+      type: "usage";
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+      /** 命中缓存的 prompt token；上游不给则缺省 */
+      cachedPromptTokens?: number;
+    }
   | { type: "done" }
   | { type: "error"; error: string };
 

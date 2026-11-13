@@ -177,3 +177,122 @@ test("delta.reasoning（非 reasoning_content）同样走 onReasoning", async ()
     await new Promise<void>((done) => server.close(() => done()));
   }
 });
+// ---- F40（2026-11-13）：真实 token usage 透传 ----
+//
+// 三条覆盖：请求侧带 stream_options.include_usage；usage chunk 规范化后回调 onUsage
+// 且不混入正文；上游 4xx 拒绝该参数时去掉重试一次（不许整轮失败）。
+
+/** 起一个可自定义应答的上游（用于 usage / 400 重试用例）。 */
+function startCustomUpstream(
+  handler: (
+    body: Record<string, unknown>,
+    res: http.ServerResponse,
+    attempt: number,
+  ) => void,
+) {
+  return new Promise<Upstream & { attempts: number }>((resolve) => {
+    const bodies: Array<Record<string, unknown>> = [];
+    let attempts = 0;
+    const server = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (chunk) => {
+        raw += chunk;
+      });
+      req.on("end", () => {
+        attempts += 1;
+        const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+        bodies.push(body);
+        handler(body, res, attempts);
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+      resolve({
+        baseUrl: `http://127.0.0.1:${port}`,
+        bodies,
+        attempts,
+        close: () =>
+          new Promise<void>((done) => {
+            server.close(() => done());
+          }),
+      } as Upstream & { attempts: number });
+    });
+  });
+}
+
+test("F40 请求体带 stream_options.include_usage", async () => {
+  const upstream = await startUpstream(() => ({ content: "正文" }));
+  try {
+    const provider = new OpenAICompatProvider({ baseUrl: upstream.baseUrl, model: "m" });
+    await provider.chat(messages);
+    const body = upstream.bodies[0] as { stream_options?: { include_usage?: boolean } };
+    assert.deepEqual(body.stream_options, { include_usage: true });
+  } finally {
+    await upstream.close();
+  }
+});
+
+test("F40 usage chunk → onUsage 规范化数字，且 usage 不进正文", async () => {
+  const upstream = await startCustomUpstream((_body, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "答" } }] })}\n\n`);
+    // usage 作为最后一个 chunk：choices 为空
+    res.write(
+      `data: ${JSON.stringify({
+        choices: [],
+        usage: {
+          prompt_tokens: 120,
+          completion_tokens: 30,
+          total_tokens: 150,
+          prompt_tokens_details: { cached_tokens: 64 },
+        },
+      })}\n\n`,
+    );
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  try {
+    const provider = new OpenAICompatProvider({ baseUrl: upstream.baseUrl, model: "m" });
+    const usages: Array<Record<string, number>> = [];
+    const tokens: string[] = [];
+    const full = await provider.chat(messages, {
+      onToken: (d) => tokens.push(d),
+      onUsage: (u) => usages.push({ ...u }),
+    });
+    assert.deepEqual(usages, [
+      { promptTokens: 120, completionTokens: 30, totalTokens: 150, cachedPromptTokens: 64 },
+    ]);
+    assert.equal(full, "答", "usage 不得混进正文");
+    assert.deepEqual(tokens, ["答"]);
+  } finally {
+    await upstream.close();
+  }
+});
+
+test("F40 上游 4xx 拒绝 stream_options → 去掉参数重试一次并成功", async () => {
+  const upstream = await startCustomUpstream((body, res, attempt) => {
+    const hasStreamOptions = "stream_options" in body;
+    if (attempt === 1 && hasStreamOptions) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unsupported parameter: stream_options" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "重试成功" } }] })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  try {
+    const provider = new OpenAICompatProvider({ baseUrl: upstream.baseUrl, model: "m" });
+    const usages: unknown[] = [];
+    const full = await provider.chat(messages, { onUsage: (u) => usages.push(u) });
+    assert.equal(full, "重试成功", "去参数后应正常返回正文，不许整轮失败");
+    assert.equal(upstream.bodies.length, 2, "只重试一次");
+    assert.deepEqual(upstream.bodies[0].stream_options, { include_usage: true });
+    assert.equal("stream_options" in upstream.bodies[1], false, "重试请求去掉 stream_options");
+    assert.equal(usages.length, 0, "重试后拿不到 usage，不得伪造");
+  } finally {
+    await upstream.close();
+  }
+});

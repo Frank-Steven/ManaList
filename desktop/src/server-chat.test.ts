@@ -299,3 +299,95 @@ test("B12 旧 vision 配置：true 保留 / false 无 explicit 走能力表 / �
   config = saved;
   await fetch(`${base}/v1/models/reload`, { method: "POST", headers: auth() });
 });
+// ---- F40（2026-11-13）：/v1/chat 透传真实 usage ----
+//
+// 用本地 mock 上游充当「返回 usage 的 OpenAI 兼容端点」，验证 usage 帧**紧跟 done 之前**；
+// 同时验证不返回 usage 的 provider（mock）根本不产生 usage 帧（旧手机端解析不受影响）。
+test("F40 /v1/chat：上游给 usage → SSE 在 done 之前发 usage 帧", async () => {
+  const http = await import("node:http");
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "你好" } }] })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({
+          choices: [],
+          usage: { prompt_tokens: 200, completion_tokens: 40, total_tokens: 240 },
+        })}\n\n`,
+      );
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  await new Promise<void>((done) => upstream.listen(0, "127.0.0.1", () => done()));
+  const addr = upstream.address() as AddressInfo;
+
+  const saved = config;
+  config = {
+    ...config,
+    models: [
+      ...config.models,
+      {
+        id: "usage-up",
+        name: "UsageUp",
+        provider: "openai-compat",
+        baseUrl: `http://127.0.0.1:${addr.port}/v1`,
+        model: "m",
+      },
+    ],
+    defaultModelId: "mock-1",
+  };
+  try {
+    await fetch(`${base}/v1/models/reload`, { method: "POST", headers: auth() });
+    const res = await fetch(`${base}/v1/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...auth() },
+      body: JSON.stringify({
+        conversationId: "c-usage",
+        modelConfigId: "usage-up",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+    assert.equal(res.status, 200);
+    const events = await readSse(res);
+    assert.equal(events.at(-1)?.type, "done", "done 必须是最后一个事件");
+    const last = events.at(-2) as {
+      type: string;
+      promptTokens?: number;
+      completionTokens?: number;
+      totalTokens?: number;
+    };
+    assert.equal(last.type, "usage", "usage 帧必须紧跟 done 之前");
+    assert.equal(last.promptTokens, 200);
+    assert.equal(last.completionTokens, 40);
+    assert.equal(last.totalTokens, 240);
+    // usage 不得混进正文
+    const full = events
+      .filter((e) => e.type === "token_delta")
+      .map((t) => (t as { delta: string }).delta)
+      .join("");
+    assert.equal(full, "你好");
+  } finally {
+    config = saved;
+    await fetch(`${base}/v1/models/reload`, { method: "POST", headers: auth() });
+    await new Promise<void>((done) => upstream.close(() => done()));
+  }
+});
+
+test("F40 mock provider 不给 usage → 完全不出现 usage 帧（向后兼容）", async () => {
+  const res = await fetch(`${base}/v1/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...auth() },
+    body: JSON.stringify({
+      conversationId: "c-no-usage",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    }),
+  });
+  assert.equal(res.status, 200);
+  const events = await readSse(res);
+  assert.equal(events.some((e) => e.type === "usage"), false, "无 usage 时不得出现 usage 帧");
+  assert.deepEqual(events.at(-1), { type: "done" });
+});
