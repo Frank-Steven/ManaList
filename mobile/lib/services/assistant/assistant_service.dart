@@ -510,6 +510,14 @@ class AssistantService {
     // F35：协议级推理内容（reasoning_content）单独占一个段号，避免与 <think> 段冲突。
     const reasoningSection = 10000;
     final reasoningBuf = StringBuffer();
+    // F35：思考起止时间（首次/末次思考事件），用于落库真实耗时。
+    DateTime? thinkingStartedAt;
+    DateTime? thinkingLastAt;
+    void markThinking() {
+      final now = DateTime.now();
+      thinkingStartedAt ??= now;
+      thinkingLastAt = now;
+    }
 
     while (true) {
       final isContinuation = continuationRound > 0;
@@ -602,6 +610,7 @@ class AssistantService {
             // 先剥思考块（<think> 标签），剩余文本再过工具块解析
             final thinkRes = thinkParser.feed(ev.delta);
             if (thinkRes.thinkingChanged || thinkRes.stateChanged) {
+              markThinking();
               thinkingBySection[thinkParser.sectionIndex] =
                   thinkParser.sectionThinking;
               handle._emit(AssistantThinkingDelta(thinkParser.sectionIndex,
@@ -623,6 +632,7 @@ class AssistantService {
           case ChatReasoningDelta():
             // F35：协议级推理内容（reasoning_content）直接作为思考段上报，
             // 不经过 <think> 解析器；与正文分段互不影响。
+            markThinking();
             reasoningBuf.write(ev.delta);
             thinkingBySection[reasoningSection] = reasoningBuf.toString();
             handle._emit(AssistantThinkingDelta(
@@ -649,6 +659,7 @@ class AssistantService {
     // 未闭合工具块整体丢弃（details §2.2），尾行文本仍上屏
     final thinkTail = thinkParser.finish();
     if (thinkTail.thinkingChanged || thinkTail.stateChanged) {
+      markThinking();
       thinkingBySection[thinkParser.sectionIndex] =
           thinkParser.sectionThinking;
       handle._emit(AssistantThinkingDelta(
@@ -696,7 +707,13 @@ class AssistantService {
         .join('\n\n')
         .trim();
     if (thinkingText.isNotEmpty) {
-      await db.updateChatMessageThinking(assistantMsg.id, thinkingText);
+      final started = thinkingStartedAt;
+      final last = thinkingLastAt;
+      final ms = (started != null && last != null)
+          ? last.difference(started).inMilliseconds
+          : null;
+      await db.updateChatMessageThinking(assistantMsg.id, thinkingText,
+          thinkingMs: ms);
     }
 
     if (errorText != null) {

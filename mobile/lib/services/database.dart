@@ -117,6 +117,7 @@ Future<void> createV8Tables(DatabaseExecutor db) async {
       attachments TEXT,
       status TEXT NOT NULL,
       thinking TEXT,
+      thinking_ms INTEGER,
       created_at INTEGER NOT NULL
     )
   ''');
@@ -263,6 +264,15 @@ Future<void> migrateToV13(DatabaseExecutor db) async {
   final cols = await db.rawQuery('PRAGMA table_info(chat_messages)');
   if (!cols.any((c) => c['name'] == 'thinking')) {
     await db.execute('ALTER TABLE chat_messages ADD COLUMN thinking TEXT');
+  }
+}
+
+/// v14（F35 收尾）：chat_messages.thinking_ms —— 思考耗时落库，
+/// 否则回合结束后只能显示「已思考 0s」。PRAGMA 守卫保证幂等。
+Future<void> migrateToV14(DatabaseExecutor db) async {
+  final cols = await db.rawQuery('PRAGMA table_info(chat_messages)');
+  if (!cols.any((c) => c['name'] == 'thinking_ms')) {
+    await db.execute('ALTER TABLE chat_messages ADD COLUMN thinking_ms INTEGER');
   }
 }
 
@@ -606,7 +616,7 @@ class AppDatabase {
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'msgrepo.db'),
-      version: 13,
+      version: 14,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -661,6 +671,10 @@ class AppDatabase {
     if (oldVersion < 13) {
       // v13（F33）：chat_messages.thinking —— 回合落定后过程行仍能展开看思考。
       await migrateToV13(db);
+    }
+    if (oldVersion < 14) {
+      // v14（F35）：thinking_ms —— 思考耗时，结束态不再显示 0s。
+      await migrateToV14(db);
     }
   }
 
@@ -2114,10 +2128,17 @@ class AppDatabase {
   }
 
   /// F33：把本轮思考文本写进 assistant 消息（空串不写，保持 NULL）。
-  Future<void> updateChatMessageThinking(String id, String thinking) async {
+  Future<void> updateChatMessageThinking(String id, String thinking,
+      {int? thinkingMs}) async {
     final db = await database;
-    await db.update('chat_messages', {'thinking': thinking},
-        where: 'id = ?', whereArgs: [id]);
+    await db.update(
+        'chat_messages',
+        {
+          'thinking': thinking,
+          if (thinkingMs != null) 'thinking_ms': thinkingMs,
+        },
+        where: 'id = ?',
+        whereArgs: [id]);
   }
 
   Future<void> updateChatMessageStatus(String id, String status) async {

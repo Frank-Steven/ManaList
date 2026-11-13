@@ -1177,25 +1177,40 @@ class _ChatPageState extends State<ChatPage> {
         rest.addAll(_buildMessageWrapped(m, cs));
       }
     }
-    // F33：思考文本已落库 → 历史过程行里也能展开看思考。
-    final thinkSeg = thinking.isEmpty
+    // F33/F35：思考文本与耗时已落库 → 历史过程行可展开，且显示真实秒数。
+    ChatMessage? thinkMsg;
+    if (thinking.isNotEmpty) {
+      for (final m in turn) {
+        if (m.role == ChatRole.assistant && (m.thinking ?? '').trim().isNotEmpty) {
+          thinkMsg = m;
+          break;
+        }
+      }
+    }
+    final thinkKey = thinkMsg == null ? null : 'thinking:${thinkMsg.id}';
+    final thinkStart = DateTime.fromMillisecondsSinceEpoch(
+        thinkMsg?.createdAt ?? turn.last.createdAt);
+    final thinkSeg = thinkMsg == null
         ? null
         : (ChatStreamSegment(
             kind: ChatStreamSegmentKind.thinking,
-            startedAt: DateTime.fromMillisecondsSinceEpoch(turn.last.createdAt))
+            startedAt: thinkStart)
           ..text = thinking
           ..active = false
-          ..endedAt = DateTime.fromMillisecondsSinceEpoch(turn.last.createdAt));
+          ..expanded = _expandedToolMsgIds.contains(thinkKey)
+          ..endedAt = thinkStart.add(
+              Duration(milliseconds: thinkMsg.thinkingMs ?? 0)));
     return [
       ...leading,
       ProcessSection(
         summary: _historyProcessSummary(tools, hasThinking: thinkSeg != null),
         children: [
-          if (thinkSeg != null)
+          if (thinkSeg != null && thinkKey != null)
             ThinkingBlock(
               segment: thinkSeg,
-              onToggle: () => setState(
-                  () => thinkSeg.expanded = !thinkSeg.expanded),
+              // 展开状态存进 _expandedToolMsgIds：否则每次重建都会新建 segment，
+              // 点了立刻回到折叠态（真机「思考点不开」的根因）。
+              onToggle: () => _toggleToolExpanded(thinkKey),
             ),
           for (final m in tools)
             ToolCallBlock(

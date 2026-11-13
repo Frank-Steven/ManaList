@@ -131,6 +131,9 @@ class ChatMessage {
 
   /// 助手思考文本（DB v13，F33）：落库后历史回合的「过程」行仍能展开看思考。
   final String? thinking;
+
+  /// 思考耗时毫秒（DB v14，F35）：结束态显示真实「已思考 Ns」而不是 0s。
+  final int? thinkingMs;
   final int createdAt;
 
   const ChatMessage({
@@ -141,6 +144,7 @@ class ChatMessage {
     this.attachments = const [],
     this.status = ChatMessageStatus.done,
     this.thinking,
+    this.thinkingMs,
     required this.createdAt,
   });
 
@@ -156,6 +160,7 @@ class ChatMessage {
                 .toList(),
         status: row['status'] as String,
         thinking: row['thinking'] as String?,
+        thinkingMs: (row['thinking_ms'] as num?)?.toInt(),
         createdAt: (row['created_at'] as num).toInt(),
       );
 
@@ -168,6 +173,7 @@ class ChatMessage {
             jsonEncode(attachments.map((e) => e.toJson()).toList()),
         'status': status,
         'thinking': thinking,
+        'thinking_ms': thinkingMs,
         'created_at': createdAt,
       };
 
@@ -179,6 +185,7 @@ class ChatMessage {
     List<ChatAttachment>? attachments,
     String? status,
     String? thinking,
+    int? thinkingMs,
     int? createdAt,
   }) =>
       ChatMessage(
@@ -189,6 +196,7 @@ class ChatMessage {
         attachments: attachments ?? this.attachments,
         status: status ?? this.status,
         thinking: thinking ?? this.thinking,
+        thinkingMs: thinkingMs ?? this.thinkingMs,
         createdAt: createdAt ?? this.createdAt,
       );
 }
