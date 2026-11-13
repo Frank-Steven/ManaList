@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../../models/conversation.dart';
 import '../../../services/assistant/models.dart';
+import 'expandable_header.dart';
 import 'streaming_blocks.dart';
 
 /// F21 第①阶段（审批稿「成功工具聚合」）：同一阶段**连续的成功工具回注**
@@ -199,46 +200,21 @@ class _ToolStepsGroupState extends State<ToolStepsGroup> {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        InkWell(
-          key: widget.headerKey,
-          borderRadius: BorderRadius.circular(8),
-          onTap: _toggle,
-          child: Container(
-            constraints: const BoxConstraints(minHeight: 44),
+        // task-91：统一头部（三角在右）；headerKey 保留给测试定位。
+        ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 44),
+          child: ExpandableHeader(
+            key: widget.headerKey,
+            leading:
+                Icon(Icons.check_circle_outline, size: 16, color: cs.primary),
+            title: successStepsSummary(count),
+            status: seconds > 0 ? '$seconds s' : null,
+            statusFontFeatures: const [FontFeature.tabularFigures()],
+            expanded: _isExpanded,
+            onTap: _toggle,
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.check_circle_outline,
-                    size: 16, color: cs.primary),
-                const SizedBox(width: 6),
-                Text(
-                  successStepsSummary(count),
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: cs.onSurface,
-                    fontFeatures: const [FontFeature.tabularFigures()],
-                  ),
-                ),
-                if (seconds > 0) ...[
-                  const SizedBox(width: 6),
-                  Text(
-                    '$seconds s',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: cs.onSurfaceVariant,
-                      fontFeatures: const [FontFeature.tabularFigures()],
-                    ),
-                  ),
-                ],
-                const SizedBox(width: 4),
-                Icon(
-                  _isExpanded ? Icons.expand_less : Icons.expand_more,
-                  size: 18,
-                  color: cs.onSurfaceVariant,
-                ),
-              ],
-            ),
+            titleSize: 13,
+            statusSize: 11,
           ),
         ),
         if (_isExpanded)

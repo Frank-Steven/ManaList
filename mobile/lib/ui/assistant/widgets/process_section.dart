@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'expandable_header.dart';
+
 /// F31：正文已输出后，思考链/工具调用仍保留，但默认折叠。
 ///
 /// 只负责「折叠容器 + 摘要行」；内部子项由调用方传入，
@@ -38,29 +40,14 @@ class _ProcessSectionState extends State<ProcessSection> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          InkWell(
+          // task-91：统一头部（三角在右），Key 保留给 process_section_test。
+          ExpandableHeader(
             key: const ValueKey('process-toggle'),
-            borderRadius: BorderRadius.circular(8),
+            title: widget.summary,
+            expanded: _open,
             onTap: () => setState(() => _open = !_open),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              child: Row(
-                children: [
-                  Icon(
-                    _open ? Icons.expand_more : Icons.chevron_right,
-                    size: 16,
-                    color: cs.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      widget.summary,
-                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                    ),
-                  ),
-                ],
-              ),
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            titleSize: 12,
           ),
           if (_open)
             Padding(

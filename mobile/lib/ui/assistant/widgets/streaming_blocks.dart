@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../../services/assistant/tool_spec.dart';
+import 'expandable_header.dart';
 
 /// 一轮流式回复的一个分段（2026-11-01）：
 /// 思考块（<think> 标签）、工具块（```tool 围栏块）、正文文本段。
@@ -251,8 +252,6 @@ class ThinkingBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final statusStyle = statusDigitsStyle(
-        TextStyle(fontSize: 11, color: cs.onSurfaceVariant));
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 3),
       decoration: BoxDecoration(
@@ -263,40 +262,20 @@ class ThinkingBlock extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          InkWell(
-            borderRadius: BorderRadius.circular(8),
+          // task-91：统一头部（三角在右，expand_more 旋转）。
+          ExpandableHeader(
+            leading: Icon(Icons.psychology_outlined,
+                size: 15, color: cs.onSurfaceVariant),
+            title: '思考',
+            status: segment.active
+                ? '思考中 ${segment.elapsedSeconds}s'
+                : '已思考 ${segment.elapsedSeconds}s',
+            statusFontFeatures: const [FontFeature.tabularFigures()],
+            expanded: segment.expanded,
             onTap: onToggle,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-              child: Row(
-                children: [
-                  Icon(Icons.psychology_outlined,
-                      size: 15, color: cs.onSurfaceVariant),
-                  const SizedBox(width: 6),
-                  Text('思考',
-                      style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: cs.onSurfaceVariant)),
-                  const SizedBox(width: 6),
-                  Text(
-                    segment.active
-                        ? '思考中 ${segment.elapsedSeconds}s'
-                        : '已思考 ${segment.elapsedSeconds}s',
-                    style: statusStyle,
-                  ),
-                  // F21 第②阶段：全页只保留主进行态条一个循环动效，
-                  // 思考块的转圈已移除（状态文案「思考中 Ns」仍在）。
-                  const Spacer(),
-                  Icon(
-                      segment.expanded
-                          ? Icons.expand_less
-                          : Icons.expand_more,
-                      size: 16,
-                      color: cs.onSurfaceVariant),
-                ],
-              ),
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            titleSize: 12,
+            statusSize: 11,
           ),
           if (segment.expanded && segment.text.isNotEmpty)
             Padding(
@@ -337,8 +316,6 @@ class ToolCallBlock extends StatelessWidget {
         : segment.active
             ? cs.primary
             : cs.onSurfaceVariant;
-    final statusStyle = statusDigitsStyle(
-        TextStyle(fontSize: 11, color: statusColor));
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 3),
       decoration: BoxDecoration(
@@ -351,46 +328,20 @@ class ToolCallBlock extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          InkWell(
-            borderRadius: BorderRadius.circular(8),
+          // task-91：统一头部（三角在右）。无详情时不可展开（不显示三角）。
+          ExpandableHeader(
+            leading: Icon(icon, size: 15, color: cs.onSurfaceVariant),
+            title: title,
+            status: segment.active
+                ? '${segment.status} ${segment.elapsedSeconds}s'
+                : segment.status,
+            statusColor: statusColor,
+            statusFontFeatures: const [FontFeature.tabularFigures()],
+            expanded: segment.expanded,
             onTap: hasDetail ? onToggle : null,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-              child: Row(
-                children: [
-                  Icon(icon, size: 15, color: cs.onSurfaceVariant),
-                  const SizedBox(width: 6),
-                  Flexible(
-                    child: Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: cs.onSurface),
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    segment.active
-                        ? '${segment.status} ${segment.elapsedSeconds}s'
-                        : segment.status,
-                    style: statusStyle,
-                  ),
-                  // F21 第②阶段：工具块的呼吸点已移除（状态文案仍在），
-                  // 进行中的动效只留给主进行态条。
-                  const Spacer(),
-                  if (hasDetail)
-                    Icon(
-                        segment.expanded
-                            ? Icons.expand_less
-                            : Icons.expand_more,
-                        size: 16,
-                        color: cs.onSurfaceVariant),
-                ],
-              ),
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            titleSize: 12,
+            statusSize: 11,
           ),
           if (segment.expanded && hasDetail)
             Padding(
