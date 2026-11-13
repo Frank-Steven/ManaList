@@ -17,6 +17,18 @@ int contextPercent(int usedTokens, int limitTokens) {
   return (usedTokens / limitTokens * 100).round();
 }
 
+/// 显示用百分比文案（F43）：
+/// 四舍五入到 0 但确实有用量时显示 `<1%`，否则看着像「没算」。
+/// - limitTokens <= 0（上限未知）→ `0%`；
+/// - p == 0 且 usedTokens > 0 → `<1%`；
+/// - 其余 `$p%`（含 >100%）。
+String contextPercentLabel(int usedTokens, int limitTokens) {
+  if (limitTokens <= 0) return '0%';
+  final p = contextPercent(usedTokens, limitTokens);
+  if (p == 0 && usedTokens > 0) return '<1%';
+  return '$p%';
+}
+
 /// token 数的人类可读格式：<1000 原样；<1e6 `~x.xK`；≥1e6 `x.xM`。
 String formatTokenCount(int tokens) {
   if (tokens <= 0) return '0';
@@ -85,7 +97,12 @@ class ContextMeter extends StatelessWidget {
   /// （旧值 48 曾让圆环行比其他胶囊高一截、并被压在行右边缘。）
   static const double hitSize = 36;
 
+  /// 整数百分比（保留给圆环/颜色判断与既有断言）。
   int get percent => contextPercent(usedTokens, effectiveLimitTokens);
+
+  /// 显示用文案（<1% 时显示 `<1%`，不再显示 0%）。
+  String get percentLabel =>
+      contextPercentLabel(usedTokens, effectiveLimitTokens);
 
   Color _arcColor(ColorScheme cs) {
     final limit = effectiveLimitTokens;
@@ -133,7 +150,8 @@ class ContextMeter extends StatelessWidget {
           ),
           const SizedBox(width: 6),
           Text(
-            '$percent%',
+            // F43：0.2% 不再显示成 0%，显示 <1%（圆环与颜色仍用整数 percent）。
+            percentLabel,
             style: TextStyle(
               fontSize: 12,
               height: 1.1,
@@ -150,8 +168,8 @@ class ContextMeter extends StatelessWidget {
       // 同时带上上下文上限来源（模型表 / 端点 / 手动 / 估算）。
       label: [
         usage != null
-            ? '上下文已用 $percent%（上次请求真实输入）'
-            : '约 $percent%（字符估算）',
+            ? '上下文已用 $percentLabel（上次请求真实输入）'
+            : '约 $percentLabel（字符估算）',
         if (window != null) window!.label,
       ].join('；'),
       button: true,
@@ -203,7 +221,7 @@ Future<void> showContextMeterSheet(
       final cs = Theme.of(sheetContext).colorScheme;
       final theme = Theme.of(sheetContext).textTheme;
       final limit = window?.tokens ?? limitTokens;
-      final percent = contextPercent(usedTokens, limit);
+      final percentLabel = contextPercentLabel(usedTokens, limit);
       final hasLimit = limit > 0;
       return SafeArea(
         top: false,
@@ -213,7 +231,7 @@ Future<void> showContextMeterSheet(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('上下文已用 $percent%',
+              Text('上下文已用 $percentLabel',
                   style: theme.titleMedium
                       ?.copyWith(fontWeight: FontWeight.w600)),
               const SizedBox(height: 12),

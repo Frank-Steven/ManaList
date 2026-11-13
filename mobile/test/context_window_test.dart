@@ -98,6 +98,30 @@ void main() {
       expect(find.text("18%"), findsNothing);
     });
 
+    // ---- F43：小于 1% 时显示 <1%，不要显示成 0% ----
+    test("百分比文案四态（纯函数）", () {
+      expect(contextPercentLabel(2100, 1000000), "<1%",
+          reason: "0.21% 四舍五入为 0，但不能显示 0%");
+      expect(contextPercentLabel(5894, 1000000), "1%");
+      expect(contextPercentLabel(0, 32768), "0%", reason: "确实没用量为 0%");
+      expect(contextPercentLabel(1200, 0), "0%", reason: "上限未知按 0");
+      expect(contextPercentLabel(70000, 32768), "214%", reason: "超限照常显示");
+    });
+
+    testWidgets("胶囊与 sheet 都显示 <1%（不再出现 0%）", (tester) async {
+      await tester.pumpWidget(wrap(const ContextMeter(
+        usedTokens: 2100,
+        window: ContextWindowInfo(1000000, ContextWindowSource.modelTable),
+      )));
+      expect(find.text("<1%"), findsOneWidget);
+      expect(find.text("0%"), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey("context-meter-pill")));
+      await tester.pumpAndSettle();
+      expect(find.text("上下文已用 <1%"), findsOneWidget);
+      expect(find.text("上下文已用 0%"), findsNothing);
+    });
+
     testWidgets("来源文案：模型能力表 / 估算 / 手动配置", (tester) async {
       /// 打开某个来源的 sheet：
       /// ① 先关掉上一个 case 残留的 sheet（否则 ModalBarrier/Scrim 会吃掉点击，
