@@ -127,10 +127,14 @@ class ReasoningPillRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 4, 2),
+      // F38：右侧内边距 4 → 12（与左侧对称，胶囊整体左移，不再贴行右边缘）。
+      padding: const EdgeInsets.fromLTRB(12, 2, 12, 2),
       child: Row(
         children: [
+          // F39：点击是「跳转模型配置页」而不是下拉，所以不再画 ▾ 小三角
+          // （同时把它的横向占位一起去掉，胶囊宽度只由模型名决定）。
           _pill(
+            key: const ValueKey('reasoning-model-pill'),
             context: context,
             onTap: onModelTap,
             child: Row(
@@ -144,13 +148,13 @@ class ReasoningPillRow extends StatelessWidget {
                     style: TextStyle(fontSize: 12, color: cs.onSurface),
                   ),
                 ),
-                Icon(Icons.arrow_drop_down, size: 16, color: cs.onSurfaceVariant),
               ],
             ),
           ),
           if (showReasoning) ...[
             const SizedBox(width: 6),
             _pill(
+              key: const ValueKey('reasoning-strength-pill'),
               context: context,
               onTap: onReasoningTap,
               child: Row(
@@ -190,6 +194,7 @@ class ReasoningPillRow extends StatelessWidget {
   }
 
   Widget _pill({
+    Key? key,
     required BuildContext context,
     required VoidCallback onTap,
     required Widget child,
@@ -201,6 +206,7 @@ class ReasoningPillRow extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
         onTap: onTap,
         child: Container(
+          key: key,
           constraints: const BoxConstraints(minHeight: 32, maxWidth: 168),
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
           decoration: BoxDecoration(

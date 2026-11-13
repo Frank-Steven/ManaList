@@ -129,12 +129,26 @@ void main() {
     });
   });
 
-  group('deriveConversationTitle（§9 自动命名）', () {
-    test('截 20 字加省略号；去首尾空白；空串原样返回（调用方跳过）', () {
+  group('deriveConversationTitle（§9 自动命名 / F37 新口径）', () {
+    test('折叠空白 + trim，保留全文（不再按 20 字截断存库）', () {
       expect(deriveConversationTitle('  帮我整理收件箱  '), '帮我整理收件箱');
-      expect(deriveConversationTitle('一二三四五六七八九十一二三四五六七八九十一二三'),
-          '一二三四五六七八九十一二三四五六七八九十…');
+      // F37：21 字标题必须完整保留，否则顶栏永远不可能溢出滚动
+      const long21 = 'think step by step about it';
+      expect(deriveConversationTitle(long21), long21);
+      expect(deriveConversationTitle(long21).endsWith('…'), isFalse);
+      // 换行/连续空白折叠成单空格
+      expect(deriveConversationTitle('第一行\n\n第二行   第三行'), '第一行 第二行 第三行');
       expect(deriveConversationTitle('   '), '');
+    });
+
+    test('只有超过 120 字符才截断加省略号', () {
+      final a = 'a' * kConversationTitleMaxLength;
+      expect(deriveConversationTitle(a), a);
+      final b = 'b' * (kConversationTitleMaxLength + 1);
+      final out = deriveConversationTitle(b);
+      expect(out.length, kConversationTitleMaxLength + 1);
+      expect(out.endsWith('…'), isTrue);
+      expect(out.substring(0, kConversationTitleMaxLength), b.substring(0, kConversationTitleMaxLength));
     });
   });
 

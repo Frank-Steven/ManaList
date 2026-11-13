@@ -61,9 +61,15 @@ class ContextMeter extends StatelessWidget {
   /// 测试注入；默认打开底部 sheet。
   final VoidCallback? onTap;
 
-  static const double ringSize = 14;
+  // F38（2026-11-13）：与另外两个胶囊（模型 / 思考强度）同口径——
+  // minHeight 32、padding h10 v4、字号 12、圆环 16、ring-text gap 6。
+  static const double ringSize = 16;
   static const double ringStroke = 2;
-  static const double hitSize = 48;
+
+  /// 命中高度下限。F38 口径：**不再为 48dp 撑高整行** ——
+  /// 行高上限 = pill 32 + 行上下 padding 2*2 = 36，命中高 ≥36 即可。
+  /// （旧值 48 曾让圆环行比其他胶囊高一截、并被压在行右边缘。）
+  static const double hitSize = 36;
 
   int get percent => contextPercent(usedTokens, limitTokens);
 
@@ -84,7 +90,9 @@ class ContextMeter extends StatelessWidget {
         : 0.0;
 
     final pill = Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      key: const ValueKey('context-meter-pill'),
+      constraints: const BoxConstraints(minHeight: 32),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHigh,
         borderRadius: BorderRadius.circular(999),
@@ -107,11 +115,11 @@ class ContextMeter extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(width: 5),
+          const SizedBox(width: 6),
           Text(
             '$percent%',
             style: TextStyle(
-              fontSize: 11.5,
+              fontSize: 12,
               height: 1.1,
               color: cs.onSurfaceVariant,
               fontFeatures: const [FontFeature.tabularFigures()],
@@ -122,7 +130,7 @@ class ContextMeter extends StatelessWidget {
     );
 
     return Semantics(
-      label: '上下文已用 $percent%（仅附件估算，按 32k 估算）',
+      label: '约 $percent%（字符估算）',
       button: true,
       child: InkResponse(
         onTap: onTap ??
@@ -132,10 +140,9 @@ class ContextMeter extends StatelessWidget {
                   limitTokens: limitTokens,
                 ),
         radius: hitSize / 2,
-        // 命中区至少 48×48，但**宽度必须让 pill 自然增长**：
-        // 之前用 SizedBox(width: 48) 把 pill 的内部可用宽度压到 48-2*8-2*1=30，
-        // ring 14 + gap 5 + 「214%」≈ 26 就溢出（F21 宿主实测 13px / 超限 36px）。
-        // 这里只给**最小**尺寸，宽度随内容增长；文字与圆环都不缩小。
+        // F38 口径：命中高下限 36（= pill 32 + 行上下各 2），**不再为 48dp 撑高整行**；
+        // 宽度仍随内容自然增长（F21 踩过：SizedBox(width:48) 把 pill 内部压到 30，
+        // ring+gap+「214%」溢出 13px），所以只给最小尺寸、文字与圆环都不缩小。
         child: ConstrainedBox(
           constraints: const BoxConstraints(
             minWidth: hitSize,

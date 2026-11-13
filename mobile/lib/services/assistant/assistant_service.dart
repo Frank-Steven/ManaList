@@ -21,11 +21,22 @@ sealed class AssistantEvent {
   const AssistantEvent();
 }
 
-/// 首条用户消息派生对话标题（design-v3 §1.4 / assistant-v4-ui §9 验收）：
-/// 去首尾空白，超 20 字截断加省略号。纯函数便于单测。
+/// 首条用户消息派生对话标题（design-v3 §1.4 / assistant-v4-ui §9 验收）。
+///
+/// F37（2026-11-13）：旧实现把标题截到 20 字 + '…' **存库**，顶栏拿到的是
+/// 已被截断的短标题 —— 于是「长标题自动滚动」在物理上永远触发不了
+/// （20 字英文 ≈196dp < 可用 ~256dp），用户看到的「…」其实是库里存的省略号。
+/// 现在：折叠空白（换行/连续空白 → 单空格）+ trim，**保留全文**；
+/// 只有真超过 [kConversationTitleMaxLength] 才截断加省略号（防极端长文进标题）。
+/// 纯函数便于单测；旧会话不做数据迁移（历史标题保持原样）。
+const int kConversationTitleMaxLength = 120;
+
 String deriveConversationTitle(String firstMessage) {
-  final t = firstMessage.trim();
-  return t.length > 20 ? '${t.substring(0, 20)}…' : t;
+  final collapsed = firstMessage.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (collapsed.length > kConversationTitleMaxLength) {
+    return '${collapsed.substring(0, kConversationTitleMaxLength)}…';
+  }
+  return collapsed;
 }
 
 /// 可见文本增量（工具块内容不含在内）。
