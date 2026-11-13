@@ -305,20 +305,43 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
               '${defaultName != null ? '；默认：$defaultName' : ''}',
               style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
           for (final e in _remotes) _buildRemoteTile(e, cs),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-              onPressed: () => _openWizard(),
-              icon: const Icon(Icons.add),
-              label: const Text('添加远程接口'),
+          // 选择模式只用来选，增删改一律走「管理模型配置」。
+          if (!widget.selectionMode)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => _openWizard(),
+                icon: const Icon(Icons.add),
+                label: const Text('添加远程接口'),
+              ),
             ),
-          ),
+          if (widget.selectionMode) ...[
+            const Divider(height: 32),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.settings_outlined, size: 20),
+              title: const Text('管理模型配置'),
+              subtitle: const Text('测试连接 / 编辑 / 添加 / 删除接口'),
+              trailing: const Icon(Icons.chevron_right, size: 18),
+              onTap: _openManagePage,
+            ),
+          ],
         ],
       ),
     );
   }
 
   String onlineStatusHint(bool online) => online ? '模型由 LinkModel 管理' : '离线';
+
+  /// 选择页底部「管理模型配置」：进管理模式做增删改，返回后刷新列表
+  /// （可能在管理页改了默认接口 / 删了当前绑定的端点）。
+  Future<void> _openManagePage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const ModelPickerPage()),
+    );
+    if (!mounted) return;
+    await _load();
+  }
 
   Widget _buildDesktopModelTile(DesktopModelEntry m, ColorScheme cs) {
     final reachable = m.reachable;
