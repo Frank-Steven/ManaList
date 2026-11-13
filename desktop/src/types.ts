@@ -83,6 +83,8 @@ export interface ChatRequest {
   /** 对话绑定的模型配置 id，缺省用 defaultModelId */
   modelConfigId?: string;
   stream: boolean;
+  /** 推理强度（F35）：缺省/off 不发参数；low/medium/high → reasoning_effort */
+  reasoning?: "off" | "low" | "medium" | "high";
 }
 
 // ---- chat-response.schema.json（design-v3 §2、§5.4）----
@@ -93,6 +95,7 @@ export interface ChatRequest {
  */
 export type ChatEvent =
   | { type: "token_delta"; delta: string }
+  | { type: "reasoning_delta"; delta: string }
   | {
       type: "proposal";
       proposalId: string;

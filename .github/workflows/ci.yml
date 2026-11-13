@@ -52,4 +52,4 @@ jobs:
       - name: 类型检查与构建
         run: npm run build
       - name: 单元测试
-        run: npx tsx --test src/*.test.ts
+        run: npx tsx --test src/*.test.ts src/ai/*.test.ts

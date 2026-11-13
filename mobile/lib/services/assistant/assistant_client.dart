@@ -369,10 +369,14 @@ class AssistantClient {
     if (endpoint.apiKey.isNotEmpty) {
       req.headers['Authorization'] = 'Bearer ${endpoint.apiKey}';
     }
+    final reasoning = endpoint.reasoning;
+    final reasoningOn = reasoning != null && reasoning != AiEndpoint.reasoningOff;
     req.body = jsonEncode({
       'model': endpoint.model,
-      'temperature': 0,
+      // 推理模型不接受 temperature=0（部分端点直接 400），开启推理时省略。
+      if (!reasoningOn) 'temperature': 0,
       'stream': true,
+      if (reasoningOn) 'reasoning_effort': reasoning,
       'messages': buildRemoteMessages(messages,
           attachments: attachments,
           vision: visionAllowsImages(
@@ -404,9 +408,16 @@ class AssistantClient {
         final choices = json['choices'] as List?;
         if (choices == null || choices.isEmpty) continue;
         final delta = (choices.first as Map)['delta'];
-        final content = (delta is Map) ? delta['content'] : null;
-        if (content is String && content.isNotEmpty) {
-          yield ChatTokenDelta(content);
+        if (delta is Map) {
+          // 推理内容（DeepSeek reasoner / Kimi thinking 等）与正文分开上报。
+          final reasoning = delta['reasoning_content'] ?? delta['reasoning'];
+          if (reasoning is String && reasoning.isNotEmpty) {
+            yield ChatReasoningDelta(reasoning);
+          }
+          final content = delta['content'];
+          if (content is String && content.isNotEmpty) {
+            yield ChatTokenDelta(content);
+          }
         }
       }
       yield const ChatDone();

@@ -531,6 +531,8 @@ class InboxTriage {
           buf.write(delta);
         case ChatError(:final error):
           throw AiException(error);
+        case ChatReasoningDelta():
+          break; // 子调用只要最终判定文本，推理内容丢弃
         case ChatDone():
         case ChatProposalEvent():
           break; // 子调用不产工具块；桌面端也不透传 proposal 事件

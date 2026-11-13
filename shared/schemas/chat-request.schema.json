@@ -80,6 +80,11 @@
     "stream": {
       "type": "boolean",
       "description": "为 true 时以 SSE/NDJSON 流式返回 chat-response 事件；首版恒为 true"
+    },
+    "reasoning": {
+      "type": "string",
+      "enum": ["off", "low", "medium", "high"],
+      "description": "推理强度（F35）。缺省=不发推理参数（与旧版一致）；off=显式关闭；low/medium/high 映射为 reasoning_effort。可选"
     }
   }
 }

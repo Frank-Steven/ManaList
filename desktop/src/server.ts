@@ -248,6 +248,8 @@ export function createServer(opts: ServerOptions): http.Server {
         try {
           await provider.chat(buildProviderMessages(body, visionAllowsImages(visionSupport)), {
             onToken: (delta) => send({ type: "token_delta", delta }),
+            onReasoning: (delta) => send({ type: "reasoning_delta", delta }),
+            reasoning: body.reasoning,
           });
           send({ type: "done" });
           console.log(`[chat] 完成：${modelId}，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);

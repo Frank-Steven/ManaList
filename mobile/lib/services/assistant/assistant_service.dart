@@ -507,6 +507,9 @@ class AssistantService {
     var continuationRound = 0;
     // F33：本轮各段思考文本（section → 文本），回合收尾落库到 assistant 消息。
     final thinkingBySection = <int, String>{};
+    // F35：协议级推理内容（reasoning_content）单独占一个段号，避免与 <think> 段冲突。
+    const reasoningSection = 10000;
+    final reasoningBuf = StringBuffer();
 
     while (true) {
       final isContinuation = continuationRound > 0;
@@ -617,6 +620,13 @@ class AssistantService {
             for (final block in res.blocks) {
               await handleBlock(block);
             }
+          case ChatReasoningDelta():
+            // F35：协议级推理内容（reasoning_content）直接作为思考段上报，
+            // 不经过 <think> 解析器；与正文分段互不影响。
+            reasoningBuf.write(ev.delta);
+            thinkingBySection[reasoningSection] = reasoningBuf.toString();
+            handle._emit(AssistantThinkingDelta(
+                reasoningSection, reasoningBuf.toString(), true));
           case ChatProposalEvent():
             // desktop 不透传 proposal 事件（提案由手机端落库）；忽略。
             break;

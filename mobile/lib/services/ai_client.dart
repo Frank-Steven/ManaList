@@ -62,8 +62,16 @@ class AiEndpoint {
   /// null = 上次测试成功（或从未失败）。
   final String? lastError;
 
+  /// 推理强度（F35，2026-11-13）：null = 未配置（不发推理参数）、
+  /// off = 显式关闭、low/medium/high = 开启并发送 reasoning_effort。
+  /// 不配置时行为与旧版一致（只发 model/temperature/stream/messages）。
+  final String? reasoning;
+
   /// 最近一次测试成功的往返延迟（毫秒）；失败或从未测试时为 null。
   final int? lastLatencyMs;
+
+  static const reasoningOff = 'off';
+  static const reasoningLevels = <String>['off', 'low', 'medium', 'high'];
 
   const AiEndpoint({
     required this.id,
@@ -73,6 +81,7 @@ class AiEndpoint {
     this.model = '',
     this.isDesktop = false,
     this.vision,
+    this.reasoning,
     this.lastError,
     this.lastLatencyMs,
   });
@@ -96,6 +105,7 @@ class AiEndpoint {
       apiKey: json['apiKey'] as String? ?? '',
       model: json['model'] as String? ?? '',
       vision: vision,
+      reasoning: json['reasoning'] as String?,
       lastError: json['lastError'] as String?,
       lastLatencyMs: json['lastLatencyMs'] as int?,
     );
@@ -111,6 +121,7 @@ class AiEndpoint {
         // 未配置（null）时不写这两个键，读回来仍是 null。
         if (vision != null) 'vision': vision,
         if (vision != null) 'visionExplicit': true,
+        if (reasoning != null) 'reasoning': reasoning,
         if (lastError != null) 'lastError': lastError,
         if (lastLatencyMs != null) 'lastLatencyMs': lastLatencyMs,
       };
@@ -123,6 +134,7 @@ class AiEndpoint {
     String? apiKey,
     String? model,
     bool? Function()? vision,
+    String? Function()? reasoning,
     String? Function()? lastError,
     int? Function()? lastLatencyMs,
   }) =>
@@ -134,6 +146,7 @@ class AiEndpoint {
         model: model ?? this.model,
         isDesktop: isDesktop,
         vision: vision != null ? vision() : this.vision,
+        reasoning: reasoning != null ? reasoning() : this.reasoning,
         lastError: lastError != null ? lastError() : this.lastError,
         lastLatencyMs:
             lastLatencyMs != null ? lastLatencyMs() : this.lastLatencyMs,

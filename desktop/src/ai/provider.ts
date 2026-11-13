@@ -29,6 +29,10 @@ export function contentImageCount(content: string | ProviderContentPart[]): numb
 export interface ChatOptions {
   /** 每生成一段 delta 回调一次，供 /v1/chat 透传 token_delta 事件 */
   onToken?: (delta: string) => void;
+  /** 推理内容增量（reasoning_content），供 /v1/chat 透传 reasoning_delta 事件 */
+  onReasoning?: (delta: string) => void;
+  /** 推理强度（F35）：缺省/'off' 不发参数；low/medium/high → reasoning_effort */
+  reasoning?: "off" | "low" | "medium" | "high";
 }
 
 /**

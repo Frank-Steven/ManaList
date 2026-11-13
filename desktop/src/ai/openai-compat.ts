@@ -24,6 +24,9 @@ export class OpenAICompatProvider implements AIProvider {
       body: JSON.stringify({
         model: this.opts.model,
         stream: true,
+        ...(options?.reasoning && options.reasoning !== "off"
+          ? { reasoning_effort: options.reasoning }
+          : {}),
         messages,
       }),
     });
@@ -50,9 +53,17 @@ export class OpenAICompatProvider implements AIProvider {
           if (data === "[DONE]") continue;
           try {
             const json = JSON.parse(data) as {
-              choices?: Array<{ delta?: { content?: string } }>;
+              choices?: Array<{
+                delta?: { content?: string; reasoning_content?: string; reasoning?: string };
+              }>;
             };
-            const delta = json.choices?.[0]?.delta?.content;
+            const d = json.choices?.[0]?.delta;
+            // F35：推理内容单独回调，不混进正文（否则会污染工具块解析）。
+            const reasoning = d?.reasoning_content ?? d?.reasoning;
+            if (typeof reasoning === "string" && reasoning.length > 0) {
+              options?.onReasoning?.(reasoning);
+            }
+            const delta = d?.content;
             if (typeof delta === "string" && delta.length > 0) {
               full += delta;
               options?.onToken?.(delta);

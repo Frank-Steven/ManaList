@@ -195,6 +195,8 @@ sealed class ChatEvent {
     switch (json['type'] as String) {
       case 'token_delta':
         return ChatTokenDelta(json['delta'] as String);
+      case 'reasoning_delta':
+        return ChatReasoningDelta(json['delta'] as String);
       case 'proposal':
         return ChatProposalEvent(
           proposalId: json['proposalId'] as String,
@@ -223,6 +225,16 @@ class ChatTokenDelta extends ChatEvent {
 
   @override
   Map<String, dynamic> toJson() => {'type': 'token_delta', 'delta': delta};
+}
+
+/// 推理内容增量（reasoning_content / reasoning）。
+/// 与正文分开：不进 tool_parser，直接作为「思考」段展示（2026-11-13）。
+class ChatReasoningDelta extends ChatEvent {
+  final String delta;
+  const ChatReasoningDelta(this.delta);
+
+  @override
+  Map<String, dynamic> toJson() => {'type': 'reasoning_delta', 'delta': delta};
 }
 
 /// 原子工具调用提案事件：proposalId 由客户端生成，对应 change_proposals 落库。

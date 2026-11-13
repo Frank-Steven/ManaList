@@ -90,6 +90,18 @@ String testFailureAdvice(String error) {
   return '按上方错误信息排查；也可以先保存，稍后再测。';
 }
 
+/// F35：推理强度的说明文案（纯函数便于单测；null = 未配置/自动）。
+@visibleForTesting
+String reasoningWizardHint(String? reasoning) {
+  if (reasoning == null) {
+    return '自动：不发送 reasoning_effort，由上游按模型默认行为决定。';
+  }
+  if (reasoning == AiEndpoint.reasoningOff) {
+    return '关闭：显式 off，不发送 reasoning_effort。';
+  }
+  return '开启：发送 reasoning_effort="$reasoning"（部分推理模型不接受 temperature=0，开启时会省略 temperature）。';
+}
+
 enum _TestStatus { idle, testing, passed, failed }
 
 class ModelSetupWizardPage extends StatefulWidget {
@@ -112,6 +124,9 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
   late final TextEditingController _name;
   bool _obscureKey = true;
   bool? _vision; // null = 自动（按模型能力推断）
+  // F35：推理强度。null = 自动（不发送 reasoning_effort），off = 显式关闭，
+  // low/medium/high = 开启并发送。与 _vision 同构（null 表示“未配置”）。
+  String? _reasoning;
 
   _TestStatus _testStatus = _TestStatus.idle;
   String? _testMessage;
@@ -132,6 +147,7 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
     _model = TextEditingController(text: e?.model ?? '');
     _name = TextEditingController(text: e?.name ?? '');
     _vision = e?.vision;
+    _reasoning = e?.reasoning;
     if (_isEdit) _step = 1; // 编辑直接进入连接步，模板步可返回查看
   }
 
@@ -234,6 +250,7 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
       apiKey: _apiKey.text.trim(),
       model: model,
       vision: () => _vision,
+      reasoning: () => _reasoning,
     );
     await ai.upsertEndpoint(endpoint);
     // 第一个远程接口自动设为默认
@@ -506,6 +523,29 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
           padding: const EdgeInsets.only(top: 4),
           child: Text(visionSupportLabel(support),
               style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+        ),
+        const SizedBox(height: 8),
+        // F35：推理强度（与视觉下拉同构：null = 未配置/自动，其余为显式档位）。
+        // ⚠️ 临时入口：正式 UI 见 F36 调研后定稿（本下拉位置/文案可能整体调整）。
+        DropdownButtonFormField<String?>(
+          initialValue: _reasoning,
+          isExpanded: true,
+          decoration: const InputDecoration(labelText: '推理强度'),
+          items: const [
+            DropdownMenuItem(value: null, child: Text('自动（不发送）')),
+            DropdownMenuItem(value: 'off', child: Text('关闭（显式 off）')),
+            DropdownMenuItem(value: 'low', child: Text('低')),
+            DropdownMenuItem(value: 'medium', child: Text('中')),
+            DropdownMenuItem(value: 'high', child: Text('高')),
+          ],
+          onChanged: (v) => setState(() => _reasoning = v),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            reasoningWizardHint(_reasoning),
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+          ),
         ),
         if (_unverifiedSkip)
           Padding(
