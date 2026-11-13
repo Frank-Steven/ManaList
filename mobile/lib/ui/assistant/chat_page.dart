@@ -1098,8 +1098,6 @@ class _ChatPageState extends State<ChatPage> {
     return Scaffold(
       appBar: ChatAppBar(
         title: _conversation.title,
-        modelLabel: _modelLabel,
-        onModelTap: _switchModel,
         onRename: _rename,
         onExport: _export,
         onClearAndRestart: _clearAndRestart,

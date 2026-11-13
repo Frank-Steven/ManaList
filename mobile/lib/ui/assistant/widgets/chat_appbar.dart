@@ -3,14 +3,12 @@ import 'package:flutter/material.dart';
 import 'auto_scroll_title.dart';
 
 /// 对话页顶栏（assistant-v4-ui §3.2 组件拆分决策）：
-/// 标题（1 行省略）+ 模型状态行（点击唤模型选择器）+ ⋮ 溢出菜单。
+/// 标题（1 行省略）+ ⋮ 溢出菜单。
 ///
-/// 切换模型后果明示（2026-11-08 决策）：有在途回合时先弹
-/// [showModelSwitchConsequences] 说明 sheet，确认后才进选择器。
+/// F36 方案A：模型入口已下移到输入区上方的胶囊行，顶栏只留标题，
+/// 标题字号放大并与返回箭头同基线对齐（不再有第二行把标题顶高）。
 class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   final String title;
-  final String modelLabel;
-  final VoidCallback onModelTap;
   final VoidCallback onRename;
   final VoidCallback onExport;
   final VoidCallback onClearAndRestart;
@@ -19,8 +17,6 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
   const ChatAppBar({
     super.key,
     required this.title,
-    required this.modelLabel,
-    required this.onModelTap,
     required this.onRename,
     required this.onExport,
     required this.onClearAndRestart,
@@ -32,43 +28,16 @@ class ChatAppBar extends StatelessWidget implements PreferredSizeWidget {
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
     return AppBar(
-      title: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // F21 审批稿「标题方案③」：溢出才自动滚动，可手动拖、hover/触摸/
-          // 聚焦即停；非溢出静止、系统「减少动态效果」时也不自动滚。
-          AutoScrollTitle(
-            text: title,
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                ),
-          ),
-          InkWell(
-            onTap: onModelTap,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Flexible(
-                    child: Text(
-                      modelLabel,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                          fontSize: 12, color: cs.onSurfaceVariant),
-                    ),
-                  ),
-                  Icon(Icons.expand_more,
-                      size: 14, color: cs.onSurfaceVariant),
-                ],
-              ),
-            ),
-          ),
-        ],
+      // F21 审批稿「标题方案③」：溢出才自动滚动，可手动拖、hover/触摸/
+      // 聚焦即停；非溢出静止、系统「减少动态效果」时也不自动滚。
+      title: AutoScrollTitle(
+        text: title,
+        style: const TextStyle(
+          fontSize: 19,
+          fontWeight: FontWeight.w600,
+          height: 1.2,
+        ),
       ),
       actions: [
         PopupMenuButton<String>(
