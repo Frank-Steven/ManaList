@@ -237,12 +237,15 @@ class AssistantClient {
   ///
   /// [messages] 为完整请求消息序列（含说明书前言），按时间升序；
   /// [attachments] 为本轮展开后的附件上下文块（带 [#note:标题] 引用头）；
-  /// [modelConfigId] 为对话绑定的模型配置（desktop 模型 id 或远程端点 id）。
+  /// [modelConfigId] 为对话绑定的模型配置（desktop 模型 id 或远程端点 id）；
+  /// [reasoning] 为本回合**生效**的推理档位（对话级临时覆盖优先，见 F36）：
+  /// null = 自动（不发参数）、off = 显式关闭（不发）、low/medium/high = 发 reasoning_effort。
   Stream<ChatEvent> chat({
     required String conversationId,
     required List<ChatMessageModel> messages,
     List<ChatAttachment> attachments = const [],
     String? modelConfigId,
+    String? reasoning,
   }) async* {
     _cancelled = false;
     final ai = AiClient.instance;
@@ -251,7 +254,7 @@ class AssistantClient {
     if (modelConfigId != null) {
       for (final e in await ai.getRemoteEndpoints()) {
         if (e.id == modelConfigId) {
-          yield* _chatViaRemote(e, messages, attachments);
+          yield* _chatViaRemote(e, messages, attachments, reasoning: reasoning);
           return;
         }
       }
@@ -266,6 +269,7 @@ class AssistantClient {
         messages: messages,
         attachments: attachments,
         modelConfigId: modelConfigId,
+        reasoning: reasoning,
       );
       return;
     }
@@ -276,7 +280,7 @@ class AssistantClient {
       yield const ChatError('LinkModel 不在线且未配置远程 AI 接口（助理 → 模型配置）');
       return;
     }
-    yield* _chatViaRemote(endpoint, messages, attachments);
+    yield* _chatViaRemote(endpoint, messages, attachments, reasoning: reasoning);
   }
 
   // ---- 电脑端通道：POST /v1/chat，SSE（data: {...}） ----
@@ -286,6 +290,7 @@ class AssistantClient {
     required List<ChatMessageModel> messages,
     required List<ChatAttachment> attachments,
     String? modelConfigId,
+    String? reasoning,
   }) async* {
     final ai = AiClient.instance;
     final baseUrl = await ai.getDesktopBaseUrl();
@@ -300,6 +305,8 @@ class AssistantClient {
         if (attachments.isNotEmpty)
           'attachments': [for (final a in attachments) a.toJson()],
         if (modelConfigId != null) 'modelConfigId': modelConfigId,
+        // F36：对话级生效档位（null/off 由 desktop 侧决定不发参数）。
+        if (reasoning != null) 'reasoning': reasoning,
         'stream': true,
       });
       return req;
@@ -357,7 +364,8 @@ class AssistantClient {
   /// [attachments] 为本轮展开后的附件上下文块；端点声明 vision 时
   /// 内联图像以 content parts 发送，否则仅文本（组装见 buildRemoteMessages）。
   Stream<ChatEvent> _chatViaRemote(AiEndpoint endpoint,
-      List<ChatMessageModel> messages, List<ChatAttachment> attachments) async* {
+      List<ChatMessageModel> messages, List<ChatAttachment> attachments,
+      {String? reasoning}) async* {
     final hint = AiClient.endpointConfigHint(endpoint.baseUrl);
     if (hint != null) {
       yield ChatError(hint);
@@ -369,14 +377,16 @@ class AssistantClient {
     if (endpoint.apiKey.isNotEmpty) {
       req.headers['Authorization'] = 'Bearer ${endpoint.apiKey}';
     }
-    final reasoning = endpoint.reasoning;
-    final reasoningOn = reasoning != null && reasoning != AiEndpoint.reasoningOff;
+    // F36：对话级临时覆盖优先；未覆盖时回落到端点配置。
+    final effective = reasoning ?? endpoint.reasoning;
+    final reasoningOn =
+        effective != null && effective != AiEndpoint.reasoningOff;
     req.body = jsonEncode({
       'model': endpoint.model,
       // 推理模型不接受 temperature=0（部分端点直接 400），开启推理时省略。
       if (!reasoningOn) 'temperature': 0,
       'stream': true,
-      if (reasoningOn) 'reasoning_effort': reasoning,
+      if (reasoningOn) 'reasoning_effort': effective,
       'messages': buildRemoteMessages(messages,
           attachments: attachments,
           vision: visionAllowsImages(
@@ -410,9 +420,11 @@ class AssistantClient {
         final delta = (choices.first as Map)['delta'];
         if (delta is Map) {
           // 推理内容（DeepSeek reasoner / Kimi thinking 等）与正文分开上报。
-          final reasoning = delta['reasoning_content'] ?? delta['reasoning'];
-          if (reasoning is String && reasoning.isNotEmpty) {
-            yield ChatReasoningDelta(reasoning);
+          // 注意：别复用外层参数名 reasoning（会遮蔽入参）。
+          final reasoningChunk =
+              delta['reasoning_content'] ?? delta['reasoning'];
+          if (reasoningChunk is String && reasoningChunk.isNotEmpty) {
+            yield ChatReasoningDelta(reasoningChunk);
           }
           final content = delta['content'];
           if (content is String && content.isNotEmpty) {

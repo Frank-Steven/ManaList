@@ -110,12 +110,17 @@ class AssistantTurnHandle {
     required this.conversation,
     required this.text,
     required this.attachments,
+    this.reasoning,
   });
 
   /// 启动时的对话快照（modelConfigId 取自它）。
   final Conversation conversation;
   final String text;
   final List<ChatAttachment> attachments;
+
+  /// F36：本回合**生效**的推理档位（对话级临时覆盖 ?? 端点配置）。
+  /// null/off 都不发参数；low/medium/high 发 reasoning_effort。
+  final String? reasoning;
 
   String get conversationId => conversation.id;
 
@@ -313,11 +318,13 @@ class AssistantService {
     required Conversation conversation,
     required String text,
     List<ChatAttachment> attachments = const [],
+    String? reasoning,
   }) =>
       startTurn(
               conversation: conversation,
               text: text,
-              attachments: attachments)
+              attachments: attachments,
+              reasoning: reasoning)
           .events;
 
   /// 发起一个回合（立即返回 handle，pump 后台自持）。
@@ -326,10 +333,14 @@ class AssistantService {
     required Conversation conversation,
     required String text,
     List<ChatAttachment> attachments = const [],
+    String? reasoning,
   }) {
     cancelTurn(conversation.id);
     final handle = AssistantTurnHandle._(
-        conversation: conversation, text: text, attachments: attachments)
+        conversation: conversation,
+        text: text,
+        attachments: attachments,
+        reasoning: reasoning)
       ..channel = _newChannel();
     // 阶段变化同步通知（对话列表指示：思考中 → 回复中 → 工具执行中）
     handle.phase.addListener(() => turnsVersion.value++);
@@ -370,7 +381,8 @@ class AssistantService {
   /// 重试一条 assistant 回复：删除自触发它的用户消息起的全部后续消息
   /// （pending 提案一并撤销），用原用户消息内容/附件重跑回合。
   Future<AssistantTurnHandle?> retryAssistantMessage(
-      Conversation conversation, String assistantMessageId) async {
+      Conversation conversation, String assistantMessageId,
+      {String? reasoning}) async {
     final db = AppDatabase.instance;
     final messages = await db.getChatMessages(conversation.id);
     final idx = messages.indexWhere((m) => m.id == assistantMessageId);
@@ -387,13 +399,15 @@ class AssistantService {
     return startTurn(
         conversation: conversation,
         text: userMsg.content,
-        attachments: userMsg.attachments);
+        attachments: userMsg.attachments,
+        reasoning: reasoning);
   }
 
   /// 编辑用户消息：删除该消息及后续（pending 提案撤销），用新文本
   /// （沿用原附件）重跑回合。
   Future<AssistantTurnHandle?> editUserMessage(
-      Conversation conversation, String messageId, String newText) async {
+      Conversation conversation, String messageId, String newText,
+      {String? reasoning}) async {
     final db = AppDatabase.instance;
     final messages = await db.getChatMessages(conversation.id);
     final idx = messages.indexWhere((m) => m.id == messageId);
@@ -403,7 +417,8 @@ class AssistantService {
     return startTurn(
         conversation: conversation,
         text: newText,
-        attachments: original.attachments);
+        attachments: original.attachments,
+        reasoning: reasoning);
   }
 
   /// 撤回用户消息：删除该消息及后续（pending 提案撤销），不重跑。
@@ -604,6 +619,8 @@ class AssistantService {
         messages: requestMessages,
         attachments: expanded,
         modelConfigId: conversation.modelConfigId,
+        // F36：本回合生效的推理档位（对话级覆盖 ?? 端点配置）。
+        reasoning: handle.reasoning,
       )) {
         switch (ev) {
           case ChatTokenDelta():

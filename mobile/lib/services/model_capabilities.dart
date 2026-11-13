@@ -95,6 +95,48 @@ VisionSupport resolveVisionSupport({required String model, bool? configured}) {
 bool visionAllowsImages(VisionSupport support) =>
     support == VisionSupport.supported;
 
+// ---- F36（2026-11-13）：推理强度能力判定 ----
+
+/// 已知支持「推理强度参数」（`reasoning_effort` / thinking 档位）的模型白名单。
+///
+/// 保守列举，规则**宁可少不可多**：不确定的一律 false（不发参数 = 旧行为）。
+/// 判定用 [normalizeModelId] 归一后的小写串做子串/前缀匹配：
+/// - DeepSeek 推理系（deepseek-reasoner / deepseek-r1 系列）；
+/// - 名字里带 thinking 的（kimi thinking / qwen thinking / glm thinking 等）；
+/// - OpenAI o1 / o3 / o4 推理系列；
+/// - 阿里 QwQ 推理系列。
+bool isKnownReasoningModel(String model) {
+  final m = normalizeModelId(model).toLowerCase();
+  if (m.isEmpty) return false;
+  if (m.contains('deepseek-reasoner')) return true;
+  if (m.contains('deepseek-r1')) return true;
+  // kimi / qwen / glm 的 thinking 型号（如 kimi-k2-thinking、glm-4.6-thinking）
+  if (m.contains('thinking')) return true;
+  // QwQ（阿里推理系列）
+  if (m.contains('qwq')) return true;
+  // OpenAI o 系列推理模型：o1 / o1-mini / o3 / o3-mini / o4-mini …
+  if (RegExp(r'^o[134](?:$|-)').hasMatch(m)) return true;
+  return false;
+}
+
+/// 解析「该模型是否支持推理强度参数」。
+///
+/// [configured] 是端点上用户显式配置的档位（null/off/low/medium/high）：
+/// **非空即视为用户明确表态支持**（与视觉三态同理，显式优先于能力表）。
+bool resolveReasoningSupport({required String model, String? configured}) {
+  final c = configured?.trim();
+  if (c != null && c.isNotEmpty) return true;
+  return isKnownReasoningModel(model);
+}
+
+/// 该档位是否要真的发送 `reasoning_effort`：null（自动）与 off（显式关闭）都**不发**。
+bool shouldSendReasoningEffort(String? effective) {
+  final v = effective?.trim();
+  if (v == null || v.isEmpty) return false;
+  if (v == 'off') return false;
+  return v == 'low' || v == 'medium' || v == 'high';
+}
+
 /// 表单里的完整文案：视觉：支持 / 视觉：已关闭 / 视觉：未确认。
 String visionSupportLabel(VisionSupport support) => switch (support) {
       VisionSupport.supported => '视觉：支持',

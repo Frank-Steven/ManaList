@@ -45,6 +45,7 @@ class _ScriptedClient extends AssistantClient {
     required List<ChatMessageModel> messages,
     List<ChatAttachment> attachments = const [],
     String? modelConfigId,
+    String? reasoning,
   }) async* {
     final i = calls.length;
     calls.add(List<ChatMessageModel>.of(messages));

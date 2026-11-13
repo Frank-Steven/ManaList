@@ -15,6 +15,7 @@ import '../../services/ai_client.dart';
 import '../../services/assistant/assistant_client.dart';
 import '../../services/database.dart';
 import '../../services/library_file_service.dart';
+import '../../services/model_capabilities.dart';
 import '../library/files_page.dart' show libraryFileIcon;
 import 'approvals_page.dart';
 import 'model_picker.dart';
@@ -27,6 +28,7 @@ import 'widgets/collapsible_content.dart';
 import 'widgets/input_bar.dart';
 import 'widgets/process_section.dart';
 import 'widgets/proposal_card.dart';
+import 'widgets/reasoning_pill_row.dart';
 import 'widgets/streaming_blocks.dart';
 import 'widgets/suggestion_chips.dart';
 import 'widgets/tool_steps_group.dart';
@@ -143,6 +145,41 @@ class _ChatPageState extends State<ChatPage> {
   /// null = 还在解析；解析失败/已失效会写成「模型配置已失效」，绝不回退显示 id。
   String? _modelDisplayName;
 
+  // ---- F36：思考强度（对话级临时覆盖，不写回端点）----
+  /// 能力判定用的模型名（远程端点的 model，或 desktop 模型 id）。
+  String? _capabilityModel;
+
+  /// 端点自身配置的推理档位（null = 未配置/自动）。
+  String? _endpointReasoning;
+
+  /// 本对话的临时覆盖：null = 跟随端点默认；用户只改这里，不写回端点。
+  String? _reasoningOverride;
+
+  bool _reasoningPanelOpen = false;
+
+  /// 该模型是否支持推理强度（不支持时隐藏思考强度胶囊）。
+  bool get _reasoningSupported => resolveReasoningSupport(
+        model: _capabilityModel ?? '',
+        configured: _endpointReasoning,
+      );
+
+  /// 本回合真正生效的档位：对话级覆盖优先，其次端点配置。
+  String? get _effectiveReasoning =>
+      _reasoningOverride ?? _endpointReasoning;
+
+  /// 上下文圆环的**近似**用量：历史字符 / 4 + 草稿附件 token 估算。
+  int get _approxContextTokens {
+    var chars = 0;
+    for (final m in _messages) {
+      chars += m.content.length;
+    }
+    return estimateContextTokens(
+      historyChars: chars,
+      attachmentTokens:
+          _pendingAttachments.isEmpty ? 0 : _pendingAttachmentTokens,
+    );
+  }
+
   /// 空对话建议 chips（assistant-v4-ui §3.8）；非空对话恒为空表。
   List<String> _suggestions = [];
 
@@ -246,11 +283,28 @@ class _ChatPageState extends State<ChatPage> {
   /// 顺序：① 本地远程接口（`AiEndpoint.id == id` → `name`）；
   /// ② 桌面在线时 `/v1/models`（`DesktopModelEntry.id == id` → `name`）；
   /// ③ 都找不到 → 「模型配置已失效」。**任何情况下都不显示 id/指纹**。
+  ///
+  /// F36：同一次解析顺便缓存「能力判定用的模型名」与「端点配置的推理档位」，
+  /// 供输入区上方的思考强度胶囊判断是否显示（不额外发请求）。
   Future<void> _refreshModelDisplayName() async {
     final id = _conversation.modelConfigId;
+    String? capModel;
+    String? capReasoning;
     if (id == null || id.isEmpty) {
+      // 默认模型：取默认远程端点（可能没有 → 能力判定按未知处理）。
+      try {
+        final ep = await AiClient.instance.defaultRemoteEndpoint();
+        capModel = ep?.model;
+        capReasoning = ep?.reasoning;
+      } catch (e, st) {
+        AppLog.instance.warn('chat.default-model', e, st);
+      }
       if (!mounted) return;
-      setState(() => _modelDisplayName = '默认模型');
+      setState(() {
+        _modelDisplayName = '默认模型';
+        _capabilityModel = capModel;
+        _endpointReasoning = capReasoning;
+      });
       return;
     }
     String? name;
@@ -258,6 +312,8 @@ class _ChatPageState extends State<ChatPage> {
       for (final e in await AiClient.instance.getRemoteEndpoints()) {
         if (e.id == id) {
           name = e.name;
+          capModel = e.model;
+          capReasoning = e.reasoning;
           break;
         }
       }
@@ -277,8 +333,12 @@ class _ChatPageState extends State<ChatPage> {
     }
     if (!mounted) return;
     final trimmed = name?.trim();
-    setState(() => _modelDisplayName =
-        (trimmed != null && trimmed.isNotEmpty) ? trimmed : '模型配置已失效');
+    setState(() {
+      _modelDisplayName =
+          (trimmed != null && trimmed.isNotEmpty) ? trimmed : '模型配置已失效';
+      _capabilityModel = capModel ?? id;
+      _endpointReasoning = capReasoning;
+    });
   }
 
   /// 顶栏模型行文案：解析中先显示占位，**绝不闪现 id**。
@@ -812,6 +872,8 @@ class _ChatPageState extends State<ChatPage> {
       conversation: _conversation,
       text: text,
       attachments: attachments,
+      // F36：本对话的临时覆盖（不写回端点）优先，其次端点配置。
+      reasoning: _effectiveReasoning,
     ));
   }
 
@@ -943,7 +1005,8 @@ class _ChatPageState extends State<ChatPage> {
       _errorDiag = null;
     });
     final handle = await AssistantService.instance
-        .retryAssistantMessage(_conversation, m.id);
+        .retryAssistantMessage(_conversation, m.id,
+            reasoning: _effectiveReasoning);
     if (!mounted) return;
     await _reload();
     if (handle != null) _attachTurn(handle);
@@ -996,7 +1059,8 @@ class _ChatPageState extends State<ChatPage> {
       _errorDiag = null;
     });
     final handle = await AssistantService.instance
-        .editUserMessage(_conversation, m.id, newText);
+        .editUserMessage(_conversation, m.id, newText,
+            reasoning: _effectiveReasoning);
     if (!mounted) return;
     await _reload();
     if (handle != null) _attachTurn(handle);
@@ -1061,9 +1125,38 @@ class _ChatPageState extends State<ChatPage> {
             pendingCount: _pendingProposalCount,
             onStop: _busy ? _cancel : null,
           ),
+          // F36 方案A：胶囊行（模型胶囊最左 + 思考强度胶囊 + 右侧上下文圆环）。
+          ReasoningPillRow(
+            modelLabel: _modelLabel,
+            onModelTap: _switchModel,
+            reasoningText: reasoningPillText(_effectiveReasoning),
+            reasoningActive: _effectiveReasoning != null,
+            showReasoning: _reasoningSupported,
+            onReasoningTap: () => setState(
+                () => _reasoningPanelOpen = !_reasoningPanelOpen),
+            usedTokens: _approxContextTokens,
+            limitTokens: kDefaultContextTokenLimit,
+          ),
+          // 档位面板：整宽贴在输入区上方（不是跟随胶囊的浮层）。
+          if (_reasoningPanelOpen && _reasoningSupported)
+            ReasoningPanel(
+              selected: _effectiveReasoning,
+              onSelect: (level) => setState(() {
+                _reasoningOverride = level;
+                _reasoningPanelOpen = false;
+              }),
+              onClose: () => setState(() => _reasoningPanelOpen = false),
+            ),
           // F03 Step2（2026-11-03）：草稿含图片时显示「单张成条 + 敏感信息离设备」提示。
           if (_hasScreenshotAttachments) _buildScreenshotsHint(cs),
-          ChatInputBar(
+          // 点输入区即收起档位面板（Listener 不消费事件，不影响输入框交互）。
+          Listener(
+            onPointerDown: (_) {
+              if (_reasoningPanelOpen) {
+                setState(() => _reasoningPanelOpen = false);
+              }
+            },
+            child: ChatInputBar(
             controller: _input,
             busy: _busy,
             // 停止键已在主进行态条上：这里只留 48dp 占位，避免布局跳动。
@@ -1077,6 +1170,16 @@ class _ChatPageState extends State<ChatPage> {
             onPickScreenshots: _pickScreenshots,
             onSend: _send,
             onCancel: _cancel,
+            ),
+          ),
+          // F36：输入框下方一行灰字免责声明。
+          Padding(
+            padding: const EdgeInsets.only(bottom: 2),
+            child: Text(
+              kAiContentDisclaimer,
+              key: const ValueKey('ai-content-disclaimer'),
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+            ),
           ),
         ],
       ),

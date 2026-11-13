@@ -25,6 +25,7 @@ class _MockAssistantClient extends AssistantClient {
     required List<ChatMessageModel> messages,
     List<ChatAttachment> attachments = const [],
     String? modelConfigId,
+    String? reasoning,
   }) async* {
     capturedInputs.add(messages.isEmpty ? '' : messages.last.content);
     yield ChatTokenDelta('回复${capturedInputs.length}');
