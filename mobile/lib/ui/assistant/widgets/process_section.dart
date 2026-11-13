@@ -46,7 +46,9 @@ class _ProcessSectionState extends State<ProcessSection> {
             title: widget.summary,
             expanded: _open,
             onTap: () => setState(() => _open = !_open),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            // 右内边距 = 12(本行) + 内层卡片缩进12 + 内层头部8，减掉外框1dp边框，
+            // 让外层三角与内层各行的三角落在同一条右竖线上（真机曾差 26px）。
+            padding: const EdgeInsets.fromLTRB(12, 8, 20.5, 8),
             titleSize: 12,
           ),
           if (_open)
