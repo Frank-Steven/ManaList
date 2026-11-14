@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../../services/assistant/models.dart';
 import 'attachment_cards.dart';
+import '../../../services/context_window.dart';
 import 'context_meter.dart';
 
 /// `/` 快捷指令集（assistant-v4-ui §3.6）：指令名 → 提示词模板。
@@ -46,7 +47,12 @@ class ChatInputBar extends StatefulWidget {
   final int? attachmentTokens;
 
   /// 模型上下文上限（token）；无数据时按 32k。
+  /// F44：调用方应传 `resolveContextWindow(...).tokens`（端点自报 > 模型表 >
+  /// 用户自填 > 32k），让附件预算与上方圆环用同一个分母。
   final int tokenLimit;
+
+  /// F44：上限来源（含来源文案）；透传给 ContextMeter，保证两处口径一致。
+  final ContextWindowInfo? window;
 
   /// 回合中是否显示「停止」键。
   /// F21 第②阶段起主进行态条上有唯一停止键，输入栏 busy 时只留占位
@@ -66,6 +72,7 @@ class ChatInputBar extends StatefulWidget {
     required this.onCancel,
     this.attachmentTokens,
     this.tokenLimit = kDefaultContextTokenLimit,
+    this.window,
     this.showStopButton = true,
   });
 
@@ -180,10 +187,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   /// 上下文指示器（F21 审批稿 / DSH ContextMeter 实证最小版）：
-  /// 折叠态 = 14px 圆环 + NN%；点击 → 底部 sheet（只有「附件（估算）」一行）。
+  /// 折叠态 = 16px 圆环 + NN%/<1%；点击 → 底部 sheet（估算或真实 usage）。
   ///
-  /// 数据口径见 context_meter.dart：上限是 App 现值 32768（模型未声明窗口），
-  /// 面板明确写「按 32k 估算」，不伪造系统提示词/工具定义/对话三类。
+  /// 数据口径见 context_meter.dart；**上限不再写死 32k**：由调用方传入
+  /// [tokenLimit]（F41 解析结果）与 [window]（F44 来源），与输入区上方圆环同源。
   /// 超预算时发送键仍由 budgetLevel 拦截（见 _buildSendButton），行为不变。
   Widget _buildContextIndicator() {
     return Padding(
@@ -191,6 +198,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
       child: ContextMeter(
         usedTokens: widget.attachmentTokens!,
         limitTokens: widget.tokenLimit,
+        window: widget.window,
       ),
     );
   }

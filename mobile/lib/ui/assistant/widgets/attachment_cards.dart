@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../../../models/library_file.dart';
 import '../../../services/assistant/models.dart';
+import '../../../services/context_window.dart';
 import '../../../services/notification_bridge.dart';
 import '../../library/files_page.dart' show libraryFileIcon;
 
@@ -92,7 +93,9 @@ int sumAttachmentTokens(Iterable<AttachmentMeta?> metas) {
 enum BudgetLevel { normal, warning, over }
 
 /// 模型上下文上限缺省值：模型配置无数据时按 32k（§3.6）。
-const int kDefaultContextTokenLimit = 32768;
+/// 别名（F44 去重）：唯一定义在 services/context_window.dart 的
+/// kAssumedContextTokenLimit，**勿再写字面量**。
+const int kDefaultContextTokenLimit = kAssumedContextTokenLimit;
 
 BudgetLevel budgetLevel(int usedTokens, int limitTokens) {
   if (limitTokens <= 0 || usedTokens <= 0) return BudgetLevel.normal;

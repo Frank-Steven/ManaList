@@ -59,8 +59,11 @@ int estimateContextTokens({
 }
 
 /// 圆环的「约 N%（字符估算）」文案。
+///
+/// F43 口径：必须走 [contextPercentLabel]（<1% 不显示成 0%），否则与胶囊/面板
+/// 的口径不一致。**当前仅测试引用**；生产路径用 ContextMeter 的 percentLabel。
 String contextEstimateText(int usedTokens, int limitTokens) =>
-    "约 ${contextPercent(usedTokens, limitTokens)}%（字符估算）";
+    "约 ${contextPercentLabel(usedTokens, limitTokens)}（字符估算）";
 
 /// 上下文用量说明（底部 sheet）。
 ///

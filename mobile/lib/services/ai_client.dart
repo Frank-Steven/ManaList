@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'model_capabilities.dart' show normalizeModelId;
 import 'secret_store.dart';
 import 'package:uuid/uuid.dart';
 
@@ -71,8 +72,12 @@ class AiEndpoint {
   final int? lastLatencyMs;
 
   /// F41：用户在端点上手动填的上下文窗口（tokens）；null = 未配置。
-  /// 本轮不提供向导 UI，只在解析层参与优先级（configured 最高）。
+  /// F44 起优先级降到「端点自报 / 官方模型表」之后（用户自填可能过时）。
   final int? contextWindow;
+
+  /// F44：连通性测试时上游 /models 自报的上下文窗口（tokens）；null = 上游没给。
+  /// 与 [lastError]/[lastLatencyMs] 同一套诊断持久化方式。
+  final int? contextWindowFromEndpoint;
 
   static const reasoningOff = 'off';
   static const reasoningLevels = <String>['off', 'low', 'medium', 'high'];
@@ -87,6 +92,7 @@ class AiEndpoint {
     this.vision,
     this.reasoning,
     this.contextWindow,
+    this.contextWindowFromEndpoint,
     this.lastError,
     this.lastLatencyMs,
   });
@@ -112,6 +118,8 @@ class AiEndpoint {
       vision: vision,
       reasoning: json['reasoning'] as String?,
       contextWindow: (json['contextWindow'] as num?)?.toInt(),
+      contextWindowFromEndpoint:
+          (json['contextWindowFromEndpoint'] as num?)?.toInt(),
       lastError: json['lastError'] as String?,
       lastLatencyMs: json['lastLatencyMs'] as int?,
     );
@@ -129,6 +137,8 @@ class AiEndpoint {
         if (vision != null) 'visionExplicit': true,
         if (reasoning != null) 'reasoning': reasoning,
         if (contextWindow != null) 'contextWindow': contextWindow,
+        if (contextWindowFromEndpoint != null)
+          'contextWindowFromEndpoint': contextWindowFromEndpoint,
         if (lastError != null) 'lastError': lastError,
         if (lastLatencyMs != null) 'lastLatencyMs': lastLatencyMs,
       };
@@ -143,6 +153,7 @@ class AiEndpoint {
     bool? Function()? vision,
     String? Function()? reasoning,
     int? Function()? contextWindow,
+    int? Function()? contextWindowFromEndpoint,
     String? Function()? lastError,
     int? Function()? lastLatencyMs,
   }) =>
@@ -157,6 +168,9 @@ class AiEndpoint {
         reasoning: reasoning != null ? reasoning() : this.reasoning,
         contextWindow:
             contextWindow != null ? contextWindow() : this.contextWindow,
+        contextWindowFromEndpoint: contextWindowFromEndpoint != null
+            ? contextWindowFromEndpoint()
+            : this.contextWindowFromEndpoint,
         lastError: lastError != null ? lastError() : this.lastError,
         lastLatencyMs:
             lastLatencyMs != null ? lastLatencyMs() : this.lastLatencyMs,
@@ -176,10 +190,14 @@ class EndpointTestResult {
   final String message;
   final List<String> modelIds;
   final int latencyMs;
+
+  /// F44：上游 /models 自报的上下文窗口（tokens）；null = 没给/冲突。
+  final int? contextWindow;
   const EndpointTestResult({
     required this.message,
     this.modelIds = const [],
     required this.latencyMs,
+    this.contextWindow,
   });
 }
 
@@ -483,17 +501,25 @@ class AiClient {
     // 成功时把模型 id 列出来（U1/N2）：上游只校验 /models 不校验模型名，
     // 用户很容易填成版本号（如 DeepSeek-V41-Flash）导致真实调用 400。
     final ids = <String>[];
+    final entries = <Map<dynamic, dynamic>>[];
     try {
       final data = (jsonDecode(resp.body) as Map).cast<String, dynamic>();
       final list = data['data'];
       if (list is List) {
         for (final m in list) {
-          if (m is Map && m['id'] is String) ids.add(m['id'] as String);
+          if (m is Map) {
+            entries.add(m);
+            if (m['id'] is String) ids.add(m['id'] as String);
+          }
         }
       }
     } catch (e, st) { AppLog.instance.warn('ai.parse-models', e, st); }
     final latency = watch.elapsedMilliseconds;
-    await recordEndpointTestResult(endpoint.id, latencyMs: latency);
+    // F44：上游自报的上下文窗口（多条目冲突则不猜）。
+    final reportedWindow = pickContextWindowFromModels(
+        entries: entries, model: endpoint.model);
+    await recordEndpointTestResult(endpoint.id,
+        latencyMs: latency, contextWindow: reportedWindow);
     final String message;
     if (ids.isEmpty) {
       message = '连通正常';
@@ -503,19 +529,70 @@ class AiClient {
           '连通正常（${ids.length} 个模型：$shown${ids.length > 5 ? '…' : ''}）';
     }
     return EndpointTestResult(
-        message: message, modelIds: ids, latencyMs: latency);
+        message: message,
+        modelIds: ids,
+        latencyMs: latency,
+        contextWindow: reportedWindow);
+  }
+
+  /// F44：从 /models 的单个 entry 里读上下文窗口。
+  /// 不同上游键名不同，按顺序尝试（num 且 >0 才算）。
+  static int? contextWindowFromModelEntry(Map<dynamic, dynamic> entry) {
+    for (final key in const [
+      'context_length',
+      'max_model_len',
+      'max_input_tokens',
+      'context_window',
+      'context_window_tokens',
+    ]) {
+      final v = entry[key];
+      if (v is num && v > 0) return v.toInt();
+    }
+    return null;
+  }
+
+  /// F44：从整份 /models 里挑一个可信的上下文窗口。
+  /// 规则：① 优先 id 归一后与 [model] 相等的条目；
+  /// ② 否则若所有非空窗口取值一致 → 用它；③ 多个冲突 → null（不猜）。
+  static int? pickContextWindowFromModels({
+    required List<Map<dynamic, dynamic>> entries,
+    required String model,
+  }) {
+    final wanted = normalizeModelId(model).toLowerCase();
+    final windows = <int>[];
+    int? matched;
+    for (final entry in entries) {
+      final window = contextWindowFromModelEntry(entry);
+      if (window == null) continue;
+      windows.add(window);
+      if (matched == null && wanted.isNotEmpty) {
+        final id = entry['id'];
+        if (id is String &&
+            normalizeModelId(id).toLowerCase() == wanted) {
+          matched = window;
+        }
+      }
+    }
+    if (matched != null) return matched;
+    final distinct = windows.toSet();
+    return distinct.length == 1 ? distinct.first : null;
   }
 
   /// 把一次连通性测试的诊断写到已保存的端点上；端点不存在（临时配置）时跳过。
   /// 成功：error 传 null（清掉旧失败记录）+ latencyMs；失败：error 传原因、延迟清空。
+  /// F44：[contextWindow] 为上游 /models 自报的窗口——**成功时写入**（null 表示
+  /// 上游没给/冲突 → 清掉落盘值）；**失败时保留旧值**（沿用 lastError 的语义：
+  /// 一次探测失败不应抹掉上次成功拿到的能力信息）。
   Future<void> recordEndpointTestResult(String endpointId,
-      {String? error, int? latencyMs}) async {
+      {String? error, int? latencyMs, int? contextWindow}) async {
     final list = await getRemoteEndpoints();
     final i = list.indexWhere((e) => e.id == endpointId);
     if (i < 0) return;
     list[i] = list[i].copyWith(
       lastError: () => error,
       lastLatencyMs: () => error == null ? latencyMs : null,
+      contextWindowFromEndpoint:
+          error == null ? () => contextWindow : null,
     );
     await _saveRemoteEndpoints(list);
   }

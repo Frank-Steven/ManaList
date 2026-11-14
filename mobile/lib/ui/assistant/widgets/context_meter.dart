@@ -5,10 +5,13 @@ import 'package:flutter/material.dart';
 import '../../../services/assistant/models.dart';
 import '../../../services/context_window.dart';
 
-/// 上下文上限的**现值**：ManaList 没有 per-model `contextWindow`，
-/// 全 App 沿用 32,768（assistant-v4-ui §3.6 的 kDefaultContextTokenLimit）。
-/// 因此圆环百分比只是「按 32k 估算」，不是模型真实窗口。
-const int kAssumedContextWindow = 32768;
+/// 兜底上限别名（F44 去重）：**唯一定义在 services/context_window.dart**
+/// （kAssumedContextTokenLimit = 32768）。
+///
+/// 实际上限不再写死：调用方传 `resolveContextWindow(...)` 的结果
+/// （端点自报 > 官方模型表 > 用户手填 > 32k 兜底），来源由
+/// `ContextWindowInfo.label` 在面板/Semantics 里展示；本常量只作兜底。
+const int kAssumedContextWindow = kAssumedContextTokenLimit;
 
 /// 上下文占用百分比（= 附件估算 tokens / 上限）。边界：上限 ≤0 或用量 ≤0 → 0；
 /// 不做上限截断（超限要能显示 >100%），负数按 0。
@@ -56,8 +59,8 @@ String formatTokenCount(int tokens) {
 ///   「**历史正文（字符数 ÷ 4）+ 草稿附件估算**」，面板只显示这一项合成值
 ///   （F42 已把条目名与说明改成如实描述）。工具定义已并入 `buildToolSpecPrompt`
 ///   的请求前言、系统提示词也没有单独计量，照抄三类会**重复计或编造**；
-/// - 上限是 `kAssumedContextWindow = 32768`（App 现值，非模型窗口），所以
-///   百分比与文案都明确写「按 32k 估算」。
+/// - 上限由 `resolveContextWindow` 解析（端点自报 > 模型表 > 手填 > 兜底），
+///   实测不可得时落回 kAssumedContextWindow（32k 兜底），此时文案明确写「估算」。
 ///
 /// 交互（移动端）：点击 → `showModalBottomSheet`，不做 hover 浮层。
 /// 超预算时发送键仍由 input_bar 的 budgetLevel 逻辑禁用（本组件不接管）。

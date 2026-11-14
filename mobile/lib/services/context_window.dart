@@ -2,9 +2,10 @@ import "model_capabilities.dart" show normalizeModelId;
 
 /// F41（2026-11-13）：上下文窗口上限改为「可获取」，不再硬编码 32k。
 ///
-/// 解析优先级（高 → 低）：
-///   configured（用户在端点上手动填的）> fromEndpoint（服务端 /models 上报）
-///   > 模型表（官方文档可查）> 兜底 32k（source = assumed）。
+/// 解析优先级（F44 用户口径，高 → 低）：
+///   fromEndpoint（服务端 /models 自报，最可信）> 模型表（官方文档可查）
+///   > configured（用户手动填的，可能过时）> 兜底 32k（source = assumed）。
+/// 注意：这与 F41 初版（configured 最高）相反，是用户明确要求的新顺序。
 /// 入参 null / <= 0 视为「未提供」，继续往下走；返回值永远非空。
 enum ContextWindowSource { configured, endpoint, modelTable, assumed }
 
@@ -22,6 +23,16 @@ const Map<String, int> kKnownContextWindows = <String, int>{
   "deepseek-v4.1-flash": 1000000,
   // DeepSeek V4 Pro。
   "deepseek-v4-pro": 1000000,
+  // 千问 1M 组：来源 https://platform.qianwenai.com/docs/developer-guides/
+  // getting-started/text-generation-models.md（原文「qwen3.7-plus … 支持 1M 上下文」，
+  // 并把 qwen3.8-max / qwen3.8-flash / qwen3.7-max 与 qwen3.7-plus 同列 1M 组）。
+  "qwen3.7-plus": 1000000,
+  "qwen3.7-max": 1000000,
+  "qwen3.8-flash": 1000000,
+  "qwen3.8-max": 1000000,
+  // 智谱：来源 https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash
+  // （原文「上下文窗口 1M / 最大输出 128K」）。
+  "glm-5.3-flash": 1000000,
 };
 
 /// DeepSeek 的 1M 上下文常量（模型表与测试共用）。
@@ -88,15 +99,16 @@ ContextWindowInfo resolveContextWindow({
   int? configured,
   int? fromEndpoint,
 }) {
-  if (configured != null && configured > 0) {
-    return ContextWindowInfo(configured, ContextWindowSource.configured);
-  }
+  // F44 新顺序：端点自报 > 官方模型表 > 用户自填 > 默认 32k。
   if (fromEndpoint != null && fromEndpoint > 0) {
     return ContextWindowInfo(fromEndpoint, ContextWindowSource.endpoint);
   }
   final fromTable = knownContextWindowFor(model);
   if (fromTable != null && fromTable > 0) {
     return ContextWindowInfo(fromTable, ContextWindowSource.modelTable);
+  }
+  if (configured != null && configured > 0) {
+    return ContextWindowInfo(configured, ContextWindowSource.configured);
   }
   return const ContextWindowInfo(
       kAssumedContextTokenLimit, ContextWindowSource.assumed);

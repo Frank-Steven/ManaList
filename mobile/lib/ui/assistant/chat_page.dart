@@ -156,9 +156,14 @@ class _ChatPageState extends State<ChatPage> {
   /// F41：端点手动配置的上下文窗口（tokens；null = 未配置）。
   int? _endpointContextWindow;
 
-  /// F41：解析出的上下文窗口（上限 + 来源），圆环与面板都用它。
+  /// F44：连通性测试时上游 /models 自报的窗口（null = 上游没给）。
+  int? _endpointReportedContextWindow;
+
+  /// F41/F44：解析出的上下文窗口（上限 + 来源），圆环与面板都用它。
+  /// F44 优先级：端点自报 > 模型表 > 用户自填 > 32k 兜底。
   ContextWindowInfo get _contextWindow => resolveContextWindow(
         model: _capabilityModel ?? '',
+        fromEndpoint: _endpointReportedContextWindow,
         configured: _endpointContextWindow,
       );
 
@@ -333,6 +338,7 @@ class _ChatPageState extends State<ChatPage> {
     String? capModel;
     String? capReasoning;
     int? capContextWindow;
+    int? capReportedContextWindow;
     if (id == null || id.isEmpty) {
       // 默认模型：取默认远程端点（可能没有 → 能力判定按未知处理）。
       try {
@@ -340,6 +346,7 @@ class _ChatPageState extends State<ChatPage> {
         capModel = ep?.model;
         capReasoning = ep?.reasoning;
         capContextWindow = ep?.contextWindow;
+        capReportedContextWindow = ep?.contextWindowFromEndpoint;
       } catch (e, st) {
         AppLog.instance.warn('chat.default-model', e, st);
       }
@@ -349,6 +356,7 @@ class _ChatPageState extends State<ChatPage> {
         _capabilityModel = capModel;
         _endpointReasoning = capReasoning;
         _endpointContextWindow = capContextWindow;
+        _endpointReportedContextWindow = capReportedContextWindow;
       });
       return;
     }
@@ -360,6 +368,7 @@ class _ChatPageState extends State<ChatPage> {
           capModel = e.model;
           capReasoning = e.reasoning;
           capContextWindow = e.contextWindow;
+          capReportedContextWindow = e.contextWindowFromEndpoint;
           break;
         }
       }
@@ -385,6 +394,7 @@ class _ChatPageState extends State<ChatPage> {
       _capabilityModel = capModel ?? id;
       _endpointReasoning = capReasoning;
       _endpointContextWindow = capContextWindow;
+      _endpointReportedContextWindow = capReportedContextWindow;
     });
   }
 
@@ -1201,6 +1211,10 @@ class _ChatPageState extends State<ChatPage> {
             metaOf: _metaOf,
             attachmentTokens:
                 _pendingAttachments.isEmpty ? null : _pendingAttachmentTokens,
+            // F44：附件预算也按解析出的真实上限（此前仍按 32k，导致圆环 1M 而
+            // 附件 32k 就红）。来源一并传下去，预算条的 sheet 文案与圆环一致。
+            tokenLimit: _contextWindow.tokens,
+            window: _contextWindow,
             onRemoveAttachment: _removeAttachment,
             onAddAttachments: _pickAttachments,
             onPickScreenshots: _pickScreenshots,
