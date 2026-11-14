@@ -69,6 +69,7 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     AiClient.secretStore = InMemorySecretStore();
     ai.debugResetOnlineCache();
+    ai.debugResetEndpointWrites();
     ai.closeClient();
     client.debugReset();
     bodies.clear();
@@ -281,6 +282,7 @@ void main() {
     setUp(() async {
       SharedPreferences.setMockInitialValues({});
       AiClient.secretStore = InMemorySecretStore();
+      AiClient.instance.debugResetEndpointWrites();
       db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
       await createBaseTables(db);
       appDb.debugAttachDatabase(db);

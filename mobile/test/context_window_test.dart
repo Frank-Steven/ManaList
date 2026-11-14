@@ -224,6 +224,8 @@ void main() {
       TestWidgetsFlutterBinding.ensureInitialized();
       SharedPreferences.setMockInitialValues({});
       AiClient.secretStore = InMemorySecretStore();
+      // B31：端点写队列是单例字段，逐用例重置（防跨 FakeAsync zone 的未完成 future）。
+      AiClient.instance.debugResetEndpointWrites();
     });
 
     test("纯函数：测试通过才写；idle/失败一律保留旧值", () {

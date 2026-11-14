@@ -80,10 +80,16 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
 
   /// 进入页面时对可见端点自动各测一次（§5.1）；结果持久化到端点诊断，
   /// 行内状态点/原因直接读取，整页只自动测一轮。
+  ///
+  /// B31：**必须串行**。诊断写入是「读整表 → 改一条 → 整表写回」，并发测 N 个
+  /// 端点会各自基于同一份旧表覆盖，后写盖掉先写（真机表现为「自动测试不落库」）。
+  /// 端点数量是个位数，串行代价几十毫秒，可接受。
   Future<void> _autoTestRemotes() async {
     if (_autoTested || _remotes.isEmpty || !mounted) return;
     _autoTested = true;
-    await Future.wait([for (final e in _remotes) _testEndpointSilent(e)]);
+    for (final e in _remotes) {
+      await _testEndpointSilent(e);
+    }
     await _load();
   }
 

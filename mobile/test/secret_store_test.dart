@@ -15,6 +15,8 @@ void main() {
     secrets = InMemorySecretStore();
     AiClient.secretStore = secrets;
     SharedPreferences.setMockInitialValues({});
+    // B31：端点写队列是单例字段，逐用例重置。
+    AiClient.instance.debugResetEndpointWrites();
   });
 
   test('保存接口后：prefs 里没有 apiKey，安全存储里有', () async {

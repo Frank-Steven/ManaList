@@ -68,6 +68,8 @@ void main() {
       TestWidgetsFlutterBinding.ensureInitialized();
       SharedPreferences.setMockInitialValues({});
       AiClient.secretStore = InMemorySecretStore();
+      // B31：端点写队列是单例字段，逐用例重置（防跨 FakeAsync zone 的未完成 future）。
+      AiClient.instance.debugResetEndpointWrites();
     });
 
     test('upsert/默认/删除的往返不变，密钥走安全存储', () async {
@@ -158,6 +160,8 @@ void main() {
       TestWidgetsFlutterBinding.ensureInitialized();
       SharedPreferences.setMockInitialValues({});
       AiClient.secretStore = InMemorySecretStore();
+      // B31：端点写队列是单例字段，逐用例重置（防跨 FakeAsync zone 的未完成 future）。
+      AiClient.instance.debugResetEndpointWrites();
     });
 
     test('旧配置没有诊断键：读回 null，不写回多余键', () {

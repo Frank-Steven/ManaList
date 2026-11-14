@@ -44,6 +44,7 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     AiClient.secretStore = InMemorySecretStore();
     ai.debugResetOnlineCache();
+    ai.debugResetEndpointWrites();
     ai.closeClient();
     client.debugReset();
     lastChatBody = null;

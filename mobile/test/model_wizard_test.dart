@@ -49,6 +49,9 @@ void main() {
       TestWidgetsFlutterBinding.ensureInitialized();
       SharedPreferences.setMockInitialValues({});
       AiClient.secretStore = InMemorySecretStore();
+      // B31：串行写队列是单例字段，跨 testWidgets 会残留属于旧 FakeAsync zone 的
+      // 未完成 future → 本用例 await 它会永远 pending（pumpAndSettle 超时）。
+      AiClient.instance.debugResetEndpointWrites();
     });
 
     tearDown(() {

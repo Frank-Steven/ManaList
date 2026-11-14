@@ -301,6 +301,46 @@ class AiClient {
     return withKeys;
   }
 
+  /// B31：端点集合的「读-改-写」串行队列。
+  ///
+  /// 背景：`recordEndpointTestResult` / `upsertEndpoint` / `deleteEndpoint` 都是
+  /// 「getRemoteEndpoints() 读整表 → 改一条 → _saveRemoteEndpoints() 整表写回」，
+  /// 多个调用并发时各自基于同一份旧表、后写覆盖先写（真机：模型配置页自动测试
+  /// 并发测 N 个端点 → 一条诊断都没留下）。这里把**公共写操作外层**串起来，
+  /// 让每次读-改-写都基于上一次写完的最新状态。
+  ///
+  /// 注意：**不要**把 `getRemoteEndpoints`（读，含旧 key 迁移分支）或
+  /// `_saveRemoteEndpoints`（底层写）也包进来，否则会自等待死锁。
+  ///
+  /// ⚠️ 必须是**可空 + 空闲即复位**，不能在字段初始化/构造时预先创建 future：
+  /// `Future` 绑定创建它的 zone，flutter_test 每个 testWidgets 有自己的 FakeAsync
+  /// zone；跨 zone await 一个预先创建的 future 会永久 pending（pumpAndSettle 超时）。
+  /// 现在顺序调用（previous == null）**不产生任何 then 链**，只有真并发才排队，
+  /// 而并发发生在同一 zone 内，安全。
+  Future<void>? _endpointWriteTail; // null = 空闲
+
+  /// B31：测试专用——清空串行队列（对 null 安全）。
+  ///
+  /// 正常路径下队列空闲后会自动复位成 null，本方法只为「上个用例留下未完成尾」
+  /// 的极端情况兜底（例如用例在 await 前就结束）。
+  @visibleForTesting
+  void debugResetEndpointWrites() {
+    _endpointWriteTail = null;
+  }
+
+  Future<T> _serializedEndpointWrite<T>(Future<T> Function() run) {
+    final previous = _endpointWriteTail;
+    final Future<T> result =
+        previous == null ? run() : previous.then((_) => run());
+    final Future<void> done = result.then<void>((_) {}, onError: (_) {});
+    _endpointWriteTail = done;
+    // 空闲即复位：避免把「已完成的 future」跨 zone 带到下一个用例/下一轮调用。
+    done.then((_) {
+      if (identical(_endpointWriteTail, done)) _endpointWriteTail = null;
+    });
+    return result;
+  }
+
   Future<void> _saveRemoteEndpoints(List<AiEndpoint> endpoints) async {
     final prefs = await SharedPreferences.getInstance();
     // P2-1：密钥进安全存储，SharedPreferences 里只留不含 key 的配置。
@@ -316,27 +356,30 @@ class AiClient {
     await prefs.setString(_keyEndpoints, jsonEncode(plain));
   }
 
-  Future<void> upsertEndpoint(AiEndpoint endpoint) async {
-    final list = await getRemoteEndpoints();
-    final i = list.indexWhere((e) => e.id == endpoint.id);
-    if (i >= 0) {
-      list[i] = endpoint;
-    } else {
-      list.add(endpoint);
-    }
-    await _saveRemoteEndpoints(list);
-  }
+  Future<void> upsertEndpoint(AiEndpoint endpoint) =>
+      _serializedEndpointWrite<void>(() async {
+        final list = await getRemoteEndpoints();
+        final i = list.indexWhere((e) => e.id == endpoint.id);
+        if (i >= 0) {
+          list[i] = endpoint;
+        } else {
+          list.add(endpoint);
+        }
+        await _saveRemoteEndpoints(list);
+      });
 
-  Future<void> deleteEndpoint(String id) async {
-    if (id == desktopEndpointId) return;
-    final list = await getRemoteEndpoints();
-    list.removeWhere((e) => e.id == id);
-    await secretStore.delete(_secretKeyFor(id));
-    await _saveRemoteEndpoints(list);
-    if (await getDefaultEndpointId() == id) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_keyDefaultEndpoint);
-    }
+  Future<void> deleteEndpoint(String id) {
+    if (id == desktopEndpointId) return Future<void>.value();
+    return _serializedEndpointWrite<void>(() async {
+      final list = await getRemoteEndpoints();
+      list.removeWhere((e) => e.id == id);
+      await secretStore.delete(_secretKeyFor(id));
+      await _saveRemoteEndpoints(list);
+      if (await getDefaultEndpointId() == id) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove(_keyDefaultEndpoint);
+      }
+    });
   }
 
   /// 默认远程接口 id；null 表示未选（电脑端始终自动优先，不参与默认选择）。
@@ -345,10 +388,11 @@ class AiClient {
     return prefs.getString(_keyDefaultEndpoint);
   }
 
-  Future<void> setDefaultEndpointId(String id) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_keyDefaultEndpoint, id);
-  }
+  Future<void> setDefaultEndpointId(String id) =>
+      _serializedEndpointWrite<void>(() async {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_keyDefaultEndpoint, id);
+      });
 
   Future<AiEndpoint?> defaultRemoteEndpoint() async {
     final list = await getRemoteEndpoints();
@@ -584,18 +628,19 @@ class AiClient {
   /// 上游没给/冲突 → 清掉落盘值）；**失败时保留旧值**（沿用 lastError 的语义：
   /// 一次探测失败不应抹掉上次成功拿到的能力信息）。
   Future<void> recordEndpointTestResult(String endpointId,
-      {String? error, int? latencyMs, int? contextWindow}) async {
-    final list = await getRemoteEndpoints();
-    final i = list.indexWhere((e) => e.id == endpointId);
-    if (i < 0) return;
-    list[i] = list[i].copyWith(
-      lastError: () => error,
-      lastLatencyMs: () => error == null ? latencyMs : null,
-      contextWindowFromEndpoint:
-          error == null ? () => contextWindow : null,
-    );
-    await _saveRemoteEndpoints(list);
-  }
+          {String? error, int? latencyMs, int? contextWindow}) =>
+      _serializedEndpointWrite<void>(() async {
+        final list = await getRemoteEndpoints();
+        final i = list.indexWhere((e) => e.id == endpointId);
+        if (i < 0) return;
+        list[i] = list[i].copyWith(
+          lastError: () => error,
+          lastLatencyMs: () => error == null ? latencyMs : null,
+          contextWindowFromEndpoint:
+              error == null ? () => contextWindow : null,
+        );
+        await _saveRemoteEndpoints(list);
+      });
 
   /// 拼接 baseUrl 与接口路径：去掉尾部多余斜杠，避免 `//` 之类的 404（N2 诊断）。
   static String joinEndpointUrl(String baseUrl, String path) {
