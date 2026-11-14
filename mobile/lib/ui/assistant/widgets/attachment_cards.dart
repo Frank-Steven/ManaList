@@ -345,7 +345,8 @@ class _FileBlock extends StatelessWidget {
             Icon(icon, size: 30, color: cs.primary),
             const Spacer(),
             Text(
-              meta?.title ?? attachment.id,
+              // B32：meta 还没解析出来时不要回退成 UUID（用户会把它当文件名）。
+              meta?.title ?? '正在读取…',
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(

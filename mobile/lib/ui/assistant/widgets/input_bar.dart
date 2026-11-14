@@ -148,7 +148,9 @@ class _ChatInputBarState extends State<ChatInputBar> {
     final file = meta?.file;
     return InputChip(
       avatar: Icon(meta?.icon ?? Icons.attach_file, size: 16),
-      label: Text(meta?.title ?? a.id, style: const TextStyle(fontSize: 11)),
+      // B32：meta 尚未解析时显示占位，别把 UUID 当文件名。
+      label: Text(meta?.title ?? '正在读取…',
+          style: const TextStyle(fontSize: 11)),
       visualDensity: VisualDensity.compact,
       side: BorderSide(color: cs.outlineVariant),
       onPressed: isPreviewableImage(meta)

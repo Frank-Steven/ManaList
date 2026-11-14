@@ -506,15 +506,29 @@ class _ChatPageState extends State<ChatPage> {
     return true;
   }
 
+  /// B32：草稿附件写入的**唯一入口**——setState + 落库 + 立即解析元数据。
+  ///
+  /// 之前 `_pickAttachments` 只 setState + 落库、没调 `_resolveAttachmentMeta()`，
+  /// 于是新附件在 `_attachmentMeta` 里没有 key → `_metaOf` 返回 null → 预算算 0、
+  /// 卡片标题退化成 UUID。重进会话时走初始加载的 resolve 才恢复正常。
+  Future<void> _applyPendingAttachments(List<ChatAttachment> next,
+      {bool persist = true}) async {
+    setState(() => _pendingAttachments = next);
+    if (persist) {
+      await AppDatabase.instance
+          .setConversationDraftAttachments(_conversation.id, next);
+    }
+    await _resolveAttachmentMeta();
+  }
+
   Future<void> _pickAttachments() async {
     final picked = await Navigator.of(context).push<List<ChatAttachment>>(
       MaterialPageRoute(
           builder: (_) => AttachmentPickerPage(selected: _pendingAttachments)),
     );
     if (picked != null && mounted) {
-      setState(() => _pendingAttachments = picked);
-      await AppDatabase.instance
-          .setConversationDraftAttachments(_conversation.id, picked);
+      // B32：立即解析元数据（预算/卡片标题当场就对，不必重进会话）。
+      await _applyPendingAttachments(picked);
     }
   }
 
@@ -555,10 +569,8 @@ class _ChatPageState extends State<ChatPage> {
       _showSnack('截图导入失败，请重试或改用「附件」入口');
       return;
     }
-    setState(() => _pendingAttachments = [..._pendingAttachments, ...added]);
-    await AppDatabase.instance
-        .setConversationDraftAttachments(_conversation.id, _pendingAttachments);
-    await _resolveAttachmentMeta();
+    // B32：同样走唯一入口（里面已包含落库 + resolve）。
+    await _applyPendingAttachments([..._pendingAttachments, ...added]);
     if (!mounted) return;
     final parts = <String>['已加入 ${added.length} 张截图'];
     if (overflow > 0) {
@@ -926,7 +938,6 @@ class _ChatPageState extends State<ChatPage> {
     _input.clear();
     final attachments = List<ChatAttachment>.of(_pendingAttachments);
     setState(() {
-      _pendingAttachments = [];
       _segments = [];
       _currentTextSeg = null;
       _textBaseOffset = 0;
@@ -934,9 +945,9 @@ class _ChatPageState extends State<ChatPage> {
       _errorText = null;
       _errorDiag = null;
     });
-    // 草稿附件随消息落库（startTurn 的 attachments 参数），草稿立即清空
-    AppDatabase.instance
-        .setConversationDraftAttachments(_conversation.id, const []);
+    // 草稿附件随消息落库（startTurn 的 attachments 参数），草稿立即清空。
+    // B32：清空也走唯一入口（persist=true 落库空表），不 await 以免阻塞发送。
+    unawaited(_applyPendingAttachments(const []));
     _attachTurn(AssistantService.instance.startTurn(
       conversation: _conversation,
       text: text,
