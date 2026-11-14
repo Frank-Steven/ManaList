@@ -263,7 +263,9 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
                   children: [
                     Text(online ? '已连接' : '未连接'),
                     Text(
-                      '${_desktopDeviceName != null ? '$_desktopDeviceName · ' : ''}$onlineStatusHint(online)',
+                      // B25：`$name(args)` 在 Dart 里只插值 `$name`，`(args)` 会变成
+                      // 字面量 → 渲染出 Closure: …。必须写 `${name(args)}`。
+                      '${_desktopDeviceName != null ? '$_desktopDeviceName · ' : ''}${onlineStatusHint(online)}',
                       style:
                           TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                     ),
