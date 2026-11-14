@@ -2,6 +2,10 @@ import "package:flutter/material.dart";
 import "package:flutter_test/flutter_test.dart";
 import "package:msgrepo_mobile/services/ai_client.dart";
 import "package:msgrepo_mobile/services/context_window.dart";
+import "package:msgrepo_mobile/services/secret_store.dart";
+import "package:msgrepo_mobile/ui/assistant/model_setup_wizard.dart"
+    show reportedWindowOnSave;
+import "package:shared_preferences/shared_preferences.dart";
 import "package:msgrepo_mobile/ui/assistant/widgets/attachment_cards.dart";
 import "package:msgrepo_mobile/ui/assistant/widgets/context_meter.dart";
 
@@ -97,11 +101,13 @@ void main() {
       expect(knownContextWindowFor(""), isNull);
     });
 
-    test("上限文案格式化：混刻度（十进制 k + 1024 进制 k）", () {
+    test("上限文案格式化：十进制/二进制 k 与 M 混刻度（含 B30 六例）", () {
+      expect(formatContextWindowTokens(1048576), "1M", reason: "B30：1024×1024");
+      expect(formatContextWindowTokens(2097152), "2M", reason: "B30：2×1024×1024");
       expect(formatContextWindowTokens(32768), "32k", reason: "32×1024");
-      expect(formatContextWindowTokens(1000000), "1M");
-      expect(formatContextWindowTokens(128000), "128k", reason: "128,000 十进制");
       expect(formatContextWindowTokens(131072), "128k", reason: "128×1024");
+      expect(formatContextWindowTokens(128000), "128k", reason: "128,000 十进制");
+      expect(formatContextWindowTokens(1000000), "1M", reason: "十进制 M");
       expect(formatContextWindowTokens(200000), "200k");
       expect(formatContextWindowTokens(32767), "33k", reason: "不可整除时四舍五入");
     });
@@ -209,6 +215,92 @@ void main() {
     test("budgetLevel(100000, 1000000) 不超限；旧 32k 会超限", () {
       expect(budgetLevel(100000, 1000000), isNot(BudgetLevel.over));
       expect(budgetLevel(100000, kDefaultContextTokenLimit), BudgetLevel.over);
+    });
+  });
+
+  // ---- B27：向导内「测试连接」拿到的自报窗口要能随保存落库 ----
+  group("B27 向导自报窗口落库（三态）", () {
+    setUp(() {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      SharedPreferences.setMockInitialValues({});
+      AiClient.secretStore = InMemorySecretStore();
+    });
+
+    test("纯函数：测试通过才写；idle/失败一律保留旧值", () {
+      final passed =
+          reportedWindowOnSave(testPassed: true, testedWindow: 131072);
+      expect(passed.write, isTrue);
+      expect(passed.value, 131072);
+
+      // 成功但上游没给 → 写入 null（清掉过时值）
+      final passedNoWindow =
+          reportedWindowOnSave(testPassed: true, testedWindow: null);
+      expect(passedNoWindow.write, isTrue);
+      expect(passedNoWindow.value, isNull);
+
+      final idle =
+          reportedWindowOnSave(testPassed: false, testedWindow: 131072);
+      expect(idle.write, isFalse, reason: "未测试/失败不得覆盖已存窗口");
+      expect(idle.value, isNull);
+    });
+
+    test("测试成功 → 保存后端点 contextWindowFromEndpoint 等于实测值", () async {
+      final ai = AiClient.instance;
+      final endpoint = AiEndpoint(
+        id: ai.newEndpointId(),
+        name: "远程B27",
+        baseUrl: "https://b27.example.com/v1",
+      );
+      await ai.upsertEndpoint(endpoint);
+
+      final plan = reportedWindowOnSave(testPassed: true, testedWindow: 131072);
+      if (plan.write) {
+        await ai.recordEndpointTestResult(endpoint.id,
+            latencyMs: 42, contextWindow: plan.value);
+      }
+      final saved = (await ai.getRemoteEndpoints()).single;
+      expect(saved.contextWindowFromEndpoint, 131072);
+      expect(saved.lastLatencyMs, 42);
+    });
+
+    test("未测试直接保存 → 不覆盖已存窗口（保留旧值）", () async {
+      final ai = AiClient.instance;
+      final endpoint = AiEndpoint(
+        id: ai.newEndpointId(),
+        name: "远程B27b",
+        baseUrl: "https://b27b.example.com/v1",
+        contextWindowFromEndpoint: 65536,
+      );
+      await ai.upsertEndpoint(endpoint);
+
+      // idle：向导不点测试直接保存 → helper 判定不写，故不调用 writer
+      final plan = reportedWindowOnSave(testPassed: false, testedWindow: null);
+      if (plan.write) {
+        await ai.recordEndpointTestResult(endpoint.id,
+            latencyMs: 1, contextWindow: plan.value);
+      }
+      final saved = (await ai.getRemoteEndpoints()).single;
+      expect(saved.contextWindowFromEndpoint, 65536,
+          reason: "编辑页未测试不得覆盖旧的自报窗口");
+    });
+
+    test("测试失败后保存 → 只记错误，窗口保持旧值", () async {
+      final ai = AiClient.instance;
+      final endpoint = AiEndpoint(
+        id: ai.newEndpointId(),
+        name: "远程B27c",
+        baseUrl: "https://b27c.example.com/v1",
+        contextWindowFromEndpoint: 32768,
+      );
+      await ai.upsertEndpoint(endpoint);
+
+      final plan = reportedWindowOnSave(testPassed: false, testedWindow: null);
+      expect(plan.write, isFalse);
+      await ai.recordEndpointTestResult(endpoint.id, error: "HTTP 500：boom");
+      final saved = (await ai.getRemoteEndpoints()).single;
+      expect(saved.contextWindowFromEndpoint, 32768,
+          reason: "失败不抹掉上次成功拿到的窗口");
+      expect(saved.lastError, contains("500"));
     });
   });
 

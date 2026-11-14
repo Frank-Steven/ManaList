@@ -38,6 +38,9 @@ const Map<String, int> kKnownContextWindows = <String, int>{
 /// DeepSeek 的 1M 上下文常量（模型表与测试共用）。
 const int kDeepSeekMillionContext = 1000000;
 
+/// 二进制 M（1024×1024）：B30 用于把 1048576 显示成 1M 而不是 1024k。
+const int kBinaryMillion = 1024 * 1024;
+
 /// 归一后的模型名 → 已知窗口；未知返回 null。
 ///
 /// 匹配规则（与 model_capabilities 同风格，但更严）：
@@ -65,6 +68,9 @@ int? knownContextWindowFor(String model) {
 String formatContextWindowTokens(int tokens) {
   if (tokens <= 0) return "0";
   if (tokens % 1000000 == 0) return "${tokens ~/ 1000000}M";
+  // B30：1,048,576 是「1024×1024」的二进制 M（不少上游按二进制报窗口）——
+  // 不先判它就会落到 1024k。
+  if (tokens % kBinaryMillion == 0) return "${tokens ~/ kBinaryMillion}M";
   if (tokens % 1000 == 0) return "${tokens ~/ 1000}k";
   if (tokens % 1024 == 0) return "${tokens ~/ 1024}k";
   return "${(tokens / 1000).round()}k";

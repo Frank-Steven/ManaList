@@ -102,6 +102,18 @@ String reasoningWizardHint(String? reasoning) {
   return '开启：发送 reasoning_effort="$reasoning"（部分推理模型不接受 temperature=0，开启时会省略 temperature）。';
 }
 
+/// B27：保存时对「端点自报窗口」的动作（三态，便于单测）。
+///
+/// - 本次测试**通过** → `write=true`：把实测值写入（实测为 null 表示上游没给，
+///   成功情况下清掉落盘的旧值，避免显示过时的窗口）；
+/// - idle（打开页面未测）/ 失败 / 测试中 → `write=false`：**保留**端点里已存的值。
+@visibleForTesting
+({bool write, int? value}) reportedWindowOnSave({
+  required bool testPassed,
+  int? testedWindow,
+}) =>
+    (write: testPassed, value: testPassed ? testedWindow : null);
+
 enum _TestStatus { idle, testing, passed, failed }
 
 class ModelSetupWizardPage extends StatefulWidget {
@@ -132,6 +144,9 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
   String? _testMessage;
   List<String> _modelIds = const [];
   int? _latencyMs;
+
+  /// B27：本次「测试连接」里上游 /models 自报的上下文窗口；测试成功才写进端点。
+  int? _reportedContextWindow;
   bool _saving = false;
 
   bool get _isEdit => widget.existing != null;
@@ -186,6 +201,7 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
     _testMessage = null;
     _modelIds = const [];
     _latencyMs = null;
+    _reportedContextWindow = null;
   }
 
   Future<void> _runTest() async {
@@ -207,6 +223,8 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
         _testStatus = _TestStatus.passed;
         _latencyMs = r.latencyMs;
         _modelIds = r.modelIds;
+        // B27：把自报窗口留在页面上，保存时随诊断一起落库。
+        _reportedContextWindow = r.contextWindow;
         _testMessage = '连接成功 · ${r.latencyMs}ms'
             '${r.modelIds.isEmpty ? '' : ' · 发现 ${r.modelIds.length} 个模型'}';
         if (_model.text.trim().isEmpty && r.modelIds.isNotEmpty) {
@@ -219,6 +237,7 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
         _testStatus = _TestStatus.failed;
         _testMessage = '$e';
         _modelIds = const [];
+        _reportedContextWindow = null;
       });
     }
   }
@@ -258,8 +277,15 @@ class _ModelSetupWizardPageState extends State<ModelSetupWizardPage> {
       await ai.setDefaultEndpointId(endpoint.id);
     }
     // 本次测试的诊断随保存落盘（测试时端点可能还没入库，落盘后补记一次）
-    if (_testStatus == _TestStatus.passed) {
-      await ai.recordEndpointTestResult(endpoint.id, latencyMs: _latencyMs);
+    // B27：窗口写不写由 reportedWindowOnSave 统一判定——只有「本次测试通过」
+    // 才写自报窗口；idle（打开页面未测）/ 失败一律保留端点里已存的旧值。
+    final windowPlan = reportedWindowOnSave(
+      testPassed: _testStatus == _TestStatus.passed,
+      testedWindow: _reportedContextWindow,
+    );
+    if (windowPlan.write) {
+      await ai.recordEndpointTestResult(endpoint.id,
+          latencyMs: _latencyMs, contextWindow: windowPlan.value);
     } else if (_testStatus == _TestStatus.failed && _testMessage != null) {
       await ai.recordEndpointTestResult(endpoint.id, error: _testMessage);
     }
