@@ -1229,10 +1229,9 @@ class _ChatPageState extends State<ChatPage> {
             metaOf: _metaOf,
             attachmentTokens:
                 _pendingAttachments.isEmpty ? null : _pendingAttachmentTokens,
-            // F44：附件预算也按解析出的真实上限（此前仍按 32k，导致圆环 1M 而
-            // 附件 32k 就红）。来源一并传下去，预算条的 sheet 文案与圆环一致。
+            // F44：附件预算按解析出的真实上限（此前仍按 32k，1M 端点下 32k 就红）。
+            // B33：附件行不再渲染上下文圆环，`window` 形参已从 ChatInputBar 删除。
             tokenLimit: _contextWindow.tokens,
-            window: _contextWindow,
             onRemoveAttachment: _removeAttachment,
             onAddAttachments: _pickAttachments,
             onPickScreenshots: _pickScreenshots,

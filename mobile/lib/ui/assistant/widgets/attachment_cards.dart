@@ -122,6 +122,26 @@ BudgetLevel budgetLevel(int usedTokens, int limitTokens) {
   return BudgetLevel.normal;
 }
 
+/// B32：附件实体已失效（库行被删）时唯一的展示文案——**唯一定义**，勿再写字面量。
+const String kMissingAttachmentText = '文件已失效';
+
+/// 草稿 chip / 附件卡片共用的三态标题（B32 补丁）：
+/// - meta 还没解析 → 「正在读取…」（不显示 UUID）；
+/// - 实体已失效 → [kMissingAttachmentText]；
+/// - 正常 → 真实文件名。
+String attachmentTitleText(AttachmentMeta? meta) {
+  if (meta == null) return '正在读取…';
+  if (meta.missing) return kMissingAttachmentText;
+  return meta.title;
+}
+
+/// 草稿 chip 的三态图标：未解析 → 回形针；已失效 → 断链；正常 → meta.icon。
+IconData attachmentTitleIcon(AttachmentMeta? meta, {IconData? fallback}) {
+  if (meta == null) return fallback ?? Icons.attach_file;
+  if (meta.missing) return Icons.link_off;
+  return meta.icon;
+}
+
 String formatAttachmentSize(int? bytes) {
   if (bytes == null) return '大小未知';
   if (bytes < 1024) return '$bytes B';
@@ -332,7 +352,7 @@ class _FileBlock extends StatelessWidget {
             ChatAttachmentType.note => '笔记',
             ChatAttachmentType.message => '消息',
             // B29：查不到实体时明确告知失效，不能显示成 0/空白。
-            _ => meta?.missing == true ? '文件已失效' : '文件',
+            _ => meta?.missing == true ? kMissingAttachmentText : '文件',
           }
         : formatAttachmentSize(file.size);
     return InkWell(
@@ -345,8 +365,9 @@ class _FileBlock extends StatelessWidget {
             Icon(icon, size: 30, color: cs.primary),
             const Spacer(),
             Text(
-              // B32：meta 还没解析出来时不要回退成 UUID（用户会把它当文件名）。
-              meta?.title ?? '正在读取…',
+              // B32：三态（未解析/失发/正常）统一走 attachmentTitleText，
+              // 不要回退成 UUID，也不要各处再写一份判断。
+              attachmentTitleText(meta),
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(

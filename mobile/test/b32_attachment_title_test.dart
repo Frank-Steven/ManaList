@@ -38,6 +38,16 @@ void main() {
           reason: 'B32：UUID 不得被当成文件名展示');
     });
 
+    testWidgets('失效的库实体 → 卡片显示「文件已失效」，不含 UUID', (tester) async {
+      const meta = AttachmentMeta(
+          title: '文件',
+          icon: Icons.insert_drive_file_outlined,
+          missing: true);
+      await tester.pumpWidget(cardHarness(meta));
+      expect(find.text('文件已失效'), findsWidgets);
+      expect(find.textContaining(uuid), findsNothing);
+    });
+
     testWidgets('meta 解析完成后自然替换成真实标题', (tester) async {
       const meta = AttachmentMeta(
           title: 'f03-B.png', icon: Icons.image_outlined);
@@ -70,6 +80,19 @@ void main() {
       await tester.pumpWidget(chipHarness((_) => null));
       expect(find.text('正在读取…'), findsOneWidget);
       expect(find.textContaining(uuid), findsNothing);
+    });
+
+    testWidgets('失效的草稿附件 → chip 显示「文件已失效」，不含 UUID',
+        (tester) async {
+      await tester.pumpWidget(chipHarness((_) => const AttachmentMeta(
+          title: '文件',
+          icon: Icons.insert_drive_file_outlined,
+          missing: true)));
+      expect(find.text('文件已失效'), findsOneWidget);
+      expect(find.text('文件'), findsNothing,
+          reason: 'B32 补丁：失效附件不能再显示成通用「文件」');
+      expect(find.textContaining(uuid), findsNothing);
+      expect(find.byIcon(Icons.link_off), findsOneWidget);
     });
 
     testWidgets('metaOf 有值时 chip 显示真实标题', (tester) async {

@@ -2,8 +2,6 @@ import 'package:flutter/material.dart';
 
 import '../../../services/assistant/models.dart';
 import 'attachment_cards.dart';
-import '../../../services/context_window.dart';
-import 'context_meter.dart';
 
 /// `/` 快捷指令集（assistant-v4-ui §3.6）：指令名 → 提示词模板。
 /// 固定集，不做自定义命令编辑器；模板插入输入框后可继续编辑。
@@ -48,11 +46,12 @@ class ChatInputBar extends StatefulWidget {
 
   /// 模型上下文上限（token）；无数据时按 32k。
   /// F44：调用方应传 `resolveContextWindow(...).tokens`（端点自报 > 模型表 >
-  /// 用户自填 > 32k），让附件预算与上方圆环用同一个分母。
+  /// 用户自填 > 32k），让附件预算拦截与输入区上方圆环用同一个上限。
+  /// B33：附件行不再渲染圆环/百分比，这里只服务 `budgetLevel` 超限拦截。
   final int tokenLimit;
 
-  /// F44：上限来源（含来源文案）；透传给 ContextMeter，保证两处口径一致。
-  final ContextWindowInfo? window;
+  // B33：`window`（上下文上限来源）在附件行圆环删除后已无消费者；
+  // 上限只由 [tokenLimit] 参与预算拦截（budgetLevel）与提示文案。
 
   /// 回合中是否显示「停止」键。
   /// F21 第②阶段起主进行态条上有唯一停止键，输入栏 busy 时只留占位
@@ -72,7 +71,6 @@ class ChatInputBar extends StatefulWidget {
     required this.onCancel,
     this.attachmentTokens,
     this.tokenLimit = kDefaultContextTokenLimit,
-    this.window,
     this.showStopButton = true,
   });
 
@@ -147,9 +145,9 @@ class _ChatInputBarState extends State<ChatInputBar> {
     final meta = widget.metaOf(a);
     final file = meta?.file;
     return InputChip(
-      avatar: Icon(meta?.icon ?? Icons.attach_file, size: 16),
-      // B32：meta 尚未解析时显示占位，别把 UUID 当文件名。
-      label: Text(meta?.title ?? '正在读取…',
+      // B32 补丁：失效的草稿附件不能再显示成通用「文件」，与卡片共用同一判定。
+      avatar: Icon(attachmentTitleIcon(meta), size: 16),
+      label: Text(attachmentTitleText(meta),
           style: const TextStyle(fontSize: 11)),
       visualDensity: VisualDensity.compact,
       side: BorderSide(color: cs.outlineVariant),
@@ -182,25 +180,9 @@ class _ChatInputBarState extends State<ChatInputBar> {
               ],
             ),
           ),
-          if (widget.attachmentTokens != null) _buildContextIndicator(),
+          // B33（用户定稿）：附件行只放附件 chip，不再放上下文圆环等其它控件。
+          // 圆环的唯一生产实例在输入区上方的 ReasoningPillRow（reasoning_pill_row.dart）。
         ],
-      ),
-    );
-  }
-
-  /// 上下文指示器（F21 审批稿 / DSH ContextMeter 实证最小版）：
-  /// 折叠态 = 16px 圆环 + NN%/<1%；点击 → 底部 sheet（估算或真实 usage）。
-  ///
-  /// 数据口径见 context_meter.dart；**上限不再写死 32k**：由调用方传入
-  /// [tokenLimit]（F41 解析结果）与 [window]（F44 来源），与输入区上方圆环同源。
-  /// 超预算时发送键仍由 budgetLevel 拦截（见 _buildSendButton），行为不变。
-  Widget _buildContextIndicator() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 6),
-      child: ContextMeter(
-        usedTokens: widget.attachmentTokens!,
-        limitTokens: widget.tokenLimit,
-        window: widget.window,
       ),
     );
   }

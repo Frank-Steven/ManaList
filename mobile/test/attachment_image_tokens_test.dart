@@ -163,7 +163,8 @@ void main() {
           ),
         ),
       ));
-      expect(find.text('文件已失效'), findsOneWidget);
+      // B32 补丁后：卡片标题与副标题都显示失效文案 → 至少一处即可
+      expect(find.text('文件已失效'), findsWidgets);
     });
   });
 }

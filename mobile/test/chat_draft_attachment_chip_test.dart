@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/library_file.dart';
 import 'package:msgrepo_mobile/services/assistant/models.dart';
 import 'package:msgrepo_mobile/ui/assistant/widgets/attachment_cards.dart';
+import 'package:msgrepo_mobile/ui/assistant/widgets/context_meter.dart';
 import 'package:msgrepo_mobile/ui/assistant/widgets/input_bar.dart';
 
 /// F03 附件预览子项（真机 FAIL）：草稿图片附件 chip 原先只有 onDeleted，
@@ -44,6 +45,8 @@ void main() {
   Widget harness({
     required List<ChatAttachment> atts,
     required ValueChanged<ChatAttachment> onRemove,
+    int? attachmentTokens,
+    int tokenLimit = 32768,
   }) {
     final metas = <String, AttachmentMeta>{
       'a-img': AttachmentMeta(
@@ -63,6 +66,8 @@ void main() {
           onPickScreenshots: () {},
           onSend: () {},
           onCancel: () {},
+          attachmentTokens: attachmentTokens,
+          tokenLimit: tokenLimit,
         ),
       ),
     );
@@ -107,6 +112,22 @@ void main() {
   testWidgets('有图片草稿时输入框提示「可留空直接发送」', (tester) async {
     await tester.pumpWidget(harness(atts: const [imageAtt], onRemove: (_) {}));
     expect(find.text('可留空：直接发送这些截图'), findsOneWidget);
+  });
+
+  // B33（用户定稿）：附件行只放附件 chip，不要放上下文圆环等其它控件。
+  testWidgets('B33：附件行内不存在上下文圆环/百分比文本', (tester) async {
+    await tester.pumpWidget(harness(
+      atts: const [imageAtt, noteAtt],
+      onRemove: (_) {},
+      attachmentTokens: 1400,
+    ));
+
+    expect(find.byType(InputChip), findsNWidgets(2),
+        reason: '附件 chip 仍在');
+    expect(find.byType(ContextMeter), findsNothing,
+        reason: 'B33：圆环唯一生产实例在输入区上方的 ReasoningPillRow');
+    expect(find.textContaining('%'), findsNothing,
+        reason: '附件行不再出现百分比文案');
   });
 
   testWidgets('无图片草稿时保持原文案', (tester) async {
