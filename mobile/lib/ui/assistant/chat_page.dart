@@ -434,17 +434,24 @@ class _ChatPageState extends State<ChatPage> {
     switch (a.type) {
       case ChatAttachmentType.file:
         final f = await db.getFileById(a.id);
-        final isImage = f != null && isImageAttachment(f);
+        // B29：实体查不到（文件被删/归档丢行）→ 不静默 0，UI 显示「文件已失效」。
+        if (f == null) {
+          return const AttachmentMeta(
+            title: '文件',
+            icon: Icons.insert_drive_file_outlined,
+            missing: true,
+          );
+        }
+        final isImage = isImageAttachment(f);
         return AttachmentMeta(
-          title: f?.name ?? '文件',
-          icon: f != null
-              ? libraryFileIcon(f)
-              : Icons.insert_drive_file_outlined,
+          title: f.name,
+          icon: libraryFileIcon(f),
           file: f,
-          // 文本文件按字节数近似字符数（预算条保守估算）。
+          // 文本文件按字节数近似字符数（预算条保守估算）；
+          // B29：size 为 NULL（旧数据）时给保守下界，别让附件贡献 0。
           // F22：图片**绝不**用字节数——50KB JPEG 会被算成 2.5 万 token；
-          // 图片改走 imageTokens（按内联后 1024 长边的像素面积估算）。
-          chars: isImage ? null : f?.size,
+          // 图片改走 imageTokens（按内联后 1024 长边的像素面积估算，无参即 1400 兜底）。
+          chars: isImage ? null : (f.size ?? kUnknownTextAttachmentChars),
           imageTokens: isImage ? estimateImageTokens() : null,
         );
       case ChatAttachmentType.note:

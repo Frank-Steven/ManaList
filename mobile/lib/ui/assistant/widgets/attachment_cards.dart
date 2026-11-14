@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import '../../../models/library_file.dart';
 import '../../../services/assistant/models.dart';
 import '../../../services/context_window.dart';
+import '../../../services/library_file_service.dart'
+    show isImageFile;
 import '../../../services/notification_bridge.dart';
 import '../../library/files_page.dart' show libraryFileIcon;
 
@@ -28,12 +30,17 @@ class AttachmentMeta {
   /// 非图片附件为 null。
   final int? imageTokens;
 
+  /// B29：库实体查不到（文件已删除/归档丢行）——UI 必须显示「文件已失效」，
+  /// 不能显示 0 或空白。token 按 0 计。
+  final bool missing;
+
   const AttachmentMeta({
     required this.title,
     required this.icon,
     this.file,
     this.chars,
     this.imageTokens,
+    this.missing = false,
   });
 }
 
@@ -50,6 +57,12 @@ const int kImageTokenAreaDivisor = 750;
 
 /// 宽高未知时的**保守上界**：1024×1024 / 750 ≈ 1398.1 → 取 1400。
 const int kConservativeImageTokens = 1400;
+
+/// 未知大小的**文本/其它附件**保守下界（B29）：按 200 字符估算 → 100 tokens。
+/// 用于「库里 size 列为 NULL」的存量行，避免附件预算静默算 0；
+/// 这个值明显小于任何真实附件，不会把预算撑爆，但能让「0 token」不再出现。
+const int kUnknownTextAttachmentChars = 200;
+const int kUnknownTextAttachmentTokens = 100;
 
 /// 图片附件的 token 估算（F22 修复）：按长边 [maxSide] 等比缩放后的面积算，
 /// 不用文件字节数。宽/高未知或非法 → 回退 [kConservativeImageTokens]。
@@ -73,11 +86,15 @@ int estimateImageTokens({
 }
 
 /// 草稿附件 token 估算合计（§3.6）：图片走 [AttachmentMeta.imageTokens]，
-/// 其余类型沿用「字符/2」；元数据缺失按 0 计。
+/// 其余类型沿用「字符/2」。
+///
+/// B29：只有「实体真的查不到（meta.missing）」才按 0 计（UI 会显示「文件已失效」）；
+/// 只要有 meta 就一定有贡献——未知大小的图片/文本分别走 1400 / 100 的下界兜底。
 int sumAttachmentTokens(Iterable<AttachmentMeta?> metas) {
   var sum = 0;
   for (final meta in metas) {
     if (meta == null) continue;
+    if (meta.missing) continue; // 已失效：UI 明确报错，token 记 0
     final imageTokens = meta.imageTokens;
     if (imageTokens != null) {
       sum += imageTokens;
@@ -112,9 +129,9 @@ String formatAttachmentSize(int? bytes) {
   return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
 }
 
-/// 是否图片附件（按 mime 前缀判定；chat_page 的预算分流也用它）。
-bool isImageAttachment(LibraryFile f) =>
-    (f.mimeType ?? '').startsWith('image/');
+/// 是否图片附件（B29）：委托 services/library_file_service.dart 的 [isImageFile]，
+/// 统一口径 = MIME 前缀 或 MIME 缺失时扩展名兜底（`.jpg` 这类存量行不再漏判）。
+bool isImageAttachment(LibraryFile f) => isImageFile(f);
 
 bool _isImage(LibraryFile f) => isImageAttachment(f);
 
@@ -314,7 +331,8 @@ class _FileBlock extends StatelessWidget {
         ? switch (attachment.type) {
             ChatAttachmentType.note => '笔记',
             ChatAttachmentType.message => '消息',
-            _ => '文件',
+            // B29：查不到实体时明确告知失效，不能显示成 0/空白。
+            _ => meta?.missing == true ? '文件已失效' : '文件',
           }
         : formatAttachmentSize(file.size);
     return InkWell(

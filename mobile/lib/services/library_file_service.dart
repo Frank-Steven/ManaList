@@ -99,6 +99,17 @@ String? guessMimeFromName(String name) {
   };
 }
 
+/// 归一后的 MIME（B29）：库里有值就用，为 NULL（旧数据/归档导入）按扩展名兜底。
+/// 这是「类型判断」的唯一入口，UI 层不要再各自 `mimeType ?? guessMimeFromName(...)`。
+String effectiveMimeOf(LibraryFile f) =>
+    f.mimeType ?? guessMimeFromName(f.name) ?? '';
+
+/// 是否图片附件（B29 唯一判定）：MIME 前缀命中，或 MIME 缺失时扩展名兜底命中。
+///
+/// 背景：存量行可能 `mime_type` + `size` 双 NULL，只认 mime 前缀会把真图片判成
+/// 「非图片」，附件预算于是静默算 0。
+bool isImageFile(LibraryFile f) => effectiveMimeOf(f).startsWith('image/');
+
 /// 重命名锁定后缀（2026-11-01）：文件不允许改后缀名（类型语义会乱），
 /// 用户输入的不同后缀（或重复的原后缀）一律剥掉，再拼回 [original] 的
 /// 原后缀；原文件无后缀则按输入原样返回。

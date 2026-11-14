@@ -21,7 +21,8 @@ import '../shared/skeleton_list.dart';
 /// 按 mime 给文件分区/附件选择器共用的行首图标（唯一事实源）。
 /// mime 缺失（旧数据）时按扩展名兜底推断。
 IconData libraryFileIcon(LibraryFile file) {
-  final mime = file.mimeType ?? guessMimeFromName(file.name) ?? '';
+  // B29：类型判定收敛到 services 的 effectiveMimeOf（mime 缺失按扩展名兜底）。
+  final mime = effectiveMimeOf(file);
   if (mime.startsWith('image/')) return Icons.image_outlined;
   if (mime.startsWith('video/')) return Icons.videocam_outlined;
   if (mime.startsWith('audio/')) return Icons.audiotrack_outlined;
@@ -35,7 +36,8 @@ IconData libraryFileIcon(LibraryFile file) {
 /// 文件类型显示名（2026-11-01：类型随列表/卡片副标题展示）：
 /// 「PNG 图片」「MP4 视频」「PDF 文档」；无扩展名回退「文件」。
 String libraryFileTypeLabel(LibraryFile file) {
-  final mime = file.mimeType ?? guessMimeFromName(file.name) ?? '';
+  // B29：类型判定收敛到 services 的 effectiveMimeOf（mime 缺失按扩展名兜底）。
+  final mime = effectiveMimeOf(file);
   final ext = p.extension(file.name);
   final extLabel =
       ext.length > 1 ? ext.substring(1).toUpperCase() : '';

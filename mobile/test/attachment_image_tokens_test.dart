@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:msgrepo_mobile/models/library_file.dart';
+import 'package:msgrepo_mobile/services/assistant/models.dart';
 import 'package:msgrepo_mobile/ui/assistant/widgets/attachment_cards.dart';
 
 /// F22 回归（2026-11-11）：两张 1080×1440 / 各约 50KB 的截图曾被算成 **155%**
@@ -75,6 +77,93 @@ void main() {
       const both = AttachmentMeta(
           title: 'x.jpg', icon: Icons.image, chars: 51200, imageTokens: 1049);
       expect(sumAttachmentTokens(const [both]), 1049);
+    });
+  });
+
+  // ---- B29（2026-11-14）：附件 token 不再静默 0 ----
+  group('B29 附件 token 兜底（mime/size 为 NULL 的存量行）', () {
+    LibraryFile file({String name = 'a.bin', String? mime, int? size}) =>
+        LibraryFile(
+          id: 'f1',
+          name: name,
+          mimeType: mime,
+          size: size,
+          localPath: '/tmp/$name',
+          source: FileSource.userUpload,
+          createdAt: 0,
+        );
+
+    test('图片但 mime 为 null：文件名 .jpg 兜底判成图片 → 1400', () {
+      final f = file(name: 'IMG_0001.jpg', mime: null, size: null);
+      expect(isImageAttachment(f), isTrue,
+          reason: 'mime 缺失时按扩展名兜底（复用 guessMimeFromName）');
+      const meta = AttachmentMeta(
+          title: 'IMG_0001.jpg',
+          icon: Icons.image,
+          imageTokens: kConservativeImageTokens);
+      expect(sumAttachmentTokens(const [meta]), 1400);
+      expect(estimateImageTokens(), kConservativeImageTokens);
+    });
+
+    test('非图片但 size 为 null → 保守下界 100（不再贡献 0）', () {
+      final f = file(name: 'unknown-archive', mime: null, size: null);
+      expect(isImageAttachment(f), isFalse);
+      const meta = AttachmentMeta(
+          title: 'unknown-archive',
+          icon: Icons.insert_drive_file_outlined,
+          chars: kUnknownTextAttachmentChars);
+      expect(kUnknownTextAttachmentChars, 200);
+      expect(sumAttachmentTokens(const [meta]), kUnknownTextAttachmentTokens);
+      expect(sumAttachmentTokens(const [meta]), 100);
+    });
+
+    test('回归：正常图片（mime=image/png）仍是 1400；正常文本仍走 chars/2', () {
+      final png = file(name: 'a.png', mime: 'image/png', size: 50000);
+      expect(isImageAttachment(png), isTrue);
+      expect(
+          sumAttachmentTokens(const [
+            AttachmentMeta(
+                title: 'a.png',
+                icon: Icons.image,
+                imageTokens: kConservativeImageTokens)
+          ]),
+          1400);
+      const text = AttachmentMeta(
+          title: 'note.txt', icon: Icons.description, chars: 4000);
+      expect(sumAttachmentTokens(const [text]), 2000);
+    });
+
+    test('失效的库实体：meta.missing → token 记 0，且该条被跳过', () {
+      const missing = AttachmentMeta(
+          title: '文件',
+          icon: Icons.insert_drive_file_outlined,
+          missing: true);
+      const text = AttachmentMeta(
+          title: 'note.txt', icon: Icons.description, chars: 4000);
+      expect(missing.missing, isTrue);
+      expect(sumAttachmentTokens(const [missing]), 0);
+      expect(sumAttachmentTokens(const [missing, text]), 2000);
+    });
+
+    testWidgets('失效附件卡片显示「文件已失效」而不是空白/0', (tester) async {
+      const attachment =
+          ChatAttachment(type: ChatAttachmentType.file, id: 'gone-1');
+      const meta = AttachmentMeta(
+          title: '文件',
+          icon: Icons.insert_drive_file_outlined,
+          missing: true);
+      await tester.pumpWidget(const MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: SizedBox(
+                width: 210,
+                height: 132,
+                child:
+                    AttachmentCard(attachment: attachment, meta: meta)),
+          ),
+        ),
+      ));
+      expect(find.text('文件已失效'), findsOneWidget);
     });
   });
 }
