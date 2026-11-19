@@ -266,7 +266,19 @@ export function createServer(opts: ServerOptions): http.Server {
           send({ type: "done" });
           console.log(`[chat] 完成：${modelId}，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
         } catch (err) {
-          send({ type: "error", error: String(err) });
+          // B36：错误事件必须可操作——带上模型 id 与上游地址，手机端才能判断
+          // 「是哪个模型/哪个 baseUrl 挂了」，而不是只看到一句含糊的原始异常。
+          const rawError = err instanceof Error ? err.message : String(err);
+          const failedModel = opts.models.models.find((m) => m.id === modelId);
+          const failedTarget = failedModel
+            ? [failedModel.provider, failedModel.baseUrl]
+                .filter((v) => typeof v === "string" && v.length > 0)
+                .join(" ")
+            : "";
+          const errorText = `模型调用失败：${modelId}${
+            failedTarget ? `（${failedTarget}）` : ""
+          }— ${rawError}`;
+          send({ type: "error", error: errorText });
           console.log(`[chat] 失败：${modelId}：${String(err)}`);
         }
         // 收尾前强制冲刷：done/error 不等 16ms 窗口（且已按序追加在缓冲末尾）

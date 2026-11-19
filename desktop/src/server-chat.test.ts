@@ -214,6 +214,29 @@ test("POST /v1/chat 路由到不可达模型 → SSE error 事件（HTTP 仍 200
   assert.equal(events.at(-1)?.type, "error");
 });
 
+// B36：上游失败时 error 事件必须可操作——手机端要能看出「哪个模型 / 哪个 baseUrl」。
+test("B36 /v1/chat 上游失败 → error 文本含模型 id 与 baseUrl", async () => {
+  const res = await fetch(`${base}/v1/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...auth() },
+    body: JSON.stringify({
+      conversationId: "c3b",
+      messages: [{ role: "user", content: "hi" }],
+      modelConfigId: "dead",
+      stream: true,
+    }),
+  });
+  assert.equal(res.status, 200);
+  const events = await readSse(res);
+  const last = events.at(-1);
+  assert.equal(last?.type, "error");
+  const text = (last as { type: "error"; error: string }).error;
+  // 固定格式：模型调用失败：<modelId>（<provider> <baseUrl>）— <原始错误>
+  assert.match(text, /^模型调用失败：dead（openai-compat http:\/\/127\.0\.0\.1:9\/v1）— /);
+  assert.ok(text.includes("dead"), "必须点名模型 id");
+  assert.ok(text.includes("http://127.0.0.1:9/v1"), "必须点名上游 baseUrl");
+});
+
 test("旧 POST /v1/process 已删除 → 404", async () => {
   const res = await fetch(`${base}/v1/process`, {
     method: "POST",

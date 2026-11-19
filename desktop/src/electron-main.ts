@@ -25,6 +25,30 @@ import {
 // （v3 干净迁移：不做旧目录迁移，全新安装、重新配对）
 app.setName("LinkModel");
 
+// B37：单实例锁。没有它时双击两次会起两个进程、两个托盘图标，且两个实例会争抢
+// :8765（后起的那个 ensureServer 会走 reused 分支，但它们各自维护状态、各自探测
+// adb，用户看到的就是「图标翻倍 + 状态互相打架」）。
+// 拿不到锁的实例立刻退出，并在已有实例里提示一次。
+const singleInstanceLock = app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    event("再次启动：已有实例在运行，已忽略");
+    if (Notification.isSupported()) {
+      new Notification({
+        title: "LinkModel",
+        body: "LinkModel 已在运行，状态请看托盘图标",
+      }).show();
+    }
+    try {
+      tray?.popUpContextMenu();
+    } catch {
+      // 某些平台不支持在 not-ready 时弹出菜单，忽略即可（通知已给出提示）
+    }
+  });
+}
+
 // 配置：包内 default.json → 包内 local.json（仅开发）→ userData/config.json（用户覆盖）
 const USER_CONFIG = path.join(app.getPath("userData"), "config.json");
 const modelManager = new ModelManager(() => loadConfig([USER_CONFIG]));
@@ -357,7 +381,10 @@ async function main(): Promise<void> {
 // 无窗口应用，保持常驻
 app.on("window-all-closed", () => {});
 
-main().catch((err) => {
-  console.error(err);
-  app.quit();
-});
+// B37：只有拿到单实例锁的进程才启动服务/托盘；未拿到锁的进程已在上面 quit。
+if (singleInstanceLock) {
+  main().catch((err) => {
+    console.error(err);
+    app.quit();
+  });
+}
