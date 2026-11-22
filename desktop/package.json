@@ -12,7 +12,9 @@
     "pair": "tsx src/index.ts pair",
     "icons": "node scripts/make-icons.mjs",
     "electron": "tsc && electron .",
-    "dist": "tsc && electron-builder"
+    "dist": "tsc && electron-builder",
+    "dist:win": "npm run build && electron-builder --win",
+    "verify:win-package": "node scripts/verify-windows-package.mjs"
   },
   "dependencies": {
     "ajv": "^8.17.1"
@@ -38,6 +40,9 @@
       "!data/**",
       "!config/local.json"
     ],
+    "nsis": {
+      "include": "nsis/installer.nsh"
+    },
     "extraResources": [
       {
         "from": "../shared",
@@ -54,6 +59,17 @@
       "extendInfo": {
         "LSUIElement": true
       }
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
     }
   }
 }
