@@ -92,4 +92,16 @@ class FencedCodeBuilder extends MarkdownElementBuilder {
     if (code.isEmpty) return null;
     return MarkdownCodeBlock(code: code, colorScheme: colorScheme);
   }
+
+  /// B34（2026-11-22，task-36 候选）：pre 内**所有** code 文本节点
+  /// （空 / 空白 / 非空）统一换成不可见占位。
+  ///
+  /// 不可见节点**不携带代码文本**、不改 AST；可见代码只由 visitElementAfter
+  /// 用原 element.textContent 创建（MarkdownCodeBlock 容器/复制/横滚均不变）。
+  /// 这样上游块收尾时每条 inline 都有合法子节点可 flush，不再触发
+  /// builder.dart:267 的 assert(_inlines.isEmpty)。
+  /// 本方法只在 pre 内被调用（builder.dart:406 以 _blocks.last.tag 为键）。
+  @override
+  Widget? visitText(md.Text text, TextStyle? preferredStyle) =>
+      const SizedBox.shrink();
 }

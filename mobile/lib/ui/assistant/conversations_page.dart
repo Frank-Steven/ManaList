@@ -13,6 +13,8 @@ import 'demo/assistant_components_demo_page.dart';
 import 'chat_page.dart';
 import 'conversation_export.dart';
 import 'model_picker.dart';
+import 'widgets/assistant_loading_indicator.dart';
+import 'widgets/assistant_logo.dart';
 import 'widgets/streaming_blocks.dart';
 
 /// 通道状态（assistant-v4-ui §2.2 状态点，全助理域同一语义）：
@@ -79,6 +81,28 @@ List<TextSpan> highlightSpans(String text, String query, TextStyle hitStyle) {
   return spans;
 }
 
+/// B43：助理页一次数据快照（首次加载的新旧判定与串行保护用的载体）。
+///
+/// 生产由 DB / AI 的既有 await 顺序填充；测试可经
+/// [ConversationsPageState.debugLoaderOverride] 注入可控数据。
+class ConversationsLoadResult {
+  const ConversationsLoadResult({
+    required this.conversations,
+    this.pendingCounts = const {},
+    this.desktopOnline = false,
+    this.remotesById = const {},
+    this.desktopModelNames = const {},
+    this.defaultEndpointId,
+  });
+
+  final List<Conversation> conversations;
+  final Map<String, int> pendingCounts;
+  final bool desktopOnline;
+  final Map<String, AiEndpoint> remotesById;
+  final Map<String, String> desktopModelNames;
+  final String? defaultEndpointId;
+}
+
 /// 助理主 Tab（design-v3 §5.1 → assistant-v4-ui §2）：
 /// 对话列表（搜索/置顶/三态副标题/状态点/左滑手势），
 /// AppBar 一级入口：搜索、待确认区（角标）、模型配置。
@@ -106,6 +130,27 @@ class ConversationsPageState extends State<ConversationsPage> {
   /// 有在途回合时每秒刷新一次副标题秒数；没有在途回合不挂定时器。
   Timer? _ticker;
 
+  // ---- B43 首次加载动画（用户 2026-11-22 双重批准：T=800ms，opacity 0.35–1）----
+
+  /// 首次加载延迟显示阈值：极短加载不闪屏（用户已批准 200ms）。
+  static const Duration _loadingDelay = Duration(milliseconds: 200);
+
+  /// 首次加载尚未完成（一旦完成即永久置 false：后续 reload 保留列表、不闪空白）。
+  bool _initialLoadPending = true;
+
+  /// 延迟计时到点后是否显示加载指示。
+  bool _showLoading = false;
+
+  /// 首次加载的 200ms 延迟计时器。
+  Timer? _loadingTimer;
+
+  /// reload 串行号：旧请求完成时若号已变，则不覆盖新快照。
+  int _reloadSerial = 0;
+
+  /// 测试注入点：非 null 时 `reload()` 用它替代真实 DB/AI 读取（生产恒为 null）。
+  @visibleForTesting
+  static Future<ConversationsLoadResult> Function()? debugLoaderOverride;
+
   @override
   void initState() {
     super.initState();
@@ -117,6 +162,8 @@ class ConversationsPageState extends State<ConversationsPage> {
   @override
   void dispose() {
     AssistantService.instance.turnsVersion.removeListener(_onTurnsChange);
+    _reloadSerial++; // 让在途请求失效
+    _loadingTimer?.cancel();
     _ticker?.cancel();
     _searchCtrl.dispose();
     super.dispose();
@@ -140,14 +187,25 @@ class ConversationsPageState extends State<ConversationsPage> {
     }
   }
 
-  Future<void> reload() async {
+  /// 读取一次列表快照（DB / AI 的既有 await 顺序保持不变）。
+  ///
+  /// B43：每个 await 之后都检查 mounted 与串行号 —— 旧请求不再写 UI，
+  /// 也不会覆盖更新的快照。返回 null 表示本次已被更新的请求取代。
+  Future<ConversationsLoadResult?> _loadFromServices(int serial) async {
     final db = AppDatabase.instance;
     final ai = AiClient.instance;
+    bool stale() => !mounted || serial != _reloadSerial;
+
     final list = await db.getConversations();
+    if (stale()) return null;
     final pending = await db.pendingProposalCountsByConversation();
+    if (stale()) return null;
     final remotes = await ai.getRemoteEndpoints();
+    if (stale()) return null;
     final defaultId = await ai.getDefaultEndpointId();
+    if (stale()) return null;
     final online = await ai.isDesktopOnline();
+    if (stale()) return null;
     Map<String, String> desktopNames = {};
     if (online) {
       try {
@@ -156,17 +214,61 @@ class ConversationsPageState extends State<ConversationsPage> {
       } catch (_) {
         // 模型名只是副标题展示，拉取失败按「LinkModel 模型」兜底
       }
+      if (stale()) return null;
     }
-    if (!mounted) return;
-    setState(() {
-      _conversations = list;
-      _pendingCounts = pending;
-      _desktopOnline = online;
-      _remotesById = {for (final e in remotes) e.id: e};
-      _desktopModelNames = desktopNames;
-      _defaultEndpointId = defaultId;
+    return ConversationsLoadResult(
+      conversations: list,
+      pendingCounts: pending,
+      desktopOnline: online,
+      remotesById: {for (final e in remotes) e.id: e},
+      desktopModelNames: desktopNames,
+      defaultEndpointId: defaultId,
+    );
+  }
+
+  Future<void> reload() async {
+    final serial = ++_reloadSerial;
+    if (_initialLoadPending) _armLoadingTimer(serial);
+    try {
+      final result = debugLoaderOverride != null
+          ? await debugLoaderOverride!()
+          : await _loadFromServices(serial);
+      if (result == null || !mounted || serial != _reloadSerial) return;
+      setState(() {
+        _conversations = result.conversations;
+        _pendingCounts = result.pendingCounts;
+        _desktopOnline = result.desktopOnline;
+        _remotesById = result.remotesById;
+        _desktopModelNames = result.desktopModelNames;
+        _defaultEndpointId = result.defaultEndpointId;
+        _initialLoadPending = false;
+        _showLoading = false;
+      });
+      _loadingTimer?.cancel();
+      _loadingTimer = null;
+      _syncTicker();
+    } finally {
+      // 异常/提前返回：结束「最新」那次加载态并取消计时器，避免永久空白；
+      // 旧请求（serial 已变）不动新请求的状态。异常本身仍向上抛（不吞错）。
+      if (mounted && serial == _reloadSerial && _initialLoadPending) {
+        _loadingTimer?.cancel();
+        _loadingTimer = null;
+        setState(() {
+          _initialLoadPending = false;
+          _showLoading = false;
+        });
+        _syncTicker();
+      }
+    }
+  }
+
+  /// 首次加载：延迟 [_loadingDelay] 后，若仍是最新请求且尚未完成，才显示加载指示。
+  void _armLoadingTimer(int serial) {
+    _loadingTimer?.cancel();
+    _loadingTimer = Timer(_loadingDelay, () {
+      if (!mounted || serial != _reloadSerial || !_initialLoadPending) return;
+      setState(() => _showLoading = true);
     });
-    _syncTicker();
   }
 
   // ---- 动作 ----
@@ -204,8 +306,7 @@ class ConversationsPageState extends State<ConversationsPage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () =>
-                Navigator.of(context).pop(controller.text.trim()),
+            onPressed: () => Navigator.of(context).pop(controller.text.trim()),
             child: const Text('保存'),
           ),
         ],
@@ -232,8 +333,7 @@ class ConversationsPageState extends State<ConversationsPage> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text('导出失败：$e'),
-            duration: const Duration(seconds: 2)));
+            content: Text('导出失败：$e'), duration: const Duration(seconds: 2)));
       }
     }
   }
@@ -285,9 +385,8 @@ class ConversationsPageState extends State<ConversationsPage> {
               },
             ),
             ListTile(
-              leading: Icon(conv.pinned
-                  ? Icons.push_pin_outlined
-                  : Icons.push_pin),
+              leading:
+                  Icon(conv.pinned ? Icons.push_pin_outlined : Icons.push_pin),
               title: Text(conv.pinned ? '取消置顶' : '置顶'),
               onTap: () {
                 Navigator.of(sheetContext).pop();
@@ -306,8 +405,8 @@ class ConversationsPageState extends State<ConversationsPage> {
               leading: Icon(Icons.delete_outline,
                   color: Theme.of(sheetContext).colorScheme.error),
               title: Text('删除',
-                  style:
-                      TextStyle(color: Theme.of(sheetContext).colorScheme.error)),
+                  style: TextStyle(
+                      color: Theme.of(sheetContext).colorScheme.error)),
               onTap: () async {
                 Navigator.of(sheetContext).pop();
                 if (await _confirmDelete(conv)) {
@@ -357,12 +456,10 @@ class ConversationsPageState extends State<ConversationsPage> {
     return _desktopOnline ? '配置已失效' : 'LinkModel 模型';
   }
 
-  ChannelStatus _channelStatus(Conversation c) =>
-      conversationChannelStatus(
+  ChannelStatus _channelStatus(Conversation c) => conversationChannelStatus(
         modelConfigId: c.modelConfigId,
         desktopOnline: _desktopOnline,
-        isKnownDesktopModel:
-            _desktopModelNames.containsKey(c.modelConfigId),
+        isKnownDesktopModel: _desktopModelNames.containsKey(c.modelConfigId),
         boundRemote: _remotesById[c.modelConfigId],
         hasDefaultRemote: _defaultEndpointId != null,
       );
@@ -376,8 +473,7 @@ class ConversationsPageState extends State<ConversationsPage> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final totalPending =
-        _pendingCounts.values.fold<int>(0, (a, b) => a + b);
+    final totalPending = _pendingCounts.values.fold<int>(0, (a, b) => a + b);
     return Scaffold(
       appBar: AppBar(
         title: _searching
@@ -438,7 +534,9 @@ class ConversationsPageState extends State<ConversationsPage> {
         ],
       ),
       body: _searching ? _buildSearchResults(cs) : _buildList(cs),
-      floatingActionButton: _searching
+      // B43：首次加载未完成时（含 0–200ms 与 >200ms 两段）不显示新建引导 ——
+      // 用户批准的加载逻辑要求「加载中不出现空态/新建引导」；完成后恢复。
+      floatingActionButton: (_searching || _initialLoadPending)
           ? null
           : FloatingActionButton(
               tooltip: '新建对话',
@@ -449,17 +547,24 @@ class ConversationsPageState extends State<ConversationsPage> {
   }
 
   Widget _buildList(ColorScheme cs) {
+    if (_showLoading) {
+      // B43：首次加载（延迟 200ms 后才出现）。加载中不出现空态文案/新建引导。
+      return const AssistantLoadingIndicator();
+    }
+    if (_initialLoadPending) {
+      // 首次加载的 0–200ms 窗口：不显示任何内容，避免先闪一下「无任何会话」空态。
+      return const SizedBox.shrink();
+    }
     if (_conversations.isEmpty) {
       // 标准空态（§2.1）
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.smart_toy_outlined,
-                size: 48, color: cs.onSurfaceVariant),
+            // F45：新双星（48px，空态用 onSurfaceVariant）。
+            AssistantLogo(size: 48, color: cs.onSurfaceVariant),
             const SizedBox(height: 12),
-            Text('和助理一起整理你的库',
-                style: TextStyle(color: cs.onSurfaceVariant)),
+            Text('和助理一起整理你的库', style: TextStyle(color: cs.onSurfaceVariant)),
             const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: _newConversation,
@@ -510,8 +615,7 @@ class ConversationsPageState extends State<ConversationsPage> {
         alignment: Alignment.centerLeft,
         padding: const EdgeInsets.only(left: 16),
         color: cs.primaryContainer,
-        child: Icon(
-            c.pinned ? Icons.push_pin_outlined : Icons.push_pin,
+        child: Icon(c.pinned ? Icons.push_pin_outlined : Icons.push_pin,
             color: cs.onPrimaryContainer),
       ),
       secondaryBackground: Container(
@@ -535,8 +639,8 @@ class ConversationsPageState extends State<ConversationsPage> {
         title: Row(
           children: [
             Flexible(
-              child: Text(c.title,
-                  maxLines: 1, overflow: TextOverflow.ellipsis),
+              child:
+                  Text(c.title, maxLines: 1, overflow: TextOverflow.ellipsis),
             ),
             if (c.pinned) ...[
               const SizedBox(width: 4),
@@ -582,8 +686,7 @@ class ConversationsPageState extends State<ConversationsPage> {
 
   Widget _buildSearchResults(ColorScheme cs) {
     final q = _searchCtrl.text.trim();
-    final hitStyle =
-        TextStyle(color: cs.primary, fontWeight: FontWeight.w600);
+    final hitStyle = TextStyle(color: cs.primary, fontWeight: FontWeight.w600);
     if (q.isEmpty) {
       return Center(
         child: Text('输入关键字，匹配对话标题与消息全文',
@@ -596,8 +699,8 @@ class ConversationsPageState extends State<ConversationsPage> {
     }
     if (hits.isEmpty) {
       return Center(
-        child: Text('没有找到「$q」相关的内容',
-            style: TextStyle(color: cs.onSurfaceVariant)),
+        child:
+            Text('没有找到「$q」相关的内容', style: TextStyle(color: cs.onSurfaceVariant)),
       );
     }
     return ListView(
@@ -610,23 +713,21 @@ class ConversationsPageState extends State<ConversationsPage> {
                     : Icons.format_quote,
                 color: cs.onSurfaceVariant),
             title: Text.rich(
-              TextSpan(children: highlightSpans(
-                  h.conversation.title, q, hitStyle)),
+              TextSpan(
+                  children: highlightSpans(h.conversation.title, q, hitStyle)),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
             subtitle: h.snippet != null
                 ? Text.rich(
-                    TextSpan(
-                        children: highlightSpans(h.snippet!, q, hitStyle)),
+                    TextSpan(children: highlightSpans(h.snippet!, q, hitStyle)),
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                   )
                 : Text(
                     relativeConversationTime(
                         h.conversation.updatedAt, DateTime.now()),
-                    style:
-                        TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
             onTap: () async {
               await Navigator.of(context).push(
                 MaterialPageRoute(

@@ -6,6 +6,7 @@ import '../../services/assistant/assistant_client.dart';
 import '../../services/database.dart';
 import '../../services/model_capabilities.dart';
 import 'model_setup_wizard.dart';
+import 'widgets/assistant_logo.dart';
 
 /// 模型配置（assistant-v4-ui §5）：
 /// - 电脑端（置顶只读）：连接状态/配对 + GET /v1/models 上报的模型列表；
@@ -360,7 +361,8 @@ class _ModelPickerPageState extends State<ModelPickerPage> {
           ? Icon(
               selected ? Icons.radio_button_checked : Icons.radio_button_off,
               size: 20)
-          : Icon(Icons.smart_toy_outlined, color: cs.onSurfaceVariant),
+          // F45：仅「浏览」态用新双星；selectionMode 仍是 radio，语义不变。
+          : AssistantLogo(size: 24, color: cs.onSurfaceVariant),
       title: Text(
           '${m.name}${m.id == _desktopDefaultModelId ? '（默认）' : ''}${selected && widget.selectionMode ? ' ✓' : ''}'),
       subtitle: Text(

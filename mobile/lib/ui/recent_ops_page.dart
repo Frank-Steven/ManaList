@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../services/crdt.dart';
 import '../services/database.dart';
+import 'assistant/widgets/assistant_logo.dart';
 
 /// 最近变更审计视图（crdt.md §5）：op_log 只读列表，
 /// 让「谁在什么时候改了什么」可见——人 / 助理（对话名）/ 系统。
@@ -85,14 +86,15 @@ class RecentOpsPage extends StatelessWidget {
               final isUser = actor == OpActor.user;
               return ListTile(
                 dense: true,
-                leading: Icon(
-                  isUser
-                      ? Icons.person_outline
-                      : OpActor.isAssistant(actor)
-                          ? Icons.smart_toy_outlined
-                          : Icons.settings_suggest_outlined,
-                  color: isUser ? cs.primary : cs.onSurfaceVariant,
-                ),
+                // F45：仅 assistant 行换新双星；user / system 图标与配色不变。
+                leading: OpActor.isAssistant(actor)
+                    ? AssistantLogo(size: 24, color: cs.onSurfaceVariant)
+                    : Icon(
+                        isUser
+                            ? Icons.person_outline
+                            : Icons.settings_suggest_outlined,
+                        color: isUser ? cs.primary : cs.onSurfaceVariant,
+                      ),
                 title: Text(
                   '${_actorLabel(actor, titles)} · ${_kindLabel(op['kind'] as String)}',
                   style: const TextStyle(fontSize: 14),

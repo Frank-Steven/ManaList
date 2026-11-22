@@ -23,6 +23,7 @@ import 'model_picker.dart';
 import 'attachment_picker.dart';
 import 'conversation_export.dart';
 import 'widgets/attachment_cards.dart';
+import 'widgets/assistant_logo.dart';
 import 'widgets/chat_appbar.dart';
 import 'widgets/code_block.dart';
 import 'widgets/collapsible_content.dart';
@@ -1257,7 +1258,8 @@ class _ChatPageState extends State<ChatPage> {
     return Column(
       children: [
         const Spacer(),
-        Icon(Icons.smart_toy_outlined, size: 48, color: cs.onSurfaceVariant),
+        // F45：新双星（48px，空态用 onSurfaceVariant）。
+        AssistantLogo(size: 48, color: cs.onSurfaceVariant),
         const SizedBox(height: 12),
         Text('有什么可以帮你？',
             style: TextStyle(fontSize: 16, color: cs.onSurfaceVariant)),
@@ -1464,17 +1466,79 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   /// 统一的 Markdown 渲染（F34：历史与流式共用同一套样式）。
-  Widget _markdownView(String data, ColorScheme cs, {bool selectable = true}) =>
+  ///
+  /// B34（2026-11-22，task-22 rev5 方案）：流式正文可能停在「围栏已开、还没闭合」
+  /// 的中间态。该中间态下由我们的 FencedCodeBuilder 接管 pre，会让 flutter_markdown
+  /// 在块收尾自检（builder.dart:267 assert(_inlines.isEmpty)）失败，继发
+  /// sliver_multi_box_adaptor.dart:276。因此这里给流式调用一个 [useDefaultPre] 开关：
+  /// 未闭合期间交给上游默认 pre 渲染（同一 MarkdownBody、同一样式表、同一份数据，
+  /// 不补围栏、不跳 Markdown），围栏闭合后自动恢复既有自定义 pre。
+  /// 未闭合期间的可见差异（复制按钮暂缺、块高略变）已经用户批准。
+  ///
+  /// [keyIdentity] 只给流式正文用（传该文本段对象）：非空时给 MarkdownBody 一个
+  /// 「段身份 + pre 模式」的局部 key，使「默认 pre → 自定义 pre」切换时新建一份
+  /// MarkdownBody 状态，避免 didUpdateWidget→_parseMarkdown 复用旧 builder 再触发
+  /// builder.dart:267。历史消息不传 keyIdentity，保持无 key 的既有行为。
+  Widget _markdownView(
+    String data,
+    ColorScheme cs, {
+    bool selectable = true,
+    bool useDefaultPre = false,
+    Object? keyIdentity,
+  }) =>
       MarkdownBody(
+        key: keyIdentity == null
+            ? null
+            : ValueKey<Object>((keyIdentity, useDefaultPre)),
         data: data,
         selectable: selectable,
         softLineBreak: true,
         // F21 第③阶段：fenced code 横向滚动 + 常驻复制按钮（普通 markdown 不动）。
-        builders: {
-          "pre": FencedCodeBuilder(cs),
-        },
+        builders: useDefaultPre
+            ? const <String, MarkdownElementBuilder>{}
+            : <String, MarkdownElementBuilder>{"pre": FencedCodeBuilder(cs)},
         styleSheet: _chatMarkdownSheet(cs),
       );
+
+  /// 流式正文里是否还有**未闭合的围栏代码块**（B34 / task-22 rev5）。
+  ///
+  /// 行级状态机，不做奇偶计数（计数会被行内反引号、语言标识、缩进代码块带偏）：
+  /// - 开栏：行首（至多 3 个空格缩进）连续 ≥3 个反引号或波浪号，其后允许语言标识；
+  /// - 闭栏：与开栏同字符、长度不短于开栏，且围栏之后只剩空白；
+  /// - 普通行、行内反引号、4 个及以上空格缩进的代码行都不算围栏。
+  /// 只用于选择渲染分支，不改数据、不补围栏。
+  bool _hasUnclosedFence(String text) {
+    String? openChar;
+    var openLength = 0;
+
+    for (final line in text.split('\n')) {
+      var i = 0;
+      var indent = 0;
+      while (i < line.length && line.codeUnitAt(i) == 0x20 && indent < 4) {
+        i += 1;
+        indent += 1;
+      }
+      if (indent > 3 || i >= line.length) continue;
+      final char = line[i];
+      if (char != '`' && char != '~') continue;
+      var run = 0;
+      while (i + run < line.length && line[i + run] == char) {
+        run += 1;
+      }
+      if (run < 3) continue;
+      final rest = line.substring(i + run);
+      if (openChar == null) {
+        openChar = char;
+        openLength = run;
+        continue;
+      }
+      if (char == openChar && run >= openLength && rest.trim().isEmpty) {
+        openChar = null;
+        openLength = 0;
+      }
+    }
+    return openChar != null;
+  }
 
   MarkdownStyleSheet _chatMarkdownSheet(ColorScheme cs) => MarkdownStyleSheet(
         p: TextStyle(fontSize: 16, height: 1.6, color: cs.onSurface),
@@ -1697,6 +1761,8 @@ class _ChatPageState extends State<ChatPage> {
               segment.text,
               cs,
               selectable: false,
+              useDefaultPre: _hasUnclosedFence(segment.text),
+              keyIdentity: segment,
             ),
             ChatStreamSegmentKind.thinking => ThinkingBlock(
               segment: segment,
@@ -1728,6 +1794,15 @@ class _ChatPageState extends State<ChatPage> {
     }
 
     return Padding(
+      // B34（2026-11-22）：活动流式区的**固定身份**。
+      // 零历史首回合里，外层 ListView 的 children 会从「仅活动区」变成
+      // 「用户消息 + assistant 占位 + 活动区」，活动区的下标随之改变；
+      // 没有 key 时 Flutter 按位置/类型匹配，会把这棵流式子树的 element
+      // 拆掉重建（该结构变化是本次固定 key 要治理的候选风险；真机首断是否
+      // 消除仍待功能验收）。
+      // 常量 ValueKey 让它在列表中按身份移动；刻意不用索引或文本哈希当 key，
+      // 也不用需要挂 State 的全局 key 替代。
+      key: const ValueKey('active-streaming-turn'),
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

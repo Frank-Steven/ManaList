@@ -11,6 +11,7 @@ import 'services/app_ui_state.dart';
 import 'services/notification_bridge.dart';
 import 'services/reminder_service.dart';
 import 'ui/assistant/conversations_page.dart';
+import 'ui/assistant/widgets/assistant_logo.dart';
 import 'ui/library/library_page.dart';
 import 'ui/settings_page.dart';
 import 'ui/tasks/tasks_page.dart';
@@ -363,8 +364,12 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
             label: '库'),
         const NavigationDestination(
             icon: Icon(Icons.check_circle_outline), label: '任务'),
+        // F45：助理入口用新双星；不传色 → 跟随 IconTheme（选中/未选中/深浅色）。
+        // ExcludeSemantics：LOGO 自带 label「助理」，导航项本身也有 label「助理」，
+        // 不排除会双播报。
         const NavigationDestination(
-            icon: Icon(Icons.smart_toy_outlined), label: '助理'),
+            icon: ExcludeSemantics(child: AssistantLogo(size: 24)),
+            label: '助理'),
         const NavigationDestination(
             icon: Icon(Icons.settings_outlined), label: '设置'),
       ],

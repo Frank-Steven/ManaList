@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:msgrepo_mobile/models/conversation.dart';
 import 'package:msgrepo_mobile/services/crdt.dart';
 import 'package:msgrepo_mobile/services/database.dart';
+import 'package:msgrepo_mobile/ui/assistant/widgets/assistant_logo.dart';
 import 'package:msgrepo_mobile/ui/recent_ops_page.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -30,8 +31,8 @@ void main() {
       await createBaseTables(db);
       appDb.debugAttachDatabase(db);
       final now = DateTime.now().millisecondsSinceEpoch;
-      await appDb.insertConversation(
-          Conversation(id: 'c1', title: '周报对话', createdAt: now, updatedAt: now));
+      await appDb.insertConversation(Conversation(
+          id: 'c1', title: '周报对话', createdAt: now, updatedAt: now));
 
       // 三种 actor 各落一条 op
       await insertTask(db, 't1', title: '买菜');
@@ -55,6 +56,33 @@ void main() {
       expect(find.textContaining('系统 · 赋值'), findsOneWidget);
       expect(find.textContaining('tasks:t1:title'), findsWidgets);
       expect(find.textContaining('messages:m1:priority'), findsOneWidget);
+
+      // F45（task-45）：actor 图标 —— user=person_outline、system=settings_suggest_outlined、
+      // assistant=新双星；隔离 widget 补验，不代表真机覆盖。
+      expect(find.byIcon(Icons.person_outline), findsOneWidget,
+          reason: 'user 行仍是 person_outline');
+      expect(find.byIcon(Icons.settings_suggest_outlined), findsOneWidget,
+          reason: 'system 行仍是 settings_suggest_outlined');
+
+      // 两条 assistant op（title/description）→ 两个新双星
+      expect(find.byType(AssistantLogo), findsNWidgets(2),
+          reason: 'assistant 行用新双星，数量应与 assistant op 条数一致');
+      final assistantTile = find
+          .ancestor(
+            of: find.textContaining('助理·周报对话 · 赋值').first,
+            matching: find.byType(ListTile),
+          )
+          .first;
+      final logoInAssistantTile = find.descendant(
+          of: assistantTile, matching: find.byType(AssistantLogo));
+      expect(logoInAssistantTile, findsOneWidget,
+          reason: 'assistant 行的 leading 必须是新双星');
+      final logo = tester.widget<AssistantLogo>(logoInAssistantTile);
+      expect(logo.size, 24, reason: 'recent_ops 行图标 24px');
+      final cs =
+          Theme.of(tester.element(find.byType(RecentOpsPage))).colorScheme;
+      expect(logo.color, cs.onSurfaceVariant,
+          reason: 'assistant 行图标颜色应跟随 onSurfaceVariant');
 
       await Future<void>.delayed(const Duration(milliseconds: 450));
       appDb.debugDetachDatabase();
