@@ -36,15 +36,24 @@ class UndoService {
   UndoEntry? get latest => _entries.isEmpty ? null : _entries.last.entry;
 
   /// 入栈顶，10 秒过期自动丢弃并广播。
+  ///
+  /// [onExpire] 可选（B46）：条目**到期、被 [clear] 丢弃、或 undo 抛错**时，
+  /// 用它清理随条目附带的资源（例如已归档批量删除写入 DB 的撤销备份）。
+  /// 成功 undo 的资源由 undo 闭包自己清，这里不会重复调用。
+  /// 不传该参数的既有调用方行为完全不变。
   void register(
-      {required String label, required Future<void> Function() undo}) {
+      {required String label,
+      required Future<void> Function() undo,
+      Future<void> Function()? onExpire}) {
     final item = _UndoItem(
       entry: UndoEntry(
           id: const Uuid().v4(), label: label, enqueuedAt: DateTime.now()),
       undo: undo,
+      onExpire: onExpire,
     );
     item.timer = Timer(_ttl, () {
       _entries.remove(item);
+      unawaited(_runOnExpire(item));
       _changesController.add(null);
     });
     _entries.add(item);
@@ -58,14 +67,29 @@ class UndoService {
     item.timer?.cancel();
     try {
       await item.undo();
+    } catch (_) {
+      // undo 失败：连带清理该条目附带的资源（B46 的 DB 备份），再原样抛出。
+      await _runOnExpire(item);
+      rethrow;
     } finally {
       _changesController.add(null);
+    }
+  }
+
+  /// 执行条目附带的到期清理；失败只吞掉（备份清理失败不该打断撤销语义，
+  /// 下次开库 / 新建备份前还会再清一次）。
+  Future<void> _runOnExpire(_UndoItem item) async {
+    try {
+      await item.onExpire?.call();
+    } catch (_) {
+      // 故意忽略
     }
   }
 
   void clear() {
     for (final item in _entries) {
       item.timer?.cancel();
+      unawaited(_runOnExpire(item));
     }
     if (_entries.isNotEmpty) {
       _entries.clear();
@@ -77,7 +101,10 @@ class UndoService {
 class _UndoItem {
   final UndoEntry entry;
   final Future<void> Function() undo;
+
+  /// 可选：条目到期/被清空/undo 失败时的资源清理（B46 用）。
+  final Future<void> Function()? onExpire;
   Timer? timer;
 
-  _UndoItem({required this.entry, required this.undo});
+  _UndoItem({required this.entry, required this.undo, this.onExpire});
 }

@@ -30,39 +30,62 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
 
   Future<void> reload() async {
     final messages = await _db.getMessages(status: MessageStatus.archived);
+    // B46：选择集是「ID 快照」，这里只剔除已不存在的 ID；
+    // 期间新归档的消息**不会**自动并入旧快照（避免全选集合被悄悄扩大）。
+    final allIds = (await _db.getArchivedMessageIds()).toSet();
     if (!mounted) return;
     setState(() {
       _messages = messages;
       _loading = false;
-      _selected.removeWhere((id) => !_messages.any((m) => m.id == id));
+      _selected.removeWhere((id) => !allIds.contains(id));
       if (_selected.isEmpty) _selecting = false;
     });
   }
 
-  Future<void> _unarchive(List<Message> targets) async {
-    await _db.updateMessageStatus(
-        [for (final m in targets) m.id], MessageStatus.processed);
+  /// B46：全选 = **全部已归档**。首屏仍只查 defaultMessageLimit(500) 条，
+  /// 但选择范围来自 ID 快照（getArchivedMessageIds），不再是首屏列表。
+  Future<void> _selectAll() async {
+    final ids = await _db.getArchivedMessageIds();
+    if (!mounted) return;
+    setState(() {
+      _selected
+        ..clear()
+        ..addAll(ids);
+      _selecting = _selected.isNotEmpty;
+    });
+  }
+
+  /// B46：按 ID 取出（500 分块更新 processed，然后一次 reload）。
+  Future<void> _unarchiveIds(List<String> ids) async {
+    if (ids.isEmpty) return;
+    await _db.updateMessageStatusChunked(ids, MessageStatus.processed);
     UndoService.instance.register(
       label: '已取出',
-      undo: () async {
-        await _db.updateMessageStatus(
-            [for (final m in targets) m.id], MessageStatus.archived);
-      },
+      undo: () => _db.updateMessageStatusChunked(ids, MessageStatus.archived),
     );
     if (!mounted) return;
     showUndoSnackBar(context, '已取出', onUndone: reload);
     await reload();
   }
 
-  Future<void> _delete(List<Message> targets) async {
-    await _db.deleteMessages([for (final m in targets) m.id]);
+  /// B46：按 ID 删除 —— 单事务写入 DB 撤销备份再删；撤销闭包只持批次 id。
+  Future<void> _deleteIds(List<String> ids) async {
+    if (ids.isEmpty) return;
+    final batchId = await _db.deleteArchivedWithBackup(ids);
+    if (batchId == null) return;
     UndoService.instance.register(
       label: '已删除',
-      undo: () => _db.restoreMessages(targets),
+      undo: () => _db.restoreDeletedMessageBatch(batchId),
+      // 到期 / clear / undo 失败时丢弃这批备份（成功 undo 已由恢复函数清掉）。
+      onExpire: () => _db.deleteUndoBackupBatch(batchId),
     );
+    // B46（task-76/77）：先把列表 reload 完，再弹 SnackBar。
+    // 原来的「先 show 再 reload」会让 reload 触发的重建与 SnackBar 展示同一帧竞争：
+    // 真机上表现为删除后 0.3–4.2s 连拍都看不到「已删除 + 撤销」（4s 窗口被吃光）。
+    // 这里只调整顺序，备份/UndoService 注册/闭包/4s 时长一律不动。
+    await reload();
     if (!mounted) return;
     showUndoSnackBar(context, '已删除', onUndone: reload);
-    await reload();
   }
 
   /// 右滑（积极）：取出归档。
@@ -73,7 +96,7 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
         icon: Icons.unarchive_outlined,
         label: '取出',
         color: cs.primary,
-        onTap: () => _unarchive([m]),
+        onTap: () => _unarchiveIds([m.id]),
       ),
     ];
   }
@@ -86,13 +109,10 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
         icon: Icons.delete_outline,
         label: '删除',
         color: cs.error,
-        onTap: () => _delete([m]),
+        onTap: () => _deleteIds([m.id]),
       ),
     ];
   }
-
-  List<Message> get _selectedMessages =>
-      _messages.where((m) => _selected.contains(m.id)).toList();
 
   void _toggleSelect(Message m) {
     setState(() {
@@ -108,10 +128,11 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
     });
   }
 
-  Future<void> _runBatch(Future<void> Function(List<Message>) op) async {
-    final targets = _selectedMessages;
+  /// B46：批量入口只传**选择的 ID**（快照可能包含首屏之外的 ID）。
+  Future<void> _runBatch(Future<void> Function(List<String> ids) op) async {
+    final ids = _selected.toList();
     _exitSelection();
-    if (targets.isNotEmpty) await op(targets);
+    if (ids.isNotEmpty) await op(ids);
   }
 
   AppBar _buildAppBar() {
@@ -125,8 +146,8 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
         title: Text('已选 ${_selected.length} 项'),
         actions: [
           TextButton(
-            onPressed: () => setState(
-                () => _selected.addAll(_messages.map((m) => m.id))),
+            // B46：全选 = 全部已归档（ID 快照），不再只选首屏这 500 条。
+            onPressed: () => _selectAll(),
             child: const Text('全选'),
           ),
           TextButton(
@@ -213,13 +234,13 @@ class _ArchivedMessagesPageState extends State<ArchivedMessagesPage> {
                   icon: Icons.unarchive_outlined,
                   tooltip: '取出',
                   enabled: hasSelection,
-                  onTap: () => _runBatch(_unarchive),
+                  onTap: () => _runBatch(_unarchiveIds),
                 ),
                 SelectionAction(
                   icon: Icons.delete_outline,
                   tooltip: '删除',
                   enabled: hasSelection,
-                  onTap: () => _runBatch(_delete),
+                  onTap: () => _runBatch(_deleteIds),
                 ),
               ],
             ),

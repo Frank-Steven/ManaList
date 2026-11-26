@@ -111,14 +111,21 @@ String formatMessageTime(int ms) {
 /// 操作成功后的撤销 SnackBar（设计 §6，v2.4 重做）：「{label}」+ 撤销按钮 +
 /// 底部细进度条（剩余时间，4 秒）。按住或鼠标悬停时暂停倒计时并回满，
 /// 松开/移出后继续；超时自动关闭。撤销注册由调用方在调用本函数前完成。
+/// [aboveFab] = true 时改用 floating 并抬高 88dp，避开右下角 FAB
+/// （F18 task-87：消息页多选时撤销中心与库页 FAB 重合，tap 被 FAB 吃掉）；
+/// 默认 false = 与归档页等既有调用完全一致。
 void showUndoSnackBar(BuildContext context, String label,
-    {VoidCallback? onUndone, ScaffoldMessengerState? messenger}) {
+    {VoidCallback? onUndone,
+    ScaffoldMessengerState? messenger,
+    bool aboveFab = false}) {
   final m = messenger ?? ScaffoldMessenger.of(context);
   m.hideCurrentSnackBar();
   m.showSnackBar(
     SnackBar(
       // 关闭时机由内容里的进度控制器自管，时长设长避免系统提前收起
       duration: const Duration(days: 1),
+      behavior: aboveFab ? SnackBarBehavior.floating : null,
+      margin: aboveFab ? const EdgeInsets.fromLTRB(12, 0, 12, 88) : null,
       content: _UndoSnackContent(
         label: label,
         onExpired: m.hideCurrentSnackBar,
@@ -727,16 +734,26 @@ class SelectionActionBar extends StatelessWidget {
         top: false,
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceAround,
-            children: [
-              for (final a in actions)
-                IconButton(
-                  tooltip: a.tooltip,
-                  onPressed: a.enabled ? a.onTap : null,
-                  icon: Icon(a.icon),
+          // F18：窄屏（如 320dp）下 7 个 48dp 按钮会溢出 —— 宽屏仍按 spaceAround 均分，
+          // 总宽不足时改为横向滚动（按钮、动作、48dp 触及区全部不变）。
+          child: LayoutBuilder(
+            builder: (context, constraints) => SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minWidth: constraints.maxWidth),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: [
+                    for (final a in actions)
+                      IconButton(
+                        tooltip: a.tooltip,
+                        onPressed: a.enabled ? a.onTap : null,
+                        icon: Icon(a.icon),
+                      ),
+                  ],
                 ),
-            ],
+              ),
+            ),
           ),
         ),
       ),

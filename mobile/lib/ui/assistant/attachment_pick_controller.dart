@@ -68,6 +68,22 @@ class AttachmentPickController extends ChangeNotifier {
     if (isNew) notifyListeners();
   }
 
+  /// 批量选中（F18：消息页「全选」用）：与 [select] 同一存储，
+  /// 但**最多只 notify 一次** —— 1200 条全选不再逐条触发重建。
+  void selectMany(String type, Map<String, String> titlesById,
+      {IconData? icon}) {
+    if (titlesById.isEmpty) return;
+    var changed = false;
+    titlesById.forEach((id, title) {
+      final key = keyOf(type, id);
+      if (!_refs.containsKey(key)) changed = true;
+      _refs[key] = ChatAttachment(type: type, id: id);
+      _titles[key] = title;
+      if (icon != null) _icons[key] = icon;
+    });
+    if (changed) notifyListeners();
+  }
+
   void deselect(String type, String id) {
     if (_refs.remove(keyOf(type, id)) != null) notifyListeners();
   }

@@ -367,8 +367,10 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         // F45：助理入口用新双星；不传色 → 跟随 IconTheme（选中/未选中/深浅色）。
         // ExcludeSemantics：LOGO 自带 label「助理」，导航项本身也有 label「助理」，
         // 不排除会双播报。
+        // B45：导航槽位 24dp 里与相邻 Material 图标等粗 → 显式 2dp 有效线宽
+        //（其它入口不传 strokeDp，仍是 F45 的 viewBox 22/18）。
         const NavigationDestination(
-            icon: ExcludeSemantics(child: AssistantLogo(size: 24)),
+            icon: ExcludeSemantics(child: AssistantLogo(size: 24, strokeDp: 2)),
             label: '助理'),
         const NavigationDestination(
             icon: Icon(Icons.settings_outlined), label: '设置'),

@@ -276,6 +276,35 @@ Future<void> migrateToV14(DatabaseExecutor db) async {
   }
 }
 
+/// v15（B46）：已归档「全选批量删除」的一次性撤销备份。
+///
+/// 备份的是**完整原行**（row_json），恢复不依赖 Messages 模型字段增减；
+/// 锚点单独一张表（删消息会级联删 task_anchors，恢复必须**先 messages 后 anchors**）。
+/// onCreate 与 v14→v15 迁移共用，IF NOT EXISTS 保证幂等。
+Future<void> migrateToV15(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS undo_deleted_messages(
+      batch_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      row_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY(batch_id, message_id)
+    )
+  ''');
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS undo_deleted_anchors(
+      batch_id TEXT NOT NULL,
+      anchor_id TEXT NOT NULL,
+      row_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY(batch_id, anchor_id)
+    )
+  ''');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_undo_msgs_created ON undo_deleted_messages(created_at)');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_undo_anchors_created ON undo_deleted_anchors(created_at)');
+}
 /// op_log 建表（crdt.md §2.2/§7，DB v12）。onCreate 与 v12 迁移共用。
 Future<void> createOpLogTable(DatabaseExecutor db) async {
   await db.execute('''
@@ -508,6 +537,15 @@ class AppDatabase {
 
   /// 列表默认上限（P3-8）：超出时调用方应提示「仅显示前 N 条」而不是静默截断。
   static const defaultMessageLimit = 500;
+
+  /// 库结构版本（B46：v15 增撤销备份表）。测试可直接断言它被升到 15。
+  static const dbVersion = 15;
+
+  /// B46：撤销备份 TTL（与 UndoService 的 10 秒撤销窗口一致）。
+  static const undoBackupTtl = Duration(seconds: 10);
+
+  /// B46：批量操作分块大小（IN 列表与事务内单块读取上限）。
+  static const undoChunkSize = 500;
   static const defaultTaskLimit = 1000;
 
   static final AppDatabase instance = AppDatabase._();
@@ -616,11 +654,14 @@ class AppDatabase {
     final dir = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dir, 'msgrepo.db'),
-      version: 14,
+      version: dbVersion,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
     await _restoreLamport(_db!);
+    // B46：开库后清理过期撤销备份。这里把 db 直接交给私有实现，
+    // 不调用公开方法，避免在 openDatabase 回调链里重入本 getter。
+    await _cleanupExpiredUndoBackups(_db!);
     return _db!;
   }
 
@@ -675,6 +716,10 @@ class AppDatabase {
     if (oldVersion < 14) {
       // v14（F35）：thinking_ms —— 思考耗时，结束态不再显示 0s。
       await migrateToV14(db);
+    }
+    if (oldVersion < 15) {
+      // v15（B46）：已归档批量删除的撤销备份表（messages / task_anchors 原行 JSON）。
+      await migrateToV15(db);
     }
   }
 
@@ -762,6 +807,8 @@ class AppDatabase {
     await migrateToV10(db);
     // v12 起初始建库直接带上 op_log（空库上锚点迁移为 no-op）
     await migrateToV12(db);
+    // v15 起初始建库直接带上撤销备份表（B46）
+    await migrateToV15(db);
   }
 
   /// v2 数据层建表（设计 §1.1 messages、§1.2 tasks、§1.3 笔记三级）。
@@ -1031,19 +1078,29 @@ class AppDatabase {
   }
 
   /// [oldestFirst] = true 时按 posted_at 升序（自动处理用：先清最早的积压）。
+  ///
+  /// [limit] 可传 null（F18）：null = 不加 LIMIT，用于消息页「全量非归档」加载；
+  /// 不传时仍是既有的 [defaultMessageLimit]，其它调用方行为不变。
   Future<List<Message>> getMessages(
       {String? status,
       String? packageName,
       List<String>? priorities,
-      int limit = defaultMessageLimit,
+      int? limit = defaultMessageLimit,
       int offset = 0,
-      bool oldestFirst = false}) async {
+      bool oldestFirst = false,
+      // F18（task-85）：消息主列表只要非归档。false 时在 **SQL 层**排除归档，
+      // 避免把全量归档行解码到 Dart 再丢弃（真机 57k 行时这一步很贵）。
+      bool includeArchived = true}) async {
     final db = await database;
     final wheres = <String>[];
     final args = <Object?>[];
     if (status != null) {
       wheres.add('status = ?');
       args.add(status);
+    }
+    if (!includeArchived) {
+      wheres.add('status != ?');
+      args.add(MessageStatus.archived);
     }
     if (packageName != null) {
       wheres.add('package_name = ?');
@@ -1362,6 +1419,180 @@ class AppDatabase {
     await batch.commit(noResult: true);
   }
 
+  // ---- B46：已归档「全选」ID 快照 / 分块删除 / 一次撤销备份（DB v15） ----
+
+  /// 全部已归档消息的 **ID 列表**（只 SELECT id，不加载全量 Message）。
+  ///
+  /// B46 的关键点：已归档页首屏仍只查 [defaultMessageLimit] 条，但「全选」用本方法
+  /// 拿到的 ID 快照作为选择范围，因此全选 = 全部已归档（不再受首屏 500 限制）。
+  Future<List<String>> getArchivedMessageIds() async {
+    final db = await database;
+    final rows = await db.query(
+      'messages',
+      columns: ['id'],
+      where: 'status = ?',
+      whereArgs: [MessageStatus.archived],
+      orderBy: 'posted_at DESC',
+    );
+    return <String>[for (final r in rows) r['id'] as String];
+  }
+
+  /// 按 [undoChunkSize] 分块改状态（B46「取出」用：IN 列表不超过 500）。
+  Future<void> updateMessageStatusChunked(
+      List<String> ids, String status) async {
+    for (final chunk in _chunked(ids)) {
+      await updateMessageStatus(chunk, status);
+    }
+  }
+
+  /// 按 [undoChunkSize] 分块改优先级（F18：大全选标记/移出垃圾时避免 IN 超参）。
+  ///
+  /// 只是既有 [updateMessagePriority] 的 500 分块包装，不新增任何写语义
+  /// （含每条的 op_log 记录）。归档批量仍用 [updateMessageStatusChunked]。
+  Future<void> updateMessagePriorityChunked(List<String> ids, String priority,
+      {String actor = OpActor.user}) async {
+    for (final chunk in _chunked(ids)) {
+      await updateMessagePriority(chunk, priority, actor: actor);
+    }
+  }
+
+  /// 按 ID 批量删除消息，并在**同一个事务**里写好一次性撤销备份。
+  ///
+  /// F18（2026-11-26）：SQL 只按传入 ID 操作、不筛归档状态，因此归档页与主消息页的
+  /// 永久删除共用本方法（方法名保留 deleteArchivedWithBackup，避免牵动 archived_page）。
+  ///
+  /// 事务内每块 ≤ [undoChunkSize]：读 messages / task_anchors 的原行 → jsonEncode 入
+  /// undo_deleted_* → 删除消息与其锚点（复用既有应用层级联口径）。
+  /// **任何一块失败则整个事务回滚**：消息不删、备份不留。
+  /// 返回撤销批次 id（入参为空时返回 null，且不产生任何备份行）。
+  Future<String?> deleteArchivedWithBackup(List<String> ids) async {
+    if (ids.isEmpty) return null;
+    final db = await database;
+    // 新备份前先清过期记录，避免备份表堆积死行。
+    await _cleanupExpiredUndoBackups(db);
+    final batchId = const Uuid().v4();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    await db.transaction((txn) async {
+      for (final chunk in _chunked(ids)) {
+        final placeholders = List.filled(chunk.length, '?').join(',');
+        final msgRows = await txn.query('messages',
+            where: 'id IN ($placeholders)', whereArgs: chunk);
+        final anchorRows = await txn.query('task_anchors',
+            where: "target_type = 'message' AND target_id IN ($placeholders)",
+            whereArgs: chunk);
+        for (final row in msgRows) {
+          await txn.insert(
+            'undo_deleted_messages',
+            {
+              'batch_id': batchId,
+              'message_id': row['id'],
+              'row_json': jsonEncode(row),
+              'created_at': now,
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+        for (final row in anchorRows) {
+          await txn.insert(
+            'undo_deleted_anchors',
+            {
+              'batch_id': batchId,
+              'anchor_id': row['id'],
+              'row_json': jsonEncode(row),
+              'created_at': now,
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+        // 与 deleteMessages 相同的级联口径（sqflite 默认不开外键）。
+        await txn.delete('task_anchors',
+            where: "target_type = 'message' AND target_id IN ($placeholders)",
+            whereArgs: chunk);
+        await txn.delete('messages',
+            where: 'id IN ($placeholders)', whereArgs: chunk);
+      }
+    });
+    return batchId;
+  }
+
+  /// B46：一次撤销 —— 在**同一个事务**里按块恢复该批 messages，再恢复 task_anchors，
+  /// 最后清掉该批备份行。恢复完全按 row_json 原样回插，不经过模型字段映射。
+  Future<void> restoreDeletedMessageBatch(String batchId) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final msgRows = await txn.query('undo_deleted_messages',
+          where: 'batch_id = ?', whereArgs: [batchId], orderBy: 'message_id ASC');
+      for (final chunk in _chunked(msgRows)) {
+        final batch = txn.batch();
+        for (final r in chunk) {
+          final row = (jsonDecode(r['row_json'] as String) as Map)
+              .cast<String, Object?>();
+          batch.insert('messages', row,
+              conflictAlgorithm: ConflictAlgorithm.replace);
+        }
+        await batch.commit(noResult: true);
+      }
+      final anchorRows = await txn.query('undo_deleted_anchors',
+          where: 'batch_id = ?', whereArgs: [batchId], orderBy: 'anchor_id ASC');
+      for (final chunk in _chunked(anchorRows)) {
+        final batch = txn.batch();
+        for (final r in chunk) {
+          final row = (jsonDecode(r['row_json'] as String) as Map)
+              .cast<String, Object?>();
+          batch.insert('task_anchors', row,
+              conflictAlgorithm: ConflictAlgorithm.replace);
+        }
+        await batch.commit(noResult: true);
+      }
+      await _deleteUndoBatchRows(txn, batchId);
+    });
+  }
+
+  /// B46：丢弃某一批备份（撤销窗口到期 / UndoService.clear / undo 失败时调用）。
+  Future<void> deleteUndoBackupBatch(String batchId) async {
+    final db = await database;
+    await db.transaction((txn) => _deleteUndoBatchRows(txn, batchId));
+  }
+
+  /// B46：清理过期撤销备份（默认 10 秒 TTL）。
+  ///
+  /// 调用点：开库后（见 [database] getter）、新建备份前、UndoService 到期回调。
+  /// 未 attach/开库时是 no-op（测试可直接用 [debugAttachDatabase] 走同一条实现）。
+  Future<void> cleanupExpiredUndoBackups({Duration? ttl}) async {
+    final db = _db;
+    if (db == null) return;
+    await _cleanupExpiredUndoBackups(db, ttl: ttl ?? undoBackupTtl);
+  }
+
+  Future<void> _cleanupExpiredUndoBackups(Database db,
+      {Duration ttl = undoBackupTtl}) async {
+    final cutoff =
+        DateTime.now().subtract(ttl).millisecondsSinceEpoch;
+    for (final table in <String>[
+      'undo_deleted_messages',
+      'undo_deleted_anchors',
+    ]) {
+      await db.delete(table, where: 'created_at < ?', whereArgs: [cutoff]);
+    }
+  }
+
+  Future<void> _deleteUndoBatchRows(DatabaseExecutor txn, String batchId) async {
+    for (final table in <String>[
+      'undo_deleted_messages',
+      'undo_deleted_anchors',
+    ]) {
+      await txn.delete(table, where: 'batch_id = ?', whereArgs: [batchId]);
+    }
+  }
+
+  /// 按 [undoChunkSize] 切块（IN 列表与事务内单块读取上限）。
+  static Iterable<List<T>> _chunked<T>(List<T> items, {int? size}) sync* {
+    final step = size ?? undoChunkSize;
+    for (var i = 0; i < items.length; i += step) {
+      final end = i + step > items.length ? items.length : i + step;
+      yield items.sublist(i, end);
+    }
+  }
   // ---- v2: tasks ----
 
   Future<void> insertTask(Task task) async {

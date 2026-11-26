@@ -291,6 +291,74 @@ void main() {
     expect(logo.color, cs.onSurfaceVariant,
         reason: '空态图标颜色应跟随 colorScheme.onSurfaceVariant');
   });
+
+  // ---- B45（task-62）：导航双星 2dp 有效线宽（复用现有 toImage + _verticalInkRun）----
+
+  testWidgets('B45: strokeDp=2 时主/小星有效线宽≈2px；未传参仍是 22/18', (tester) async {
+    tester.view.physicalSize = const Size(600, 600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    Future<(ui.Image, ByteData)> raster(Widget logo) async {
+      await tester.pumpWidget(
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: Center(
+            child: RepaintBoundary(
+              key: const ValueKey('b45-logo-boundary'),
+              child: logo,
+            ),
+          ),
+        ),
+      );
+      final boundary = tester.renderObject<RenderRepaintBoundary>(
+          find.byKey(const ValueKey('b45-logo-boundary')));
+      final ui.Image? img =
+          await tester.runAsync<ui.Image>(() => boundary.toImage(pixelRatio: 1.0));
+      expect(img, isNotNull, reason: '光栅化失败');
+      final ByteData? raw = await tester.runAsync<ByteData?>(
+          () => img!.toByteData(format: ui.ImageByteFormat.rawRgba));
+      expect(raw, isNotNull, reason: '读取像素失败');
+      return (img!, raw!);
+    }
+
+    int mainRun(ui.Image image, ByteData data) => _verticalInkRun(data,
+        width: image.width,
+        height: image.height,
+        x: (55 * image.width / AssistantLogo.viewBoxWidth).round(),
+        yCenter: (210 * image.width / AssistantLogo.viewBoxWidth).round());
+
+    int smallRun(ui.Image image, ByteData data) => _verticalInkRun(data,
+        width: image.width,
+        height: image.height,
+        x: (248 * image.width / AssistantLogo.viewBoxWidth).round(),
+        yCenter: (110 * image.width / AssistantLogo.viewBoxWidth).round());
+
+    // ① 传 strokeDp: 2（导航用法）：两星都必须 ≈2px，且与绘制尺寸无关
+    for (final size in <double>[AssistantLogo.viewBoxWidth, 96]) {
+      final (image, data) = await raster(AssistantLogo(
+        size: size,
+        color: const Color(0xFF000000),
+        strokeDp: 2,
+      ));
+      final why = 'size=${size.toStringAsFixed(0)}、strokeDp=2：';
+      expect(mainRun(image, data), closeTo(2, 1),
+          reason: '$why大星有效线宽应≈2px（抗锯齿容差 ±1）');
+      expect(smallRun(image, data), closeTo(2, 1),
+          reason: '$why小星也必须是 2px（B45 两星同宽）');
+    }
+
+    // ② 不传 strokeDp（其它四入口/B43）：仍是 viewBox 22/18，不得被全局加粗
+    final (imageC, dataC) = await raster(const AssistantLogo(
+      size: AssistantLogo.viewBoxWidth,
+      color: Color(0xFF000000),
+    ));
+    expect(mainRun(imageC, dataC), closeTo(22, 2),
+        reason: '未传 strokeDp 时大星仍应是 viewBox 22 的有效线宽');
+    expect(smallRun(imageC, dataC), closeTo(18, 2),
+        reason: '未传 strokeDp 时小星仍应是 viewBox 18 的有效线宽');
+  });
 }
 
 /// 在 [x] 列上，以 [yCenter] 为中心量 alpha>32 的连续墨迹长度（量线宽用）。

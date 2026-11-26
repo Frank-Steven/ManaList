@@ -19,6 +19,7 @@ import '../shared/app_icon.dart';
 import '../tasks/task_editor.dart';
 import 'archived_page.dart';
 import 'message_detail_sheet.dart';
+import 'message_time_range.dart';
 import 'message_widgets.dart';
 import '../../services/app_log.dart';
 import '../../services/app_name_service.dart';
@@ -72,6 +73,9 @@ class MessagesPageState extends State<MessagesPage> {
   /// 应用多选筛选（2026-11-01 下拉复选；空集 = 全部应用）。
   final Set<String> _appFilter = {};
 
+  /// F18（方案 A）：时间范围条件（null = 不按时间筛）。纯本地过滤，不产生加载态。
+  MessageTimeRange? _timeRange;
+
   bool _selecting = false;
   final Set<String> _selected = {};
 
@@ -89,6 +93,13 @@ class MessagesPageState extends State<MessagesPage> {
   bool? _listenerEnabled;
 
   StreamSubscription<int>? _sub;
+
+  /// F18（task-87）：本页**自带** ScaffoldMessenger 的 key。
+  /// 真机证明：只在外层包 ScaffoldMessenger 但继续用 State.context 查找，
+  /// 仍会命中页面之上的 root messenger（提示条落在被遮挡处）。
+  /// 因此所有本页的撤销提示都显式传 [messenger]，见 [_showUndo]。
+  final GlobalKey<ScaffoldMessengerState> _messengerKey =
+      GlobalKey<ScaffoldMessengerState>();
 
   @override
   void initState() {
@@ -119,11 +130,12 @@ class MessagesPageState extends State<MessagesPage> {
     final pick = _pick;
     if (pick == null || !mounted) return;
     setState(() {
+      // F18：先建一次消息 ID 集合，避免逐 ID 扫 _messages（大全选 O(n²)）
+      final ids = <String>{for (final m in _messages) m.id};
       _selected
         ..clear()
-        ..addAll(pick
-            .idsOfType(ChatAttachmentType.message)
-            .where((id) => _messages.any((m) => m.id == id)));
+        ..addAll(
+            pick.idsOfType(ChatAttachmentType.message).where(ids.contains));
       if (_selected.isEmpty) _selecting = false;
     });
   }
@@ -148,24 +160,23 @@ class MessagesPageState extends State<MessagesPage> {
   Future<void> reload() async {
     try {
       final results = await Future.wait([
-        // 大上限 ≈ 全量：分组分页后不再靠全局限额控制内存
-        _db.getMessages(limit: 100000),
+        // F18：limit:null = 不加 LIMIT；includeArchived:false = SQL 层直接排除归档
+        // （真机 57k 行时不再把归档全解码到 Dart 再丢弃）；分组分页仍按组控制渲染量
+        _db.getMessages(limit: null, includeArchived: false),
         _db.getDistinctMessageSources(),
         _db.messageAnchorTaskIds(),
       ]);
       if (!mounted) return;
       setState(() {
-        _messages = (results[0] as List<Message>)
-            .where((m) => m.status != MessageStatus.archived)
-            .where((m) =>
-                _appFilter.isEmpty || _appFilter.contains(m.packageName))
-            .toList();
+        // F18：_messages = **全部非归档**消息（归档已在 SQL 层排除，这里不再重复过滤）；
+        // 应用/时间条件统一在 _visible 里 AND，切筛选/清时间都不会把已选 ID 弄丢。
+        _messages = (results[0] as List<Message>).toList();
         _sources = results[1] as List<SourceApp>;
         _taskLinks = results[2] as Map<String, List<String>>;
         _loading = false;
         // 所选应用的消息可能已不存在，从筛选集里剔除
-        _appFilter.removeWhere(
-            (pkg) => !_sources.any((s) => s.packageName == pkg));
+        _appFilter
+            .removeWhere((pkg) => !_sources.any((s) => s.packageName == pkg));
         _selected.removeWhere((id) => !_messages.any((m) => m.id == id));
         if (_selected.isEmpty) _selecting = false;
       });
@@ -181,8 +192,8 @@ class MessagesPageState extends State<MessagesPage> {
       }
       widget.onSelectionChanged?.call(_selecting);
       // F1（ux-fixes-2026-11 §1.2-5）：首屏组头图标批量预热
-      unawaited(AppIconService.instance
-          .prewarm(_sources.map((s) => s.packageName)));
+      unawaited(
+          AppIconService.instance.prewarm(_sources.map((s) => s.packageName)));
       // F2（ux-fixes-2026-11 §2.1）：来源应用名懒解析回填（存量包名/空名）
       _resolveSourceAppNames();
     } catch (e, st) {
@@ -194,12 +205,16 @@ class MessagesPageState extends State<MessagesPage> {
       final tasks = await _db.getTasks();
       if (!mounted) return;
       setState(() => _tasksById = {for (final t in tasks) t.id: t});
-    } catch (e, st) { AppLog.instance.warn('messages.done-tasks', e, st); }
+    } catch (e, st) {
+      AppLog.instance.warn('messages.done-tasks', e, st);
+    }
     // 通知监听权限状态（v2.5：丢失时页面顶部给恢复引导）
     try {
       final enabled = await NotificationBridge.instance.isListenerEnabled();
       if (mounted) setState(() => _listenerEnabled = enabled);
-    } catch (e, st) { AppLog.instance.warn('messages.listener-state', e, st); }
+    } catch (e, st) {
+      AppLog.instance.warn('messages.listener-state', e, st);
+    }
     // U19-B：更新底部导航「消息」角标（取 DB 的未处理数，不受页面 500 条上限影响）
     await _updateBadge();
   }
@@ -273,24 +288,35 @@ class MessagesPageState extends State<MessagesPage> {
   Object? _cacheKeyMessages;
   Object? _cacheKeyTasks;
   Set<String>? _cacheKeyFilter;
+  Set<String>? _cacheKeyApps;
+  MessageTimeRange? _cacheKeyTime;
 
   bool _cachesFresh() =>
       _visibleCache != null &&
       identical(_cacheKeyMessages, _messages) &&
       identical(_cacheKeyTasks, _tasksById) &&
-      setEquals(_cacheKeyFilter, _groupFilter);
+      setEquals(_cacheKeyFilter, _groupFilter) &&
+      setEquals(_cacheKeyApps, _appFilter) &&
+      _cacheKeyTime == _timeRange;
 
+  /// 可见消息 = 全部非归档 ∩ 应用条件 ∩ 展示分组条件 ∩ 时间条件（全部 AND）。
   List<Message> get _visible {
     final cached = _visibleCache;
     if (cached != null && _cachesFresh()) return cached;
-    final visible =
-        _messages.where((m) => _groupFilter.contains(_displayKey(m))).toList();
+    final range = _timeRange;
+    final visible = _messages
+        .where((m) => _appFilter.isEmpty || _appFilter.contains(m.packageName))
+        .where((m) => _groupFilter.contains(_displayKey(m)))
+        .where((m) => range == null || range.containsPostedAt(m.postedAt))
+        .toList();
     _visibleCache = visible;
     _sourceCache = null;
     _conversationCache.clear();
     _cacheKeyMessages = _messages;
     _cacheKeyTasks = _tasksById;
     _cacheKeyFilter = Set.of(_groupFilter);
+    _cacheKeyApps = Set.of(_appFilter);
+    _cacheKeyTime = _timeRange;
     return visible;
   }
 
@@ -440,7 +466,7 @@ class MessagesPageState extends State<MessagesPage> {
       },
     );
     if (!mounted) return;
-    showUndoSnackBar(context, '已创建任务', onUndone: reload);
+    _showUndo('已创建任务');
     await reload();
   }
 
@@ -499,20 +525,35 @@ class MessagesPageState extends State<MessagesPage> {
     );
   }
 
-  /// 彻底删除消息（v2.4：垃圾消息左滑「删除」）；撤销 = 整体回插。
+  /// 彻底删除消息：单条左滑「删除」与多选「删除」**共用**此入口。
+  ///
+  /// F18（2026-11-26，用户拍板：方案 A 底部含删除）：复用 B46 的**真实行备份**删除
+  /// helper —— deleteArchivedWithBackup(ids) 的 SQL 只按传入 ID 操作、不筛归档
+  /// 状态，可安全用于主消息页；撤销走 restoreDeletedMessageBatch，到期/clear/
+  /// 撤销失败清理走 deleteUndoBackupBatch。B46 的 10 秒 TTL 与精确锚点恢复语义
+  /// 不变，这里**不**复制任何备份实现（也不再使用无锚点备份的旧批量路径）。
   Future<void> _deleteMessagesForever(List<Message> targets) async {
-    await _db.deleteMessages([for (final m in targets) m.id]);
+    if (targets.isEmpty) return;
+    final batchId =
+        await _db.deleteArchivedWithBackup([for (final m in targets) m.id]);
+    if (batchId == null) return;
     UndoService.instance.register(
       label: '已删除',
-      undo: () => _db.restoreMessages(targets),
+      undo: () => _db.restoreDeletedMessageBatch(batchId),
+      onExpire: () => _db.deleteUndoBackupBatch(batchId),
     );
+    // F18（task-85，真机暴露）：主消息页数据量大（全量非归档，真机约 57k 行），
+    // 若先 await reload 再 show，用户要等整个列表刷新完才看到「已删除 + 撤销」，
+    // 撤销窗口实际已被吃掉。因此这里**先立即 show**，再后台 reload。
+    // 注意：这是与 archived_page（B46）**有意的页面差异**，归档页时序不改。
     if (!mounted) return;
-    showUndoSnackBar(context, '已删除', onUndone: reload);
-    await reload();
+    _showUndo('已删除');
+    unawaited(reload());
   }
 
   Future<void> _markJunk(List<Message> targets) async {
-    await _db.updateMessagePriority(
+    // F18：大全选时按 500 分块，避免 IN 参数过多（复用既有优先级写实现）
+    await _db.updateMessagePriorityChunked(
         [for (final m in targets) m.id], MessagePriority.junk);
     UndoService.instance.register(
       label: '已标记垃圾',
@@ -523,27 +564,28 @@ class MessagesPageState extends State<MessagesPage> {
       },
     );
     if (!mounted) return;
-    showUndoSnackBar(context, '已标记垃圾', onUndone: reload);
+    _showUndo('已标记垃圾');
     await reload();
   }
 
   Future<void> _unjunk(List<Message> targets) async {
-    await _db.updateMessagePriority(
+    await _db.updateMessagePriorityChunked(
         [for (final m in targets) m.id], MessagePriority.none);
     UndoService.instance.register(
       label: '已移出垃圾',
       undo: () async {
-        await _db.updateMessagePriority(
+        // 与正向一致走 500 分块，避免大全选时撤销 IN 超参
+        await _db.updateMessagePriorityChunked(
             [for (final m in targets) m.id], MessagePriority.junk);
       },
     );
     if (!mounted) return;
-    showUndoSnackBar(context, '已移出垃圾', onUndone: reload);
+    _showUndo('已移出垃圾');
     await reload();
   }
 
   Future<void> _archive(List<Message> targets) async {
-    await _db.updateMessageStatus(
+    await _db.updateMessageStatusChunked(
         [for (final m in targets) m.id], MessageStatus.archived);
     UndoService.instance.register(
       label: '已归档',
@@ -554,25 +596,57 @@ class MessagesPageState extends State<MessagesPage> {
       },
     );
     if (!mounted) return;
-    showUndoSnackBar(context, '已归档', onUndone: reload);
+    _showUndo('已归档');
     await reload();
   }
 
   // ---- 归档入口 ----
 
   Future<void> _openArchived() async {
-    await Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const ArchivedMessagesPage()));
+    await Navigator.of(context)
+        .push(MaterialPageRoute(builder: (_) => const ArchivedMessagesPage()));
     await reload();
   }
 
   /// 库页 AppBar「归档箱」入口（ui-structure §6.1：消息分区时显示）。
   Future<void> openArchived() => _openArchived();
 
+  /// F18（task-87）：本页所有撤销提示的唯一入口。
+  ///
+  /// 关键点：**显式传 messenger: _messengerKey.currentState**。
+  /// State.context 在本页 widget 之上，默认 lookup 会拿到外层 messenger，
+  /// 只包一层 ScaffoldMessenger 而不传 messenger 等于没修（真机复现过）。
+  /// SnackBar 4 秒与 UndoService 10 秒均不改。
+  void _showUndo(String label) {
+    // aboveFab:true —— 本页多选时右下角有 FAB，提示需浮在 FAB 上方，
+    // 否则真机上「撤销」中心会被 FAB 覆盖、tap 打不到（task-86 复现）。
+    showUndoSnackBar(context, label,
+        onUndone: reload, messenger: _messengerKey.currentState, aboveFab: true);
+  }
+
   // ---- 多选模式 ----
 
   List<Message> get _selectedMessages =>
       _messages.where((m) => _selected.contains(m.id)).toList();
+
+  /// 选择头摘要文本（窄屏由 Expanded + ellipsis 截断，语义完整）。
+  String get _selectionSummary {
+    final hidden = _selectedHiddenCount;
+    return hidden == 0
+        ? '已选 ${_selected.length} 项'
+        : '已选 ${_selected.length} 项（含 $hidden 未显示）';
+  }
+
+  /// 已选中、但不在当前可见集合（应用/分组/时间条件之外）的条数。
+  /// F18：切筛选或清时间只影响可见集合，**不删除**这些隐藏已选 ID，只在头部计数提示。
+  int get _selectedHiddenCount {
+    if (_selected.isEmpty) return 0;
+    var visibleSelected = 0;
+    for (final m in _visible) {
+      if (_selected.contains(m.id)) visibleSelected++;
+    }
+    return _selected.length - visibleSelected;
+  }
 
   void _toggleSelect(Message m) {
     final pick = _pick;
@@ -687,33 +761,46 @@ class MessagesPageState extends State<MessagesPage> {
             icon: const Icon(Icons.close),
             onPressed: _exitSelection,
           ),
-          Text('已选 ${_selected.length} 项'),
-          const Spacer(),
+          // F18：窄屏 + 大数量隐藏文本时，摘要用 Expanded + 单行省略，
+          // 避免 Row 溢出；语义文本不变（仅视觉截断），按钮保持固定宽度可点。
+          Expanded(
+            child: Text(
+              _selectionSummary,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
           TextButton(
-            onPressed: () {
-              final pick = _pick;
-              if (pick != null) {
-                for (final m in _visible) {
-                  pick.select(ChatAttachmentType.message, m.id,
-                      title: m.title, icon: Icons.mail_outline);
-                }
-                return;
-              }
-              setState(() => _selected.addAll(_visible.map((m) => m.id)));
-            },
+            // F18：加载中或当前可见为空 → 全选禁用（避免误点出空选择）。
+            // 全选 = 合并 _visible 的**全部** ID（不受每组「显示更多」分页限制）。
+            onPressed: (_loading || _visible.isEmpty)
+                ? null
+                : () {
+                    final pick = _pick;
+                    if (pick != null) {
+                      // pick 模式：批量写入控制器（最多一次 notify，1200 条也不逐条重建）
+                      pick.selectMany(
+                        ChatAttachmentType.message,
+                        {for (final m in _visible) m.id: m.title},
+                        icon: Icons.mail_outline,
+                      );
+                      return;
+                    }
+                    setState(() => _selected.addAll(_visible.map((m) => m.id)));
+                  },
             child: const Text('全选'),
           ),
           TextButton(
             onPressed: _selected.isEmpty
                 ? null
                 : () {
-                      final pick = _pick;
-                      if (pick != null) {
-                        pick.clearType(ChatAttachmentType.message);
-                        return;
-                      }
-                      setState(() => _selected.clear());
-                    },
+                    final pick = _pick;
+                    if (pick != null) {
+                      pick.clearType(ChatAttachmentType.message);
+                      return;
+                    }
+                    setState(() => _selected.clear());
+                  },
             child: const Text('取消'),
           ),
         ],
@@ -756,13 +843,24 @@ class MessagesPageState extends State<MessagesPage> {
             Center(
               child: Padding(
                 padding: const EdgeInsets.only(right: 8),
-                child: Container(
-                    width: 1, height: 24, color: cs.outlineVariant),
+                child:
+                    Container(width: 1, height: 24, color: cs.outlineVariant),
               ),
             ),
           // 应用筛选（2026-11-01）：单个下拉按钮 + 多选菜单，
           // 按钮上图标 = 所选应用图标前几个堆叠（第三批：去文字）
           if (_sources.isNotEmpty) _buildAppFilterButton(cs),
+          // F18：时间范围筛选（未激活 = 日历+文字；激活 = MM/dd-MM/dd + ✕）
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: _TimeFilterChip(
+                range: _timeRange,
+                onTap: _showTimeRangeSheet,
+                onClear: _clearTimeRange,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -794,6 +892,179 @@ class MessagesPageState extends State<MessagesPage> {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// F18：清除时间条件 —— **只清时间**，其它筛选（分组/应用/搜索态）与已选 ID 全保留。
+  void _clearTimeRange() {
+    if (_timeRange == null) return;
+    setState(() => _timeRange = null);
+  }
+
+  static String _fmtDay(DateTime d) =>
+      '${d.month.toString().padLeft(2, '0')}/${d.day.toString().padLeft(2, '0')}';
+
+  /// F18：时间范围弹层（今天 / 昨天 / 近 7 天 / 自定义起止）。
+  ///
+  /// 草稿语义：**取消只关弹层**，不动已生效条件；只有「确认」才应用。
+  /// 开始晚于结束 → 内联错误且不应用；弹层「清除时间筛选」等价于 chip 上的 ✕。
+  void _showTimeRangeSheet() {
+    var draftStart = _timeRange?.start;
+    var draftEnd = _timeRange?.end;
+    String? draftPreset = _timeRange?.preset;
+    String? draftError;
+
+    Future<void> pickDay(BuildContext ctx, StateSetter setSheetState,
+        {required bool isStart}) async {
+      final initial = (isStart ? draftStart : draftEnd) ?? DateTime.now();
+      final picked = await showDatePicker(
+        context: ctx,
+        initialDate: initial,
+        firstDate: DateTime(2000),
+        lastDate: DateTime(2100),
+      );
+      if (picked == null) return;
+      setSheetState(() {
+        if (isStart) {
+          draftStart = picked;
+        } else {
+          draftEnd = picked;
+        }
+        draftPreset = 'custom';
+        draftError = null;
+      });
+    }
+
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      // F18：小高度（如 600 高的测试约束）下内容必须可滚动，否则 Column 溢出、
+      // 底部「确认/取消」不可达；草稿语义与文案不变。
+      isScrollControlled: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          final cs = Theme.of(ctx).colorScheme;
+          void apply(MessageTimeRange r) {
+            setState(() => _timeRange = r);
+            Navigator.of(sheetContext).pop();
+          }
+
+          return SafeArea(
+            // F18：内容可滚动 —— 高度受限时（如 600 高的测试约束）不溢出，
+            // 「确认/取消」始终可达；草稿语义与全部文案保持不变。
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                ListTile(
+                  title: const Text('按时间范围筛选',
+                      style: TextStyle(fontWeight: FontWeight.w600)),
+                  trailing: _timeRange == null
+                      ? null
+                      : TextButton(
+                          onPressed: () {
+                            setState(() => _timeRange = null);
+                            Navigator.of(sheetContext).pop();
+                          },
+                          child: const Text('清除时间筛选'),
+                        ),
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: const Icon(Icons.today_outlined),
+                  title: const Text('今天'),
+                  trailing:
+                      draftPreset == 'today' ? const Icon(Icons.check) : null,
+                  onTap: () => apply(messageTimeRangeToday()),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.history),
+                  title: const Text('昨天'),
+                  trailing: draftPreset == 'yesterday'
+                      ? const Icon(Icons.check)
+                      : null,
+                  onTap: () => apply(messageTimeRangeYesterday()),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.date_range_outlined),
+                  title: const Text('近 7 天'),
+                  subtitle:
+                      const Text('含今天共 7 个日历日', style: TextStyle(fontSize: 12)),
+                  trailing:
+                      draftPreset == 'last7' ? const Icon(Icons.check) : null,
+                  onTap: () => apply(messageTimeRangeLast7Days()),
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: const Icon(Icons.event_outlined),
+                  title: Text(
+                      '开始日：${draftStart == null ? '未选' : _fmtDay(draftStart!)}'),
+                  trailing:
+                      draftPreset == 'custom' ? const Icon(Icons.check) : null,
+                  onTap: () => pickDay(ctx, setSheetState, isStart: true),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.event_available_outlined),
+                  title: Text(
+                      '结束日：${draftEnd == null ? '未选' : _fmtDay(draftEnd!)}'),
+                  subtitle: const Text('含开始日 00:00，不含结束日 00:00',
+                      style: TextStyle(fontSize: 12)),
+                  onTap: () => pickDay(ctx, setSheetState, isStart: false),
+                ),
+                if (draftError != null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(draftError!,
+                          style: TextStyle(color: cs.error, fontSize: 12)),
+                    ),
+                  ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => Navigator.of(sheetContext).pop(),
+                          child: const Text('取消'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: () {
+                            if (draftPreset != 'custom') {
+                              setSheetState(() =>
+                                  draftError = '请选择今天 / 昨天 / 近 7 天，或设置自定义起止');
+                              return;
+                            }
+                            if (draftStart == null || draftEnd == null) {
+                              setSheetState(
+                                  () => draftError = '请选择开始与结束日期；取消不会改动已生效条件');
+                              return;
+                            }
+                            if (!isMessageTimeRangeCustomValid(
+                                draftStart!, draftEnd!)) {
+                              setSheetState(
+                                  () => draftError = '结束日期必须晚于开始日期；当前条件保持不变');
+                              return;
+                            }
+                            apply(
+                                messageTimeRangeCustom(draftStart!, draftEnd!));
+                          },
+                          child: const Text('确认'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                ],
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -989,11 +1260,11 @@ class MessagesPageState extends State<MessagesPage> {
     final remaining = total - shown;
     return Center(
       child: TextButton.icon(
-        onPressed: () => setState(
-            () => _shownCounts[groupKey] = shown + kGroupPageStep),
+        onPressed: () =>
+            setState(() => _shownCounts[groupKey] = shown + kGroupPageStep),
         icon: const Icon(Icons.expand_more, size: 16),
-        label: Text('显示更多（还有 $remaining 条）',
-            style: const TextStyle(fontSize: 12)),
+        label:
+            Text('显示更多（还有 $remaining 条）', style: const TextStyle(fontSize: 12)),
       ),
     );
   }
@@ -1009,6 +1280,7 @@ class MessagesPageState extends State<MessagesPage> {
     if (sources.isEmpty) {
       // 引导式空态（§3.3-11）：加载期由外层骨架屏接管，这里只管真空态
       final cs = Theme.of(context).colorScheme;
+      final range = _timeRange;
       return ListView(
         controller: scrollController,
         physics: const AlwaysScrollableScrollPhysics(),
@@ -1017,14 +1289,29 @@ class MessagesPageState extends State<MessagesPage> {
           Center(
             child: Column(
               children: [
-                Icon(Icons.inbox_outlined,
-                    size: 48, color: cs.onSurfaceVariant),
+                Icon(
+                    range == null
+                        ? Icons.inbox_outlined
+                        : Icons.event_busy_outlined,
+                    size: 48,
+                    color: cs.onSurfaceVariant),
                 const SizedBox(height: 12),
-                const Text('暂无消息'),
+                // F18：按时间筛选后为空 → 给「时间」专属空态与一键清除入口，
+                // 与「采集后暂无消息」区分（纯本地过滤不出现加载态）。
+                Text(range == null ? '暂无消息' : '该时间段没有消息'),
                 const SizedBox(height: 4),
-                Text('通知采集开启后，新消息会出现在这里；下拉可刷新',
-                    style:
-                        TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                Text(
+                    range == null
+                        ? '通知采集开启后，新消息会出现在这里；下拉可刷新'
+                        : '时间范围：${range.label}（其它筛选条件也可能同时生效）',
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                if (range != null) ...[
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: _clearTimeRange,
+                    child: const Text('清除时间筛选'),
+                  ),
+                ],
               ],
             ),
           ),
@@ -1044,7 +1331,9 @@ class MessagesPageState extends State<MessagesPage> {
   /// 一级分组卡（来源应用）：头行 + （展开时）消息体 / 二级会话卡。
   Widget _buildSourceCard(_SourceGroup s, bool selectable) {
     final cs = Theme.of(context).colorScheme;
-    final expanded = _expandedSources.contains(s.key);
+    // F18：pick 模式组头点击 = 整组选择（展开图标让位给勾选框），因此强制展开，
+    // 否则用户永远看不到单条消息、无法单选；普通模式仍由用户折叠状态决定。
+    final expanded = widget.pickMode || _expandedSources.contains(s.key);
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
       child: Material(
@@ -1054,6 +1343,7 @@ class MessagesPageState extends State<MessagesPage> {
         child: Column(
           children: [
             _SourceGroupHeader(
+              key: ValueKey('source-header-${s.key}'),
               packageName: s.key,
               title: s.title,
               count: s.count,
@@ -1087,7 +1377,7 @@ class MessagesPageState extends State<MessagesPage> {
   /// 二级嵌套卡（会话）：比一级更矮、底色更深，视觉上嵌在一级卡片内。
   Widget _buildConversationCard(_ConversationGroup c, bool selectable) {
     final cs = Theme.of(context).colorScheme;
-    final expanded = _expandedConversations.contains(c.key);
+    final expanded = widget.pickMode || _expandedConversations.contains(c.key);
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 4),
       child: Material(
@@ -1097,6 +1387,7 @@ class MessagesPageState extends State<MessagesPage> {
         child: Column(
           children: [
             _ConversationGroupHeader(
+              key: ValueKey('conversation-header-${c.key}'),
               title: c.title,
               count: c.count,
               latestAt: c.latestAt,
@@ -1141,12 +1432,11 @@ class MessagesPageState extends State<MessagesPage> {
   Widget _buildSelectionBar() {
     final targets = _selectedMessages;
     final hasSelection = targets.isNotEmpty;
-    final anyJunk =
-        targets.any((m) => m.priority == MessagePriority.junk);
+    final anyJunk = targets.any((m) => m.priority == MessagePriority.junk);
     final allJunk = hasSelection &&
         targets.every((m) => m.priority == MessagePriority.junk);
-    final allLinked = hasSelection &&
-        targets.every((m) => _linkedTaskIds(m).isNotEmpty);
+    final allLinked =
+        hasSelection && targets.every((m) => _linkedTaskIds(m).isNotEmpty);
     return SelectionActionBar(
       actions: [
         SelectionAction(
@@ -1177,6 +1467,12 @@ class MessagesPageState extends State<MessagesPage> {
           onTap: () => _runBatch(_unjunk),
         ),
         SelectionAction(
+          icon: Icons.delete_forever,
+          tooltip: '删除',
+          enabled: hasSelection,
+          onTap: () => _runBatch(_deleteMessagesForever),
+        ),
+        SelectionAction(
           icon: Icons.delete_outline,
           tooltip: '取消任务',
           enabled: allLinked,
@@ -1199,7 +1495,11 @@ class MessagesPageState extends State<MessagesPage> {
   @override
   Widget build(BuildContext context) {
     // ui-structure §3：分区页不持有 AppBar（由库页容器统一持有）。
-    return Scaffold(
+    // F18（task-87）：页面自带 messenger，撤销提示固定落在**本页** Scaffold 上，
+    // 不依赖外层库页/root messenger；提示仍由 [_showUndo] 显式传 messenger。
+    return ScaffoldMessenger(
+      key: _messengerKey,
+      child: Scaffold(
       body: Column(
         children: [
           if (_listenerEnabled == false) _buildListenerBanner(context),
@@ -1227,6 +1527,7 @@ class MessagesPageState extends State<MessagesPage> {
           // pick 模式：底部操作条由附件选择页统一提供（已选附件 + 确认）
           if (_selecting && !widget.pickMode) _buildSelectionBar(),
         ],
+        ),
       ),
     );
   }
@@ -1319,6 +1620,7 @@ class _SourceGroupHeader extends StatelessWidget {
   final VoidCallback onLongPress;
 
   const _SourceGroupHeader({
+    super.key,
     required this.packageName,
     required this.title,
     required this.count,
@@ -1417,6 +1719,7 @@ class _ConversationGroupHeader extends StatelessWidget {
   final VoidCallback onLongPress;
 
   const _ConversationGroupHeader({
+    super.key,
     required this.title,
     required this.count,
     required this.latestAt,
@@ -1469,8 +1772,8 @@ class _ConversationGroupHeader extends StatelessWidget {
                     meta.join(' · '),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        fontSize: 11.5, color: cs.onSurfaceVariant),
+                    style:
+                        TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
                   ),
                 ],
               ),
@@ -1557,9 +1860,8 @@ class _IconChip extends StatelessWidget {
           width: wide ? null : 48,
           child: Center(
             child: Material(
-              color: selected
-                  ? cs.secondaryContainer
-                  : cs.surfaceContainerHighest,
+              color:
+                  selected ? cs.secondaryContainer : cs.surfaceContainerHighest,
               shape: StadiumBorder(
                 side: selected
                     ? BorderSide.none
@@ -1582,6 +1884,128 @@ class _IconChip extends StatelessWidget {
               ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// F18：时间范围筛选 chip（与 [_IconChip] 同一视觉语言）。
+///
+/// - 未激活：日历图标 + 「时间范围」，点击开弹层；
+/// - 激活：显示 MM/dd-MM/dd（结束日按「整天包含」显示）+ ✕；
+/// - ✕ 只清时间条件（其它筛选与已选 ID 保留），主体点击仍是开弹层改范围。
+class _TimeFilterChip extends StatelessWidget {
+  const _TimeFilterChip({
+    required this.range,
+    required this.onTap,
+    required this.onClear,
+  });
+
+  final MessageTimeRange? range;
+  final VoidCallback onTap;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final active = range != null;
+    // B47（task-92）：与左侧应用胶囊统一口径 —— 外层命中区 48、**视觉背景 36**。
+    // 横向筛选行宽度无界，不能用 Center/OverflowBox 这类会占满/溢出约束的居中方案
+    // （会让 RenderPositionedBox 拿到 infinite 宽度 → NaN）。这里改用 Stack：
+    //   · Positioned 背景（上下各 6dp，固定 36 高）不参与尺寸计算；
+    //   · 非定位 Row 决定 Stack 的内在宽度（min），并承载原 44dp 命中区；
+    // 颜色/圆角/边框/文字/图标/Semantics/keys/onTap/onClear 全部原样。
+    return SizedBox(
+      height: 48,
+      child: Tooltip(
+        message: active ? '时间范围：${range!.label}（点击修改）' : '按时间范围筛选',
+        child: Stack(
+          alignment: Alignment.center,
+          clipBehavior: Clip.none,
+          children: [
+            Positioned(
+              left: 0,
+              right: 0,
+              top: 6,
+              bottom: 6,
+              child: Material(
+                key: const ValueKey('f18-time-chip-visual'),
+                color:
+                    active ? cs.secondaryContainer : cs.surfaceContainerHighest,
+                shape: StadiumBorder(
+                  side: BorderSide(
+                      color: active ? Colors.transparent : cs.outlineVariant),
+                ),
+              ),
+            ),
+            // 透明 Material 作为 InkWell 的墨水宿主（与背景 Material 是兄弟关系，
+            // 背景不承载 InkWell）；不改变 Row 的内在宽度，Stack 宽度仍由 Row 决定。
+            Material(
+              type: MaterialType.transparency,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  InkWell(
+                    onTap: onTap,
+                    // 主体命中区 ≥44dp 高
+                  child: ConstrainedBox(
+                    key: const ValueKey('f18-time-chip-body'),
+                    constraints: const BoxConstraints(minHeight: 44),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.event_outlined,
+                              size: 18,
+                              color:
+                                  active ? cs.primary : cs.onSurfaceVariant),
+                          const SizedBox(width: 4),
+                          Text(active ? range!.label : '时间范围',
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  color: active
+                                      ? cs.onPrimaryContainer
+                                      : cs.onSurfaceVariant)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                if (active)
+                  // F18（task-85）：真机 uiautomator 只能按语义节点定位，纯 Tooltip 不够，
+                  // 因此给清除按钮显式语义（button + label + onTap），视觉与 44dp 不变。
+                  Semantics(
+                    // F18（task-87）：Android 需要独立节点才能被 uiautomator 命中。
+                    container: true,
+                    button: true,
+                    label: '清除时间筛选',
+                    onTap: onClear,
+                    // 只保留这一条语义节点（避免内层 Tooltip/Icon 再生成同名节点）
+                    excludeSemantics: true,
+                    child: InkWell(
+                      onTap: onClear,
+                      customBorder: const CircleBorder(),
+                      child: Tooltip(
+                        message: '清除时间筛选',
+                        // 命中区 ≥44×44dp（图标 16）
+                        child: SizedBox(
+                          key: const ValueKey('f18-time-chip-clear'),
+                          width: 44,
+                          height: 44,
+                          child: Center(
+                            child:
+                                Icon(Icons.close, size: 16, color: cs.primary),
+                          ),
+                        ),
+                      ),
+                    ),
+                    ),
+                ],
+              ),
+            ),
+          ],
         ),
       ),
     );

@@ -91,7 +91,8 @@ Widget _navHarness({required int selectedIndex}) => MaterialApp(
               icon: ExcludeSemantics(
                 child: RepaintBoundary(
                   key: _boundaryKey,
-                  child: AssistantLogo(size: 24),
+                  // 与 main.dart 的生产用法一致（B45：24dp 槽位 2dp 描边）。
+                  child: AssistantLogo(size: 24, strokeDp: 2),
                 ),
               ),
               label: '助理',
@@ -301,5 +302,34 @@ void main() {
     final recentOps = File('lib/ui/recent_ops_page.dart').readAsStringSync();
     expect(recentOps, contains('Icons.person_outline'));
     expect(recentOps, contains('Icons.settings_suggest_outlined'));
+  });
+
+  // ---- B45（task-62）：导航 2dp 描边的接线与尺寸/语义回归（隔离 widget 补验）----
+
+  testWidgets('B45: 导航入口实际传 strokeDp=2，24dp 尺寸/不传色/单份语义不变',
+      (tester) async {
+    final handle = tester.ensureSemantics();
+    try {
+      await tester.pumpWidget(_navHarness(selectedIndex: 2));
+      await tester.pumpAndSettle();
+
+      final navLogoFinder = find.descendant(
+          of: find.byType(NavigationBar), matching: find.byType(AssistantLogo));
+      expect(navLogoFinder, findsOneWidget, reason: '导航里应只有一个助理 LOGO');
+      final navLogo = tester.widget<AssistantLogo>(navLogoFinder);
+      expect(navLogo.size, 24, reason: '导航槽位仍是 24dp（B45 只改描边）');
+      expect(navLogo.strokeDp, 2, reason: 'B45：导航必须传 2dp 有效线宽');
+      expect(navLogo.color, isNull,
+          reason: '导航仍不传色 → 跟随 IconTheme（选中/未选中/深浅色）');
+      expect(find.bySemanticsLabel(RegExp('助理')), findsOneWidget,
+          reason: '语义仍只有一份（LOGO 被 ExcludeSemantics 排除）');
+
+      // 生产接线复核：main.dart 的导航项确实带 strokeDp: 2（不只是改了 harness）。
+      final mainSource = File('lib/main.dart').readAsStringSync();
+      expect(mainSource, contains('AssistantLogo(size: 24, strokeDp: 2)'),
+          reason: 'lib/main.dart 导航入口必须显式传 strokeDp: 2');
+    } finally {
+      handle.dispose();
+    }
   });
 }
