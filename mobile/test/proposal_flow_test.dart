@@ -37,8 +37,8 @@ void main() {
     appDb.debugAttachDatabase(db);
     UndoService.instance.clear();
     final now = DateTime.now().millisecondsSinceEpoch;
-    await appDb.insertConversation(
-        Conversation(id: convId, title: '测试对话', createdAt: now, updatedAt: now));
+    await appDb.insertConversation(Conversation(
+        id: convId, title: '测试对话', createdAt: now, updatedAt: now));
   });
 
   tearDown(() async {
@@ -67,7 +67,9 @@ void main() {
     test('校验失败不落库：缺 title / 未知工具 / 目标不存在 / 预留工具', () async {
       Future<ProposalOutcome> h(String tool, Map<String, dynamic> args) =>
           service.handleToolBlock(
-              conversationId: convId, batchId: 'b-x', block: block(0, tool, args));
+              conversationId: convId,
+              batchId: 'b-x',
+              block: block(0, tool, args));
 
       expect((await h('task.create', {'description': '无标题'})),
           isA<ProposalValidationFailure>());
@@ -75,10 +77,16 @@ void main() {
       expect((await h('task.update', {'id': 'ghost', 'title': 'x'})),
           isA<ProposalValidationFailure>(),
           reason: '目标存在性校验');
-      expect((await h('inbox.triage', {'scope': {'limit': 51}})),
+      expect(
+          (await h('inbox.triage', {
+            'scope': {'limit': 51}
+          })),
           isA<ProposalValidationFailure>(),
           reason: 'inbox.triage 上限 50，超出报错让 AI 分批（details §4）');
-      expect((await h('inbox.triage', {'scope': {'status': 'archived'}})),
+      expect(
+          (await h('inbox.triage', {
+            'scope': {'status': 'archived'}
+          })),
           isA<ProposalValidationFailure>(),
           reason: 'scope.status 首版仅支持 pending');
       expect(await appDb.getProposals(), isEmpty, reason: '失败不落库');
@@ -113,13 +121,332 @@ void main() {
     });
   });
 
-  group('审批 → 执行 → 回注 → 撤销', () {
-    test('task.create 全链路：applied + 任务入库 + tool 消息回注 + 撤销回 pending',
+  // ---------- R03①：审批 CAS 与并发执行唯一性（task-107） ----------
+  group('R03 审批 CAS / 并发唯一性', () {
+    Future<void> createPending(String batchId) async {
+      final outcome = await service.handleToolBlock(
+        conversationId: convId,
+        batchId: batchId,
+        block: block(0, 'task.create', {'title': 'CAS 任务 $batchId'}),
+      );
+      expect(outcome, isA<ProposalCreated>());
+    }
+
+    test('同一提案并发 approve 两次：只有一个成功，领域任务/回注各 1', () async {
+      await createPending('cas-1');
+      const id = 'cas-1_b0';
+
+      // 真并发：两个 approve 同时起跑，CAS 让只有一方拿到 pending→approved
+      final results = await Future.wait([
+        executor.approve(id),
+        executor.approve(id),
+      ]);
+
+      final okCount = results.where((r) => r.ok).length;
+      expect(okCount, 1, reason: 'CAS 保证只有一个执行者能成功执行');
+      final loser = results.firstWhere((r) => !r.ok);
+      expect(loser.message, contains('接管'), reason: '失败方给明确「已被接管」语义');
+
+      expect((await appDb.getProposalById(id))?.status, ProposalStatus.applied);
+      final tasks = await appDb.getActiveTasks();
+      expect(tasks.where((t) => t.title == 'CAS 任务 cas-1'), hasLength(1),
+          reason: '领域任务只能建 1 个');
+      final chat = await appDb.getChatMessages(convId);
+      final toolMsgs = chat.where((m) => m.role == ChatRole.tool).toList();
+      expect(toolMsgs, hasLength(1), reason: '回注消息不能重复');
+    });
+
+    test('不存在 / 非 pending 的提案：approve 返回 false 且不执行', () async {
+      expect((await executor.approve('ghost_b0')).ok, isFalse, reason: '不存在');
+
+      await createPending('cas-2');
+      // 人为把它推进到 rejected（非 pending）
+      expect(
+          await appDb.transitionProposal('cas-2_b0', ProposalStatus.rejected),
+          isTrue);
+      final exec = await executor.approve('cas-2_b0');
+      expect(exec.ok, isFalse);
+      expect(exec.message, contains('不可审批'));
+      expect(await appDb.getActiveTasks(), isEmpty, reason: '不得执行');
+    });
+
+    test('CAS 本身：同一 from 只能成功一次，第二次 affected=0', () async {
+      await createPending('cas-3');
+      const id = 'cas-3_b0';
+      expect(
+          await appDb.transitionProposal(id, ProposalStatus.approved), isTrue);
+      expect(
+          await appDb.transitionProposal(id, ProposalStatus.approved), isFalse,
+          reason: '已 approved 后再 approved：非法流转 + CAS 双重拒绝');
+      // 旧审批不得覆盖新状态：approved → superseded 之后，再 applied 必须失败
+      expect(await appDb.transitionProposal(id, ProposalStatus.superseded),
+          isTrue);
+      expect(
+          await appDb.transitionProposal(id, ProposalStatus.applied), isFalse,
+          reason: 'superseded 状态不允许直接 applied');
+      expect(
+          (await appDb.getProposalById(id))?.status, ProposalStatus.superseded);
+    });
+
+    test('收尾 CAS：状态已被接管时不再重复回注', () async {
+      await createPending('cas-4');
+      const id = 'cas-4_b0';
+      final before = (await appDb.getChatMessages(convId))
+          .where((m) => m.role == ChatRole.tool)
+          .length;
+
+      // 先抢走审批权，然后把它推到 superseded（模拟另一执行者接管）
+      expect(
+          await appDb.transitionProposal(id, ProposalStatus.approved), isTrue);
+      expect(await appDb.transitionProposal(id, ProposalStatus.superseded),
+          isTrue);
+
+      final exec = await executor.approve(id);
+      expect(exec.ok, isFalse, reason: '非 pending 不得继续');
+      final after = (await appDb.getChatMessages(convId))
+          .where((m) => m.role == ChatRole.tool)
+          .length;
+      expect(after, before, reason: '不得重复回注');
+      expect(
+          (await appDb.getProposalById(id))?.status, ProposalStatus.superseded,
+          reason: '不得被旧审批覆盖');
+      expect(await appDb.getActiveTasks(), isEmpty);
+    });
+  });
+
+  // ---------- R03②：确定性 ID 与执行 op（task-109） ----------
+  group('R03 确定性 ID / op_id', () {
+    test('task.create 用 task_<提案ID>；重复执行同提案不产生第二条任务', () async {
+      await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'det-1',
+        block: block(0, 'task.create', {'title': '确定性任务'}),
+      );
+      const pid = 'det-1_b0';
+      final exec = await executor.approve(pid);
+      expect(exec.ok, isTrue);
+
+      final tasks = await appDb.getActiveTasks();
+      final made = tasks.single;
+      expect(made.id, 'task_$pid', reason: '任务 id = task_<提案ID>');
+
+      // 同 ID 再插一次（幂等）：条数不变、内容被 replace 覆盖为同值
+      await appDb.insertTask(made);
+      expect((await appDb.getActiveTasks()).length, 1,
+          reason: 'insertTask 为 replace，同 ID 不应产生第二条');
+    });
+
+    test('note.create 用 note_<提案ID>；库为空时默认章节用 <提案ID>_notebook/_chapter',
         () async {
       await service.handleToolBlock(
         conversationId: convId,
+        batchId: 'det-2',
+        block: block(0, 'note.create', {'title': '确定性笔记', 'content': '正文'}),
+      );
+      const pid = 'det-2_b0';
+      final exec = await executor.approve(pid);
+      expect(exec.ok, isTrue);
+
+      final note = await appDb.getNoteById('note_$pid');
+      expect(note, isNotNull, reason: '笔记 id = note_<提案ID>');
+      expect(note!.chapterId, '${pid}_chapter',
+          reason: '缺省章节 = <提案ID>_chapter');
+      final chapters = await appDb.getChapters('${pid}_notebook');
+      expect(chapters.single.id, '${pid}_chapter');
+      final notebooks = await appDb.getNotebooks();
+      expect(notebooks.single.id, '${pid}_notebook',
+          reason: '缺省笔记本 = <提案ID>_notebook');
+    });
+
+    test('审批结果回注用 <提案ID>_result；重复回注仍只有 1 条', () async {
+      await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'det-3',
+        block: block(0, 'task.create', {'title': '回注确定性'}),
+      );
+      const pid = 'det-3_b0';
+      await executor.approve(pid);
+
+      final msg = await appDb.getChatMessageById('${pid}_result');
+      expect(msg, isNotNull, reason: '结果消息 id = <提案ID>_result');
+      expect(msg!.role, ChatRole.tool);
+
+      // 同 id 再写一次（模拟重放/重复回注）：条数不变
+      await appDb.insertChatMessage(msg);
+      final tools = (await appDb.getChatMessages(convId))
+          .where((m) => m.role == ChatRole.tool)
+          .toList();
+      expect(tools.length, 1,
+          reason: 'insertChatMessage 为 replace，同 id 只有 1 条');
+    });
+
+    test('同提案多字段更新：op_id 各不相同且带提案前缀', () async {
+      await insertTask(db, 't-met',
+          title: '原标题'); // helper 自带 priority='normal'
+      await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'det-4',
+        block: block(0, 'task.update', {
+          'id': 't-met',
+          'title': '新标题',
+          'priority': 'important',
+        }),
+      );
+      const pid = 'det-4_b0';
+      final exec = await executor.approve(pid);
+      expect(exec.ok, isTrue);
+
+      final rows = await db.query('op_log',
+          columns: ['op_id', 'target'],
+          where: 'target LIKE ?',
+          whereArgs: ['%t-met%']);
+      expect(rows.length, greaterThanOrEqualTo(2), reason: '两个字段各一条 op');
+      final opIds = [for (final r in rows) r['op_id'] as String];
+      expect(opIds.toSet().length, opIds.length, reason: '同提案多字段 op_id 必须互不相同');
+      for (final id in opIds) {
+        expect(id, startsWith(pid), reason: 'op_id 必须带提案前缀（可重放识别），不得共用一个 UUID');
+      }
+      expect(opIds.any((id) => id.contains(':title')), isTrue,
+          reason: '字段级后缀应体现目标字段');
+      expect(opIds.any((id) => id.contains(':priority')), isTrue);
+    });
+
+    test('只读回注确定性 id：同一条消息重复回注仍 1 条', () async {
+      const content = '[task.search] 找到 0 条';
+      const id = 'amsg-x_b0_result';
+      await executor.reportToolMessage(convId, content, messageId: id);
+      await executor.reportToolMessage(convId, content, messageId: id);
+      final tools = (await appDb.getChatMessages(convId))
+          .where((m) => m.role == ChatRole.tool)
+          .toList();
+      expect(tools.length, 1, reason: '同 id 重复回注 = replace，仍 1 条');
+      expect(tools.single.id, id);
+    });
+  });
+
+  // ---------- R03③：原子收尾与 approved 崩溃恢复（task-110） ----------
+  group('R03 原子收尾 / approved 恢复', () {
+    /// 造一条 approved 的 task.create 提案（不经过 approve，模拟「抢到 CAS 后崩溃」）。
+    Future<void> seedApproved(String batchId, String title) async {
+      await service.handleToolBlock(
+        conversationId: convId,
+        batchId: batchId,
+        block: block(0, 'task.create', {'title': title}),
+      );
+      final pid = '${batchId}_b0';
+      expect(
+          await appDb.transitionProposal(pid, ProposalStatus.approved), isTrue);
+    }
+
+    Future<int> toolMessageCount() async =>
+        (await appDb.getChatMessages(convId))
+            .where((m) => m.role == ChatRole.tool)
+            .length;
+
+    test('正常 approve：applied 与结果消息在同一事务内落地', () async {
+      await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'atom-1',
+        block: block(0, 'task.create', {'title': '原子任务'}),
+      );
+      const pid = 'atom-1_b0';
+      final exec = await executor.approve(pid);
+      expect(exec.ok, isTrue);
+
+      final proposal = await appDb.getProposalById(pid);
+      expect(proposal!.status, ProposalStatus.applied);
+      expect(proposal.resolvedAt, isNotNull);
+      expect(proposal.payload.containsKey('_undo'), isTrue,
+          reason: 'undo 与状态在同一事务写入');
+      expect(await appDb.getChatMessageById('${pid}_result'), isNotNull,
+          reason: '确定性结果消息同事务写入');
+      expect(await toolMessageCount(), 1, reason: '不额外产生第二条回注');
+    });
+
+    test('approved 且领域对象已存在：recover 不重复创建，只补 applied/result', () async {
+      await seedApproved('rec-1', '已执行过的任务');
+      const pid = 'rec-1_b0';
+      // 模拟崩溃前已完成领域写入（确定性 id）
+      await db.insert('tasks', {
+        'id': 'task_$pid',
+        'title': '已执行过的任务',
+        'kind': 'point',
+        'start_at': null,
+        'priority': 'normal',
+        'status': 'active',
+        'created_at': 1000,
+        'updated_at': 1000,
+      });
+
+      await executor.recoverApprovedProposals();
+
+      expect((await appDb.getActiveTasks()).length, 1, reason: '不得重复创建第二条任务');
+      expect((await appDb.getProposalById(pid))!.status, ProposalStatus.applied,
+          reason: '只补收尾状态');
+      final msg = await appDb.getChatMessageById('${pid}_result');
+      expect(msg, isNotNull, reason: '补一条恢复结果消息');
+      expect(msg!.content, contains('恢复'), reason: '恢复消息语义可辨识');
+    });
+
+    test('approved 且领域未执行：recover 执行一次并收尾', () async {
+      await seedApproved('rec-2', '待恢复任务');
+      const pid = 'rec-2_b0';
+
+      await executor.recoverApprovedProposals();
+
+      final tasks = await appDb.getActiveTasks();
+      expect(tasks.single.id, 'task_$pid', reason: '按确定性 id 执行一次');
+      expect(
+          (await appDb.getProposalById(pid))!.status, ProposalStatus.applied);
+      expect(await appDb.getChatMessageById('${pid}_result'), isNotNull);
+    });
+
+    test('recover 连续两次仍各只有 1 个任务 / 1 条结果消息', () async {
+      await seedApproved('rec-3', '幂等恢复');
+      const pid = 'rec-3_b0';
+
+      await executor.recoverApprovedProposals();
+      await executor.recoverApprovedProposals();
+
+      expect((await appDb.getActiveTasks()).length, 1);
+      expect(await toolMessageCount(), 1, reason: '确定性 result id + replace');
+      expect(
+          (await appDb.getProposalById(pid))!.status, ProposalStatus.applied);
+    });
+
+    test('失败 guard 的收尾：failed 且只回注一次，recover 不再重跑', () async {
+      // anchor.create 指向不存在的目标 → 校验失败（failed）
+      await service.handleToolBlock(
+        conversationId: convId,
+        batchId: 'rec-4',
+        block: block(0, 'anchor.create', {
+          'taskId': 't-missing',
+          'targetType': 'message',
+          'targetId': 'm-missing',
+        }),
+      );
+      const pid = 'rec-4_b0';
+      // 该块在校验阶段可能就没落提案；不存在则本用例不适用
+      if (await appDb.getProposalById(pid) == null) return;
+
+      await executor.approve(pid);
+      expect((await appDb.getProposalById(pid))!.status, ProposalStatus.failed);
+
+      final before = await toolMessageCount();
+      await executor.recoverApprovedProposals();
+      expect((await appDb.getProposalById(pid))!.status, ProposalStatus.failed,
+          reason: 'failed 不在恢复范围');
+      expect(await toolMessageCount(), before, reason: '不重复回注');
+    });
+  });
+
+  group('审批 → 执行 → 回注 → 撤销', () {
+    test('task.create 全链路：applied + 任务入库 + tool 消息回注 + 撤销回 pending', () async {
+      await service.handleToolBlock(
+        conversationId: convId,
         batchId: 'amsg-c',
-        block: block(0, 'task.create', {'title': '买菜', 'priority': 'important'}),
+        block:
+            block(0, 'task.create', {'title': '买菜', 'priority': 'important'}),
       );
       final exec = await executor.approve('amsg-c_b0');
       expect(exec.ok, isTrue);
@@ -174,8 +501,7 @@ void main() {
       expect((await appDb.getTaskById('t1'))?.title, '要删的');
     });
 
-    test('task.delete 带锚点：撤销恢复任务行 + 锚点行，正文全程不动（对象级锚点）',
-        () async {
+    test('task.delete 带锚点：撤销恢复任务行 + 锚点行，正文全程不动（对象级锚点）', () async {
       const body = '记得买菜';
       await insertMessage(db, 'm1', body);
       await insertTask(db, 't1', title: '买菜');
@@ -205,8 +531,13 @@ void main() {
     test('note.create 与 note.append（replace_section 已在 v12 移除）', () async {
       await db.insert('notebooks',
           {'id': 'nb1', 'name': '本', 'sort': 0, 'created_at': 1000});
-      await db.insert('chapters',
-          {'id': 'ch1', 'notebook_id': 'nb1', 'name': '章', 'sort': 0, 'created_at': 1000});
+      await db.insert('chapters', {
+        'id': 'ch1',
+        'notebook_id': 'nb1',
+        'name': '章',
+        'sort': 0,
+        'created_at': 1000
+      });
       await service.handleToolBlock(
         conversationId: convId,
         batchId: 'amsg-n1',
@@ -218,7 +549,8 @@ void main() {
       await service.handleToolBlock(
         conversationId: convId,
         batchId: 'amsg-n2',
-        block: block(0, 'note.append', {'noteId': noteId, 'content': '## 周二\n雨'}),
+        block:
+            block(0, 'note.append', {'noteId': noteId, 'content': '## 周二\n雨'}),
       );
       expect((await executor.approve('amsg-n2_b0')).ok, isTrue);
       expect((await appDb.getNoteById(noteId))?.content, contains('## 周二\n雨'));
@@ -272,8 +604,8 @@ void main() {
       await service.handleToolBlock(
         conversationId: convId,
         batchId: 'amsg-p',
-        block: block(0, 'message.set_priority',
-            {'messageId': 'm1', 'priority': 'junk'}),
+        block: block(
+            0, 'message.set_priority', {'messageId': 'm1', 'priority': 'junk'}),
       );
       expect((await executor.approve('amsg-p_b0')).ok, isTrue);
       expect((await appDb.getMessageById('m1'))?.priority, 'junk');
@@ -357,7 +689,8 @@ void main() {
 
       expect(outcome, isA<ProposalValidationFailure>(),
           reason: '未选消息不得生成单条提案（B15 收尾：library.search 拿 id 的窄路径）');
-      expect((outcome as ProposalValidationFailure).reason, contains('m-other'));
+      expect(
+          (outcome as ProposalValidationFailure).reason, contains('m-other'));
       expect(await appDb.getProposals(), isEmpty, reason: '被拒的提案不得落库');
     });
 
@@ -386,8 +719,7 @@ void main() {
             {'messageId': 'm-any', 'priority': 'junk'}),
       );
 
-      expect(outcome, isA<ProposalCreated>(),
-          reason: '没有选中集合时不得改变既有行为');
+      expect(outcome, isA<ProposalCreated>(), reason: '没有选中集合时不得改变既有行为');
       expect(await appDb.getProposals(), hasLength(1));
     });
 

@@ -447,3 +447,90 @@ class ChangeProposal {
         if (resolvedAt != null) 'resolvedAt': resolvedAt,
       };
 }
+
+/// R03-A6（task-112/113）：**回合检查点** —— 崩溃/被杀后恢复在途回合的唯一值对象。
+///
+/// 只承载「恢复请求所需的最小状态」。恢复语义是**重发请求 + 跳过已处理块**
+/// （nextBlockIndex 之后的块才会被再次处理），不是续接上游流；未闭合块按既有规则丢弃。
+class AssistantTurnCheckpoint {
+  /// assistant 消息 id（= 主键）。
+  final String assistantMessageId;
+  final String conversationId;
+
+  /// 回合阶段名（TurnPhase.name 快照，仅用于恢复时展示）。
+  final String phase;
+
+  /// 已生成正文（恢复后继续往后追加）。
+  final String visibleText;
+
+  /// 已生成的思考文本（恢复时回填 thinkingBySection）。
+  final String thinkingText;
+
+  /// 下一个待处理工具块序号（ToolBlockParser.startBlockIndex）。
+  final int nextBlockIndex;
+
+  /// 已用续跑轮数（恢复不得借此多送轮数，仍受 maxToolContinuations 约束）。
+  final int continuationRound;
+
+  /// 本回合用户输入与附件，恢复时重发请求要用。
+  final String inputText;
+  final List<ChatAttachment> inputAttachments;
+  final String? reasoning;
+  final int updatedAt;
+
+  const AssistantTurnCheckpoint({
+    required this.assistantMessageId,
+    required this.conversationId,
+    required this.phase,
+    this.visibleText = '',
+    this.thinkingText = '',
+    this.nextBlockIndex = 0,
+    this.continuationRound = 0,
+    required this.inputText,
+    this.inputAttachments = const [],
+    this.reasoning,
+    required this.updatedAt,
+  });
+
+  Map<String, Object?> toRow() => {
+        'assistant_message_id': assistantMessageId,
+        'conversation_id': conversationId,
+        'phase': phase,
+        'visible_text': visibleText,
+        'thinking_text': thinkingText,
+        'next_block_index': nextBlockIndex,
+        'continuation_round': continuationRound,
+        'input_text': inputText,
+        'input_attachments':
+            jsonEncode([for (final a in inputAttachments) a.toJson()]),
+        'reasoning': reasoning,
+        'updated_at': updatedAt,
+      };
+
+  factory AssistantTurnCheckpoint.fromRow(Map<String, Object?> row) {
+    final rawAttachments = row['input_attachments'] as String?;
+    var attachments = const <ChatAttachment>[];
+    if (rawAttachments != null && rawAttachments.isNotEmpty) {
+      final decoded = jsonDecode(rawAttachments);
+      if (decoded is List) {
+        attachments = [
+          for (final e in decoded)
+            if (e is Map) ChatAttachment.fromJson(e.cast<String, dynamic>()),
+        ];
+      }
+    }
+    return AssistantTurnCheckpoint(
+      assistantMessageId: row['assistant_message_id'] as String,
+      conversationId: row['conversation_id'] as String,
+      phase: row['phase'] as String,
+      visibleText: (row['visible_text'] as String?) ?? '',
+      thinkingText: (row['thinking_text'] as String?) ?? '',
+      nextBlockIndex: (row['next_block_index'] as num?)?.toInt() ?? 0,
+      continuationRound: (row['continuation_round'] as num?)?.toInt() ?? 0,
+      inputText: (row['input_text'] as String?) ?? '',
+      inputAttachments: attachments,
+      reasoning: row['reasoning'] as String?,
+      updatedAt: (row['updated_at'] as num?)?.toInt() ?? 0,
+    );
+  }
+}

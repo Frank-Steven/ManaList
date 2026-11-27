@@ -4,6 +4,7 @@ import '../../models/conversation.dart';
 import '../../models/note.dart';
 import '../../models/task.dart';
 import '../anchor_service.dart';
+import '../app_log.dart';
 import '../crdt.dart';
 import '../database.dart';
 import '../undo_service.dart';
@@ -59,32 +60,45 @@ class ProposalExecutor {
     if (proposal.status != ProposalStatus.pending) {
       return ProposalExecution(false, '提案状态不可审批: ${proposal.status}');
     }
-    await db.transitionProposal(proposalId, ProposalStatus.approved);
+    // R03①（task-107）：先抢审批 CAS。并发 / 双击时只有第一个能拿到
+    // pending→approved；抢不到者必须**立即返回**，不得继续 validate / _execute，
+    // 也不得回注（否则同一提案会被执行两次、领域任务/op 双写）。
+    final claimed =
+        await db.transitionProposal(proposalId, ProposalStatus.approved);
+    if (!claimed) {
+      return const ProposalExecution(
+          false, '提案已被其它执行者接管（状态已变更），本次不重复执行');
+    }
+    // R03③（task-110）：执行 + 收尾共用一条路径（approve 与 recover 都走这里）
+    return _runApproved(proposal);
+  }
+
+  /// R03③：对**已 approved** 的提案执行 guards → _execute → 原子收尾。
+  ///
+  /// approve（刚抢到 CAS）与 [recoverApprovedProposals]（崩溃恢复）共用本函数，
+  /// 禁止复制第二套执行流。
+  Future<ProposalExecution> _runApproved(ChangeProposal proposal) async {
+    final db = AppDatabase.instance;
+    final proposalId = proposal.id;
 
     // 存在性校验（目标不存在 → failed，crdt.md §3.3 收窄后的失败定义）
     final validationError =
         await ProposalService.instance.validate(proposal.tool, proposal.payload);
     if (validationError != null) {
-      await db.transitionProposal(proposalId, ProposalStatus.failed);
-      final exec = ProposalExecution(false, '执行前校验失败：$validationError');
-      await _reportBack(proposal, exec);
-      return exec;
+      return _finishFailed(proposal, '执行前校验失败：$validationError');
     }
     final permissionError =
         await _checkPermission(proposal.tool, proposal.payload);
     if (permissionError != null) {
-      await db.transitionProposal(proposalId, ProposalStatus.failed);
-      final exec = ProposalExecution(false, permissionError);
-      await _reportBack(proposal, exec);
-      return exec;
+      return _finishFailed(proposal, permissionError);
     }
 
     // 三态裁决（crdt.md §3.2）：base 漂移且冲突方是人/系统 → superseded
     final supersededReason = await _adjudicate(proposal);
     if (supersededReason != null) {
-      await db.transitionProposal(proposalId, ProposalStatus.superseded);
       final exec = ProposalExecution(false, supersededReason);
-      await _reportBack(proposal, exec);
+      await db.completeProposal(proposalId, ProposalStatus.superseded,
+          resultMessage: _resultMessage(proposal, exec));
       return exec;
     }
 
@@ -92,27 +106,119 @@ class ProposalExecutor {
     ProposalExecution exec;
     Map<String, dynamic>? undo;
     try {
-      (exec, undo) = await _execute(proposal.tool, proposal.payload, actor);
+      (exec, undo) =
+          await _execute(proposal.id, proposal.tool, proposal.payload, actor);
     } catch (e) {
       exec = ProposalExecution(false, '执行异常：$e');
     }
 
-    if (exec.ok) {
-      if (undo != null) {
-        // 逆操作快照随提案落库（历史区撤销入口的数据来源）
-        await db.insertProposal(_withUndo(
-            await db.getProposalById(proposalId) ?? proposal, undo));
-      }
-      await db.transitionProposal(proposalId, ProposalStatus.applied);
+    // 原子收尾：状态 + undo payload + 结果消息 + 会话时间戳同一事务。
+    // affected==0（被别的执行者改走）→ 不回注、不注册撤销。
+    final settled = await db.completeProposal(
+      proposalId,
+      exec.ok ? ProposalStatus.applied : ProposalStatus.failed,
+      undoPayload: exec.ok ? undo : null,
+      resultMessage: _resultMessage(proposal, exec),
+      conversationId: proposal.conversationId,
+    );
+    if (settled && exec.ok) {
+      // 撤销入口放在事务外（UndoService 是内存副作用，不能假称在事务内）；
+      // recover 重入时 settled=false → 不会重复注册。
       UndoService.instance.register(
         label: '撤销：${proposal.summary}',
         undo: () => undoApplied(proposalId),
       );
-    } else {
-      await db.transitionProposal(proposalId, ProposalStatus.failed);
     }
-    await _reportBack(proposal, exec);
     return exec;
+  }
+
+  /// 校验/权限失败：原子收尾到 failed（CAS），成功才回注。
+  Future<ProposalExecution> _finishFailed(
+      ChangeProposal proposal, String message) async {
+    final db = AppDatabase.instance;
+    final exec = ProposalExecution(false, message);
+    await db.completeProposal(
+      proposal.id,
+      ProposalStatus.failed,
+      resultMessage: _resultMessage(proposal, exec),
+      conversationId: proposal.conversationId,
+    );
+    return exec;
+  }
+
+  /// 确定性结果消息（id = 提案ID_result；replace → 幂等）。
+  ChatMessage? _resultMessage(
+      ChangeProposal proposal, ProposalExecution exec) {
+    final conversationId = proposal.conversationId;
+    if (conversationId == null) return null;
+    return _toolMessage(
+      conversationId,
+      '${exec.ok ? '✅' : '❌'} [${proposal.tool}] ${exec.message}',
+      id: '${proposal.id}_result',
+    );
+  }
+
+  /// R03③：approved 提案的崩溃恢复。
+  ///
+  /// - 领域对象/op 已存在（能证明执行过）→ **不重复执行**，只补 applied 收尾与结果消息；
+  /// - 否则走共享 guards 执行一次再收尾；
+  /// - 结果消息已存在时**不改写原文**（completeProposal 用 replace 写同一 id，内容相同）；
+  /// - 不处理历史 applied（避免无依据的重复回注），不新建恢复状态机。
+  Future<void> recoverApprovedProposals() async {
+    final db = AppDatabase.instance;
+    final List<ChangeProposal> pending;
+    try {
+      pending = await db.getProposals(status: ProposalStatus.approved);
+    } catch (_) {
+      return; // 库不可用时静默（启动路径不阻塞）
+    }
+    for (final proposal in pending) {
+      try {
+        if (await _alreadyExecuted(proposal)) {
+          // 已执行过：只补收尾（不再执行、不再注册撤销）
+          const exec = ProposalExecution(
+              true, '已恢复：该变更此前已执行，状态补齐为已应用（未重复执行）');
+          await db.completeProposal(
+            proposal.id,
+            ProposalStatus.applied,
+            resultMessage: await _resultForRecovery(proposal, exec),
+            conversationId: proposal.conversationId,
+          );
+          continue;
+        }
+        await _runApproved(proposal);
+      } catch (e) {
+        AppLog.instance.warn('proposal.recover', e);
+        continue;
+      }
+    }
+  }
+
+  /// 恢复时若已存在结果消息，直接复用（不改写原文）；否则给一条通用的恢复成功消息。
+  Future<ChatMessage?> _resultForRecovery(
+      ChangeProposal proposal, ProposalExecution exec) async {
+    final conversationId = proposal.conversationId;
+    if (conversationId == null) return null;
+    final existing =
+        await AppDatabase.instance.getChatMessageById('${proposal.id}_result');
+    return existing ?? _resultMessage(proposal, exec);
+  }
+
+  /// 判断该提案的领域写入是否已发生（用于崩溃恢复时避免重复执行）。
+  ///
+  /// - task.create → 确定性 task id 是否存在；
+  /// - note.create → 确定性 note id 是否存在；
+  /// - 其它写工具 → 是否存在以「提案ID」为前缀的 op_log 行（A2 的确定性 op_id）。
+  Future<bool> _alreadyExecuted(ChangeProposal proposal) async {
+    final db = AppDatabase.instance;
+    switch (proposal.tool) {
+      case ToolNames.taskCreate:
+        return await db.getTaskById('task_${proposal.id}') != null;
+      case ToolNames.noteCreate:
+        return await db.getNoteById('note_${proposal.id}') != null;
+      default:
+        return await db.hasOpForProposalPrefix(proposal.id);
+    }
   }
 
   /// 三态裁决（crdt.md §3.2）：返回非 null = 置 superseded 的原因。
@@ -247,13 +353,17 @@ class ProposalExecutor {
   /// （当前全部写工具都可撤销）。[actor] = `assistant:<conversationId>`，
   /// 所有物化写入经 op-recording 路径落 op_log。
   Future<(ProposalExecution, Map<String, dynamic>?)> _execute(
-      String tool, Map<String, dynamic> args, String actor) async {
+      String proposalId,
+      String tool,
+      Map<String, dynamic> args,
+      String actor) async {
     final db = AppDatabase.instance;
     switch (tool) {
       case ToolNames.taskCreate:
         final now = DateTime.now().millisecondsSinceEpoch;
         final task = Task(
-          id: _uuid.v4(),
+          // R03②：确定性 id（同一提案重放不会建出第二条任务；insertTask 为 replace）
+          id: 'task_$proposalId',
           title: (args['title'] as String).trim(),
           description: (args['description'] as String?)?.trim(),
           kind: args['kind'] == TaskKind.range ? TaskKind.range : TaskKind.point,
@@ -296,7 +406,7 @@ class ProposalExecutor {
         if (args.containsKey('status')) {
           next = next.copyWith(status: args['status'] as String);
         }
-        await db.updateTask(next, actor: actor);
+        await db.updateTask(next, actor: actor, opId: proposalId);
         return (
           ProposalExecution(true, '已修改任务「${next.title}」'),
           {'op': 'task.restore', 'task': old.toRow()},
@@ -306,7 +416,7 @@ class ProposalExecutor {
         final old = (await db.getTaskById(args['id'] as String))!;
         // 删除前快照锚点行（v12 起锚点不入正文，撤销 = 任务行 + 锚点行回插）。
         final snapshot = await db.snapshotTaskDeletion([old.id]);
-        await db.deleteTasks([old.id], actor: actor);
+        await db.deleteTasks([old.id], actor: actor, opId: proposalId);
         return (
           ProposalExecution(
               true,
@@ -320,11 +430,12 @@ class ProposalExecutor {
         );
 
       case ToolNames.noteCreate:
-        final chapterId =
-            args['chapterId'] as String? ?? await _defaultChapterId(db);
+        final chapterId = args['chapterId'] as String? ??
+            await _defaultChapterId(db, proposalId);
         final now = DateTime.now().millisecondsSinceEpoch;
         final note = Note(
-          id: _uuid.v4(),
+          // R03②：确定性 id
+          id: 'note_$proposalId',
           chapterId: chapterId,
           title: (args['title'] as String).trim(),
           content: args['content'] as String? ?? '',
@@ -364,6 +475,7 @@ class ProposalExecutor {
           targetId: args['targetId'] as String,
           createdBy: AnchorCreatedBy.ai,
           actor: actor,
+          opId: '${proposalId}_anchor-${args['targetType']}-${args['targetId']}',
         );
         if (!result.ok) {
           return (ProposalExecution(false, result.error ?? '锚点创建失败'), null);
@@ -379,8 +491,8 @@ class ProposalExecutor {
       case ToolNames.anchorRemove:
         final anchor = (await db.getAnchorById(args['anchorId'] as String))!;
         // 快照锚点行：撤销时原样回插（v12 起锚点不入正文，无正文可恢复）。
-        final removed =
-            await AnchorService.instance.removeAnchor(anchor.id, actor: actor);
+        final removed = await AnchorService.instance
+            .removeAnchor(anchor.id, actor: actor, opId: proposalId);
         if (!removed) {
           return (const ProposalExecution(false, '锚点不存在'), null);
         }
@@ -403,6 +515,7 @@ class ProposalExecutor {
       case ToolNames.messageSetPriority:
         final msg = (await db.getMessageById(args['messageId'] as String))!;
         await db.updateMessagePriority([msg.id], args['priority'] as String,
+            opId: proposalId,
             actor: actor);
         return (
           ProposalExecution(
@@ -578,17 +691,22 @@ class ProposalExecutor {
       : DateTime.fromMillisecondsSinceEpoch(ms).toString().substring(0, 16);
 
   /// note.create 缺省章节：第一个笔记本的第一个章节；库为空时建「AI 笔记」。
-  Future<String> _defaultChapterId(AppDatabase db) async {
+  Future<String> _defaultChapterId(AppDatabase db, String proposalId) async {
     for (final nb in await db.getNotebooks()) {
       final chapters = await db.getChapters(nb.id);
       if (chapters.isNotEmpty) return chapters.first.id;
     }
     final now = DateTime.now().millisecondsSinceEpoch;
+    // R03②：库为空时才建，用确定性 id（提案ID_notebook / 提案ID_chapter）；
+    // insertNotebook/insertChapter 为 replace，同一提案重放不会重复建。
     final nb = Notebook(
-        id: _uuid.v4(), name: 'AI 笔记', sort: 0, createdAt: now);
+        id: '${proposalId}_notebook',
+        name: 'AI 笔记',
+        sort: 0,
+        createdAt: now);
     await db.insertNotebook(nb);
     final ch = Chapter(
-        id: _uuid.v4(),
+        id: '${proposalId}_chapter',
         notebookId: nb.id,
         name: '默认',
         sort: 0,
@@ -599,45 +717,20 @@ class ProposalExecutor {
 
   // ---- 回注与快照 ----
 
-  ChangeProposal _withUndo(ChangeProposal p, Map<String, dynamic> undo) =>
-      ChangeProposal(
-        id: p.id,
-        conversationId: p.conversationId,
-        batchId: p.batchId,
-        tool: p.tool,
-        summary: p.summary,
-        payload: {...p.payload, _undoKey: undo},
-        status: p.status,
-        createdAt: p.createdAt,
-        resolvedAt: p.resolvedAt,
-      );
-
-  /// 执行结果回注原对话（design-v3 §1.4：role='tool' 消息，保持上下文连贯）。
-  /// 对话已删除（conversationId 置空）时跳过。
-  Future<void> _reportBack(
-      ChangeProposal proposal, ProposalExecution exec) async {
-    final conversationId = proposal.conversationId;
-    if (conversationId == null) return;
-    final db = AppDatabase.instance;
-    if (await db.getConversationById(conversationId) == null) return;
-    await db.insertChatMessage(_toolMessage(
-      conversationId,
-      '${exec.ok ? '✅' : '❌'} [${proposal.tool}] ${exec.message}',
-    ));
-    await db.touchConversation(conversationId);
-  }
-
   /// 只读工具结果/校验失败的回注（由 assistant_service 调用）。
-  Future<void> reportToolMessage(String conversationId, String content) async {
+  Future<void> reportToolMessage(String conversationId, String content,
+      {String? messageId}) async {
     final db = AppDatabase.instance;
     if (await db.getConversationById(conversationId) == null) return;
-    await db.insertChatMessage(_toolMessage(conversationId, content));
+    await db.insertChatMessage(
+        _toolMessage(conversationId, content, id: messageId));
     await db.touchConversation(conversationId);
   }
 
-  ChatMessage _toolMessage(String conversationId, String content) {
+  ChatMessage _toolMessage(String conversationId, String content, {String? id}) {
     return ChatMessage(
-      id: _uuid.v4(),
+      // R03②：调用方给确定性 id 时用它（replace 幂等），否则沿用 UUID
+      id: id ?? _uuid.v4(),
       conversationId: conversationId,
       role: ChatRole.tool,
       content: content,

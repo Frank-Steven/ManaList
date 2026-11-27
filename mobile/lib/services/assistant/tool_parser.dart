@@ -79,7 +79,13 @@ class ToolBlockParser {
   /// 块内累积的 JSON 文本。
   final StringBuffer _blockBuffer = StringBuffer();
 
-  int _blockIndex = 0;
+  /// R03-A6：恢复时可从指定块序号继续（0 = 全新回合）。
+  ///
+  /// 只影响块**编号**；feed/finish 的解析逻辑一字不改 —— 已处理过的块在恢复后
+  /// 不会再被解析出来（模板解析定位由 [ToolBlockParser.startBlockIndex] 决定）。
+  int _blockIndex;
+
+  ToolBlockParser({int startBlockIndex = 0}) : _blockIndex = startBlockIndex;
 
   /// 已闭合块数（= 下一个块的 blockIndex）。
   int get blockCount => _blockIndex;

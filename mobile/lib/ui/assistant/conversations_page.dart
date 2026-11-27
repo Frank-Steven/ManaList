@@ -539,6 +539,8 @@ class ConversationsPageState extends State<ConversationsPage> {
       floatingActionButton: (_searching || _initialLoadPending)
           ? null
           : FloatingActionButton(
+              // B44：与库页/任务页 FAB 并存，无共享元素转场 → 显式 null
+              heroTag: null,
               tooltip: '新建对话',
               onPressed: _newConversation,
               child: const Icon(Icons.add),

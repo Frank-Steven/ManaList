@@ -10,17 +10,71 @@ import 'assistant/models.dart';
 import 'attachment_store.dart';
 import 'database.dart';
 
-/// 文件被引用的统计（删除前检查，design-v3 §1.3）。
+/// JSON 文本内的子串判据：把 `value` 编成 JSON 字面量（含引号）后交给 `instr()`。
+///
+/// 为什么不拼 LIKE：JSON 会把 Windows 路径的 `\` 转义成 `\\`，而 LIKE 的
+/// `ESCAPE` 又要把 `\\` 折回单个 `\` —— 两层转义叠在一起必然匹配不到
+/// （R03-A4 实测：消息附件引用被漏算）。`instr()` 是**字面子串**匹配，
+/// 拿 jsonEncode 的结果直接比，不经过任何转义规则。
+String jsonNeedle(Object value) => jsonEncode(value);
+
+/// 笔记正文里的文件引用：`![name](file://<fileId>)`。
+///
+/// 与 ui/messages/anchored_markdown.dart、note_editor_page.dart 的写法同语义；
+/// 刻意在 services 内自带一份正则（不反向 import ui/，保持依赖方向）。
+final RegExp noteFileLinkPattern =
+    RegExp(r'!\[[^\]]*\]\(file://([0-9a-fA-F-]+)\)');
+
+/// 文件被引用的统计（删除前检查，design-v3 §1.3；R03-A4 扩到 7 类来源）。
 class LibraryFileReferences {
-  /// attachments 列引用该文件的笔记数。
+  /// 同 local_path 的**其它** files 行数（物理文件按 sha256 去重，可能多行共享）。
+  final int fileRowCount;
+
+  /// messages.attachments 里 access.value == 路径的消息数。
+  final int messageCount;
+
+  /// notes.attachments 引用该文件 id 的笔记数。
   final int noteCount;
+
+  /// 笔记**正文** `![name](file://<id>)` 引用该文件的笔记数。
+  final int noteContentCount;
+
+  /// conversations.draft_attachments 里 type=='file' 且 id 命中的会话数。
+  final int draftCount;
+
+  /// chat_messages.attachments 里 type=='file' 且 id 命中的消息数。
+  final int chatCount;
 
   /// target_type='file' 指向该文件的任务锚点数。
   final int anchorCount;
 
-  const LibraryFileReferences({this.noteCount = 0, this.anchorCount = 0});
+  const LibraryFileReferences({
+    this.fileRowCount = 0,
+    this.messageCount = 0,
+    this.noteCount = 0,
+    this.noteContentCount = 0,
+    this.draftCount = 0,
+    this.chatCount = 0,
+    this.anchorCount = 0,
+  });
 
-  bool get hasAny => noteCount > 0 || anchorCount > 0;
+  /// 是否被「删掉就会失效」的引用持有（笔记/正文/消息/草稿/聊天/锚点）。
+  ///
+  /// **不含** [fileRowCount]：同路径的其它 files 行是另一条**活着的**库记录，
+  /// 删掉本条不会让它失效，所以不该拦住「删这一行」。
+  bool get hasAny =>
+      messageCount > 0 ||
+      noteCount > 0 ||
+      noteContentCount > 0 ||
+      draftCount > 0 ||
+      chatCount > 0 ||
+      anchorCount > 0;
+
+  /// 物理文件是否仍被任何来源占用（= [hasAny] 或还有同路径 files 行）。
+  ///
+  /// 这是**删除文件本体**的唯一判据：只要还有一条同路径记录或任何引用，
+  /// 本体就必须保留，否则会给对方留下死路径。
+  bool get hasPathHolders => hasAny || fileRowCount > 0;
 }
 
 // ---- 文件夹路径（DB v9，虚拟文件夹：'' = 根目录，'/' 分隔段） ----
@@ -324,39 +378,167 @@ class LibraryFileService {
     return moved.values.fold<int>(0, (s, l) => s + l.length);
   }
 
-  /// 删除前引用检查：笔记 attachments（JSON 数组逐个解析）+ 任务锚点。
+  /// 删除前引用检查（唯一实现）：委托 [countPathReferences]，
+  /// 用该文件的 local_path（路径键）+ fileId（ID 键）统计 7 类来源。
   Future<LibraryFileReferences> countReferences(String fileId) async {
+    final file = await AppDatabase.instance.getFileById(fileId);
+    if (file == null) {
+      // 行已不存在：只能按 ID 键统计（路径未知）
+      return countPathReferences('', fileId: fileId);
+    }
+    return countPathReferences(file.localPath,
+        fileId: fileId, excludeFileId: fileId);
+  }
+
+  /// 按 **路径 + ID** 统计引用（R03-A4 的 7 类来源，全部走前缀过滤以避免全表解码）。
+  ///
+  /// - [localPath] 为空 → 只算 ID 键来源；
+  /// - [excludeFileId] 非空 → files 计数排除该行（删除自己时用）；
+  /// - **命中 LIKE 但解析失败 → 计 1 条引用**（保守：宁可少删，不留死链）。
+  Future<LibraryFileReferences> countPathReferences(
+    String localPath, {
+    String? fileId,
+    String? excludeFileId,
+  }) async {
+    final hasPath = localPath.isNotEmpty;
+    final hasId = fileId != null && fileId.isNotEmpty;
+    if (!hasPath && !hasId) return const LibraryFileReferences();
     final db = await AppDatabase.instance.database;
-    final noteRows = await db.query('notes', columns: ['attachments']);
-    var noteCount = 0;
-    for (final row in noteRows) {
-      final raw = row['attachments'] as String?;
-      if (raw == null || raw.isEmpty) continue;
-      try {
-        final ids = (jsonDecode(raw) as List).map((e) => e.toString());
-        if (ids.contains(fileId)) noteCount++;
-      } catch (_) {
-        // 单行 attachments 损坏不算引用，不阻塞检查
+
+    // 1) 同路径的其它 files 行
+    var fileRowCount = 0;
+    if (hasPath) {
+      final rows = excludeFileId == null
+          ? await db.rawQuery(
+              'SELECT COUNT(*) AS n FROM files WHERE local_path = ?',
+              [localPath])
+          : await db.rawQuery(
+              'SELECT COUNT(*) AS n FROM files WHERE local_path = ? AND id != ?',
+              [localPath, excludeFileId]);
+      fileRowCount = (rows.first['n'] as num?)?.toInt() ?? 0;
+    }
+
+    /// 逐行解码的通用计数：先用 `instr` 字面量过滤（大表不全解），再按 [matches] 判定。
+    Future<int> countJsonRows(String table, String column, String needle,
+        bool Function(List<dynamic> list) matches) async {
+      final rows = await db.query(table, columns: [column],
+          where: 'instr($column, ?) > 0', whereArgs: [needle]);
+      var n = 0;
+      for (final row in rows) {
+        final raw = row[column] as String?;
+        if (raw == null || raw.isEmpty) continue;
+        try {
+          final decoded = jsonDecode(raw);
+          if (decoded is List && matches(decoded)) n++;
+        } catch (_) {
+          n++; // 保守：命中 LIKE 却解不出 → 当作有引用
+        }
+      }
+      return n;
+    }
+
+    // 2) messages.attachments：access.value == 路径（不看 access.type，保守）
+    var messageCount = 0;
+    if (hasPath) {
+      // 库里存的是 JSON 文本（路径里的 \ 已转义成 \\），必须拿 jsonNeedle 比字面量
+      final rows = await db.query('messages', columns: ['attachments'],
+          where: 'instr(attachments, ?) > 0',
+          whereArgs: [jsonNeedle(localPath)]);
+      for (final row in rows) {
+        final raw = row['attachments'] as String?;
+        if (raw == null || raw.isEmpty) continue;
+        try {
+          final decoded = jsonDecode(raw);
+          if (decoded is! List) {
+            messageCount++;
+            continue;
+          }
+          final hit = decoded.any((e) =>
+              e is Map &&
+              e['access'] is Map &&
+              (e['access'] as Map)['value'] == localPath);
+          if (hit) messageCount++;
+        } catch (_) {
+          messageCount++; // 保守
+        }
       }
     }
+
+    // 3) notes.attachments：元素是 string id
+    var noteCount = 0;
+    // 4) notes.content：`![name](file://<id>)`
+    var noteContentCount = 0;
+    // 5) conversations.draft_attachments：type=='file'
+    var draftCount = 0;
+    // 6) chat_messages.attachments：type=='file'
+    var chatCount = 0;
+    if (hasId) {
+      final idNeedle = jsonNeedle(fileId);
+      noteCount = await countJsonRows(
+          'notes', 'attachments', idNeedle,
+          (list) => list.any((e) => e.toString() == fileId));
+      draftCount = await countJsonRows(
+          'conversations', 'draft_attachments', idNeedle,
+          (list) => list.any((e) =>
+              e is Map && e['type'] == 'file' && e['id'] == fileId));
+      chatCount = await countJsonRows(
+          'chat_messages', 'attachments', idNeedle,
+          (list) => list.any((e) =>
+              e is Map && e['type'] == 'file' && e['id'] == fileId));
+
+      final contentRows = await db.query('notes', columns: ['content'],
+          where: 'instr(content, ?) > 0',
+          whereArgs: ['file://$fileId']);
+      for (final row in contentRows) {
+        final raw = row['content'] as String? ?? '';
+        try {
+          if (noteFileLinkPattern
+              .allMatches(raw)
+              .any((m) => m.group(1) == fileId)) {
+            noteContentCount++;
+          }
+        } catch (_) {
+          noteContentCount++; // 保守
+        }
+      }
+    }
+
+    // 7) task_anchors（沿用既有查询）
     final anchorRows = await db.rawQuery(
       "SELECT COUNT(*) AS n FROM task_anchors WHERE target_type = ? AND target_id = ?",
-      [AnchorTargetType.file, fileId],
+      [AnchorTargetType.file, hasId ? fileId : ''],
     );
+    final anchorCount = (anchorRows.first['n'] as num?)?.toInt() ?? 0;
+
     return LibraryFileReferences(
+      fileRowCount: fileRowCount,
+      messageCount: messageCount,
       noteCount: noteCount,
-      anchorCount: (anchorRows.first['n'] as num?)?.toInt() ?? 0,
+      noteContentCount: noteContentCount,
+      draftCount: draftCount,
+      chatCount: chatCount,
+      anchorCount: anchorCount,
     );
   }
 
-  /// 删除文件：有引用且未 [force] 时返回 false 且不动数据；
-  /// 删除 = files 行（锚点行应用层级联，见 AppDatabase.deleteFile）+ 仓库内文件本体。
+  /// 删除文件。
+  ///
+  /// R03-A4（路径级引用安全）：
+  /// - 有引用且未 [force] → 返回 false 且不动数据；
+  /// - [force] **只**绕过「有引用就拒绝删行」这一步，**不再绕过路径检查**；
+  /// - 删完 files 行（锚点应用层级联，见 AppDatabase.deleteFile）后重新统计
+  ///   「路径 + ID」引用：**仍有任何来源引用该路径 → 保留物理文件本体**，
+  ///   避免同一 sha256 路径被其它 files 行 / 消息附件 / 笔记引用时产生死链。
   Future<bool> delete(String id, {bool force = false}) async {
     final refs = await countReferences(id);
     if (refs.hasAny && !force) return false;
     final file = await AppDatabase.instance.getFileById(id);
     if (file == null) return true;
     await AppDatabase.instance.deleteFile(id);
+    // 行已删，无需 excludeFileId；只关心「是否还有人引用这个物理路径」
+    final remaining =
+        await countPathReferences(file.localPath, fileId: file.id);
+    if (remaining.hasPathHolders) return true; // 仍被引用/同路径行 → 保留本体
     await AttachmentStore.instance.deleteQuietly(Attachment(
       id: file.id,
       kind: Attachment.kindFile,

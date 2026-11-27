@@ -444,17 +444,35 @@ class FilesPageState extends State<FilesPage> {
     final targets = _selectedFiles;
     final folderCount = _selectedFolders.length;
     if (targets.isEmpty && folderCount == 0) return;
+    // R03-A4：按类别汇总（只影响提示文案，不改布局/控件）
     var noteRefs = 0;
     var anchorRefs = 0;
+    var messageRefs = 0;
+    var noteContentRefs = 0;
+    var draftRefs = 0;
+    var chatRefs = 0;
     for (final f in targets) {
       final refs = await LibraryFileService.instance.countReferences(f.id);
       noteRefs += refs.noteCount;
       anchorRefs += refs.anchorCount;
+      messageRefs += refs.messageCount;
+      noteContentRefs += refs.noteContentCount;
+      draftRefs += refs.draftCount;
+      chatRefs += refs.chatCount;
     }
     if (!mounted) return;
-    if (noteRefs > 0 || anchorRefs > 0) {
+    if (noteRefs > 0 ||
+        anchorRefs > 0 ||
+        messageRefs > 0 ||
+        noteContentRefs > 0 ||
+        draftRefs > 0 ||
+        chatRefs > 0) {
       final parts = <String>[
         if (noteRefs > 0) '$noteRefs 处笔记附件',
+        if (noteContentRefs > 0) '$noteContentRefs 处笔记正文引用',
+        if (messageRefs > 0) '$messageRefs 条消息附件',
+        if (draftRefs > 0) '$draftRefs 条草稿附件',
+        if (chatRefs > 0) '$chatRefs 条聊天附件',
         if (anchorRefs > 0) '$anchorRefs 个任务锚点',
       ];
       final confirmed = await showDialog<bool>(
@@ -617,6 +635,10 @@ class FilesPageState extends State<FilesPage> {
     if (refs.hasAny) {
       final parts = <String>[
         if (refs.noteCount > 0) '${refs.noteCount} 篇笔记的附件',
+        if (refs.noteContentCount > 0) '${refs.noteContentCount} 处笔记正文引用',
+        if (refs.messageCount > 0) '${refs.messageCount} 条消息附件',
+        if (refs.draftCount > 0) '${refs.draftCount} 条草稿附件',
+        if (refs.chatCount > 0) '${refs.chatCount} 条聊天附件',
         if (refs.anchorCount > 0) '${refs.anchorCount} 个任务锚点',
       ];
       final confirmed = await showDialog<bool>(
@@ -624,7 +646,7 @@ class FilesPageState extends State<FilesPage> {
         builder: (dialogContext) => AlertDialog(
           title: const Text('文件仍被引用'),
           content: Text('「${file.name}」正被 ${parts.join('、')} 引用。\n'
-              '删除后这些引用会失效（笔记附件丢失、锚点移除）。仍要删除吗？'),
+              '删除后这些引用会失效；仍被引用的文件本体会保留，不会造成死链。'),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(dialogContext).pop(false),

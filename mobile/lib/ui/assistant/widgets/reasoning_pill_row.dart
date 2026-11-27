@@ -48,16 +48,6 @@ bool isDefaultReasoningLevel(String? level) => level == null;
 String reasoningPillText(String? effective) =>
       effective == null ? "思考" : "思考 · ${reasoningOptionLabel(effective)}";
 
-/// 对话上下文 token 的**近似**估算：历史消息字符数 / 4 + 草稿附件估算。
-int estimateContextTokens({
-  required int historyChars,
-  required int attachmentTokens,
-}) {
-  if (historyChars <= 0) return attachmentTokens < 0 ? 0 : attachmentTokens;
-  final fromHistory = (historyChars / 4).round();
-  return fromHistory + (attachmentTokens < 0 ? 0 : attachmentTokens);
-}
-
 /// 圆环的「约 N%（字符估算）」文案。
 ///
 /// F43 口径：必须走 [contextPercentLabel]（<1% 不显示成 0%），否则与胶囊/面板

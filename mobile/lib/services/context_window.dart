@@ -1,4 +1,7 @@
+import "assistant/models.dart" show ChatAttachment, ChatMessageModel;
 import "model_capabilities.dart" show normalizeModelId;
+import "token_estimate.dart"
+    show kConservativeImageTokens, estimateTokensFromChars;
 
 /// F41（2026-11-13）：上下文窗口上限改为「可获取」，不再硬编码 32k。
 ///
@@ -118,4 +121,80 @@ ContextWindowInfo resolveContextWindow({
   }
   return const ContextWindowInfo(
       kAssumedContextTokenLimit, ContextWindowSource.assumed);
+}
+
+// ---- R03-A5（task-112）：请求级上下文预算 ----
+
+/// 对话上下文 token 的**近似**估算：历史消息字符数 / 4 + 草稿附件估算。
+///
+/// 原定义在 ui/assistant/widgets/reasoning_pill_row.dart；R03-A5 搬到服务层，
+/// 让 UI 与服务端预算用同一口径（UI 侧改为 import，不再保留副本）。
+int estimateContextTokens({
+  required int historyChars,
+  required int attachmentTokens,
+}) {
+  if (historyChars <= 0) return attachmentTokens < 0 ? 0 : attachmentTokens;
+  final fromHistory = (historyChars / 4).round();
+  return fromHistory + (attachmentTokens < 0 ? 0 : attachmentTokens);
+}
+
+/// 一次**请求**的预算快照（R03-A5）。
+class RequestBudget {
+  /// 估算用量（字符估算，非真实 tokenizer）。
+  final int usedTokens;
+
+  /// 上限（端点自报 / 模型表 / 用户配置，见 [resolveContextWindow]）。
+  final int limitTokens;
+
+  const RequestBudget(this.usedTokens, this.limitTokens);
+
+  /// 占用比例；上限未知（<= 0）时返回 0，**不判定为超限**。
+  double get ratio => limitTokens <= 0 ? 0 : usedTokens / limitTokens;
+
+  /// 严格超过 100%（等于 100% 仍允许发送）。
+  bool get over100 => limitTokens > 0 && usedTokens > limitTokens;
+
+  /// 超过 80%（既有预警语义，对应 attachment_cards 的 budgetLevel）。
+  bool get over80 => limitTokens > 0 && usedTokens > limitTokens * 0.8;
+
+  /// 「估算 N tokens / 上限 Xk」
+  String get label =>
+      '估算 $usedTokens tokens / 上限 ${formatContextWindowTokens(limitTokens)}';
+}
+
+/// 估算**本次请求**的上下文用量（含说明书/工具前言与附件上下文块）。
+///
+/// 口径（与 UI 保持一致，不另造阈值）：
+/// - 所有消息正文 + 附件上下文文本 → 字符数求和后走 [estimateTokensFromChars]（/2）；
+/// - 「dataBase64 非空」的附件每个再加 [kConservativeImageTokens]
+///   （B29 口径：库内图 1.4K/张）。**注意** dataBase64 可能是空串（占位），
+///   空串不额外计图片 tokens，避免把纯文本附件算成图片。
+///
+/// 注意：这里按**字符**保守估算（CJK /2），不是真实 tokenizer；用于「超限就别发」的
+/// 硬闸门与 80% 预警，不用于计费。
+RequestBudget estimateRequestBudget({
+  required List<ChatMessageModel> messages,
+  List<ChatAttachment> attachments = const [],
+  required int limitTokens,
+}) {
+  var chars = 0;
+  for (final m in messages) {
+    chars += m.content.length;
+    // 附件上下文块（带 [#note:标题] 引用头）也是要发给模型的正文
+    for (final a in m.attachments) {
+      final text = a.content;
+      if (text != null) chars += text.length;
+    }
+  }
+  var imageTokens = 0;
+  for (final a in attachments) {
+    final text = a.content;
+    if (text != null) chars += text.length;
+    // dataBase64 非空 = 本回合要内联图片 → 按保守上界计
+    if (a.dataBase64 != null && a.dataBase64!.isNotEmpty) {
+      imageTokens += kConservativeImageTokens;
+    }
+  }
+  return RequestBudget(
+      estimateTokensFromChars(chars) + imageTokens, limitTokens);
 }

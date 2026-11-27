@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../ai_client.dart';
+import '../context_window.dart';
 import '../app_log.dart';
 import '../model_capabilities.dart';
 import 'models.dart';
@@ -241,6 +242,51 @@ class AssistantClient {
   /// [modelConfigId] 为对话绑定的模型配置（desktop 模型 id 或远程端点 id）；
   /// [reasoning] 为本回合**生效**的推理档位（对话级临时覆盖优先，见 F36）：
   /// null = 自动（不发参数）、off = 显式关闭（不发）、low/medium/high = 发 reasoning_effort。
+  /// 按 id 找对话绑定的远程端点（找不到返回 null）。
+  ///
+  /// R03-A5：chat() 与 contextWindowFor() 共用这一份解析，避免第二套端点查找。
+  Future<AiEndpoint?> _remoteEndpointFor(String? modelConfigId) async {
+    if (modelConfigId == null || modelConfigId.isEmpty) return null;
+    try {
+      for (final e in await AiClient.instance.getRemoteEndpoints()) {
+        if (e.id == modelConfigId) return e;
+      }
+    } catch (_) {
+      return null; // 未配置 / 读不到：按「无法判定」处理
+    }
+    return null;
+  }
+
+  /// 本回合生效的上下文窗口；**null = 无法判定**。
+  ///
+  /// 覆盖范围（R03-A5 已批准的边界）：
+  /// - 远程端点（对话绑定 id 或默认端点）：用 [resolveContextWindow] 解析；
+  /// - **desktop 路径不覆盖**：窗口只在 desktop 侧知道，本地要查它就必须额外发
+  ///   /v1/models 请求，而「超限不得发请求」这条硬闸门禁止该请求 —— 因此
+  ///   desktop 在线时这里返回 null（不做预算判定），宁可放过也不误杀。
+  ///
+  /// 全程 try/catch：测试环境 / 未配置端点时返回 null，
+  /// **绝不让预算检查本身把回合打成 error**。
+  Future<ContextWindowInfo?> contextWindowFor(String? modelConfigId) async {
+    try {
+      final ai = AiClient.instance;
+      var endpoint = await _remoteEndpointFor(modelConfigId);
+      if (endpoint == null && modelConfigId == null) {
+        // 未绑定远程 id：desktop 在线 → 不判定；否则看默认远程端点
+        if (await ai.isDesktopOnline()) return null;
+        endpoint = await ai.defaultRemoteEndpoint();
+      }
+      if (endpoint == null) return null;
+      return resolveContextWindow(
+        model: endpoint.model,
+        configured: endpoint.contextWindow,
+        fromEndpoint: endpoint.contextWindowFromEndpoint,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
   Stream<ChatEvent> chat({
     required String conversationId,
     required List<ChatMessageModel> messages,
@@ -251,13 +297,12 @@ class AssistantClient {
     _cancelled = false;
     final ai = AiClient.instance;
 
-    // 1. 对话绑定的远程端点优先
+    // 1. 对话绑定的远程端点优先（解析抽到 _remoteEndpointFor，供预算检查复用）
     if (modelConfigId != null) {
-      for (final e in await ai.getRemoteEndpoints()) {
-        if (e.id == modelConfigId) {
-          yield* _chatViaRemote(e, messages, attachments, reasoning: reasoning);
-          return;
-        }
+      final bound = await _remoteEndpointFor(modelConfigId);
+      if (bound != null) {
+        yield* _chatViaRemote(bound, messages, attachments, reasoning: reasoning);
+        return;
       }
     }
 

@@ -232,8 +232,8 @@ void main() {
   });
 
   group('迁移', () {
-    test('dbVersion 升到 15', () {
-      expect(AppDatabase.dbVersion, 15);
+    test('dbVersion 升到 16（v15 撤销备份 + v16 回合检查点）', () {
+      expect(AppDatabase.dbVersion, 16);
     });
 
     test('v14 老库迁移：缺备份表 → 迁移后建齐，旧数据不动，幂等', () async {

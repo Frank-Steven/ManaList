@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../models/conversation.dart';
+import '../app_log.dart';
+import '../context_window.dart';
 import '../database.dart';
 import 'assistant_client.dart';
 import 'image_encoder.dart';
@@ -195,7 +197,15 @@ class AssistantTurnHandle {
 /// 不再依赖页面消费流——多对话可同时各跑一个回合；同对话新回合自动
 /// 取消旧回合。编辑/撤回/重试 = 截断后续消息（pending 提案一并撤销）后重跑。
 class AssistantService {
-  AssistantService._();
+  AssistantService._() {
+    // R03③（task-110）：启动时恢复「已 approved 但未收尾」的提案（崩溃恢复）。
+    // 放在构造里=单例首次使用时触发一次；失败静默（见 recoverApprovedProposals）。
+    // 测试可直接 await ProposalExecutor.instance.recoverApprovedProposals()。
+    unawaited(ProposalExecutor.instance.recoverApprovedProposals());
+    // R03-A6：再恢复「中途崩溃的回合」（必须在提案恢复之后：先补完状态，
+    // 再决定哪些回合还能继续跑）。
+    unawaited(recoverTurns());
+  }
 
   static final AssistantService instance = AssistantService._();
 
@@ -466,42 +476,164 @@ class AssistantService {
   /// 执行一个回合：落用户消息（首条消息生成对话标题）→ 建 streaming 状态的
   /// assistant 占位消息 → 组装请求 → 流式消费 → 文本增量、工具块落提案/回注 →
   /// 结束时把可见文本与状态写回 assistant 消息。全程事件经 [handle._emit] 广播。
-  Future<void> _runTurn(AssistantTurnHandle handle) async {
+  /// 检查点恢复是**尽力而为**的优化：数据库不可用/未建 v16 表时静默降级。
+  ///
+  /// 为什么不 warn：AppLog 的节流通知会起一个 500ms Timer，widget 测试在销毁时
+  /// 会判「Timer 仍挂起」而整例失败（R03-A6 全量实测踩到两次）。下列都属于
+  /// **环境不可用**而非业务异常，记为告警只会制造噪声：
+  /// - `no such table ... assistant_turn_checkpoints`：老库 / 测试替身库未建 v16 表；
+  /// - `databaseFactory not initialized` / `MissingPluginException`：纯 widget 测试
+  ///   没有初始化 sqflite 与平台插件（生产由 AppDatabase 保证可用）。
+  /// 其它错误照常 warn，不掩盖真实问题。
+  static bool _isCheckpointUnavailable(Object e) {
+    final s = '$e';
+    if (s.contains('no such table') &&
+        s.contains('assistant_turn_checkpoints')) {
+      return true;
+    }
+    return s.contains('databaseFactory not initialized') ||
+        s.contains('MissingPluginException');
+  }
+
+  static void _warnCheckpoint(String op, Object e) {
+    if (_isCheckpointUnavailable(e)) return;
+    AppLog.instance.warn(op, e);
+  }
+
+  /// 删检查点（失败只 warn：清理失败不影响终态结果）。
+  static Future<void> _deleteCheckpointQuietly(
+      AppDatabase db, String assistantMessageId) async {
+    try {
+      await db.deleteTurnCheckpoint(assistantMessageId);
+    } catch (e) {
+      _warnCheckpoint('turn.checkpoint.delete', e);
+    }
+  }
+
+  /// R03-A6：启动时恢复在途回合，返回恢复条数（测试可直接 await）。
+  ///
+  /// 语义：**重发请求 + 跳过已处理块**（不是续接上游流）；未闭合块按既有规则丢弃。
+  /// - 会话存在且 assistant 消息仍为 streaming → 重建 handle 并 unawaited 继续跑；
+  /// - 否则按「非法检查点」处理：消息置 error + 删检查点（不静默标 done）；
+  /// - 同会话多条检查点 → 保留 updated_at 最新，其余删掉并 warn。
+  Future<int> recoverTurns() async {
+    final db = AppDatabase.instance;
+    var recovered = 0;
+    try {
+      final all = await db.getTurnCheckpoints();
+      if (all.isEmpty) return 0;
+      final latest = <String, AssistantTurnCheckpoint>{};
+      for (final c in all) {
+        final prev = latest[c.conversationId];
+        if (prev == null) {
+          latest[c.conversationId] = c;
+          continue;
+        }
+        final keepNew = c.updatedAt >= prev.updatedAt;
+        final drop = keepNew ? prev : c;
+        AppLog.instance.warn('turn.checkpoint.stale',
+            '会话 ${c.conversationId} 有多个检查点，丢弃 ${drop.assistantMessageId}');
+        await _deleteCheckpointQuietly(db, drop.assistantMessageId);
+        if (keepNew) latest[c.conversationId] = c;
+      }
+
+      for (final c in latest.values) {
+        try {
+          final conversation = await db.getConversationById(c.conversationId);
+          final msg = await db.getChatMessageById(c.assistantMessageId);
+          if (conversation == null ||
+              msg == null ||
+              msg.status != ChatMessageStatus.streaming) {
+            if (msg != null) {
+              await db.updateChatMessageStatus(msg.id, ChatMessageStatus.error);
+            }
+            await _deleteCheckpointQuietly(db, c.assistantMessageId);
+            continue;
+          }
+          final handle = AssistantTurnHandle._(
+              conversation: conversation,
+              text: c.inputText,
+              attachments: c.inputAttachments,
+              reasoning: c.reasoning)
+            ..channel = _newChannel();
+          activeTurns[conversation.id] = handle;
+          handle.phase.addListener(() => turnsVersion.value++);
+          turnsVersion.value++;
+          recovered++;
+          unawaited(_runTurn(handle, resume: c));
+        } catch (e) {
+          _warnCheckpoint('turn.recover', e);
+        }
+      }
+    } catch (e) {
+      _warnCheckpoint('turn.recover', e);
+    }
+    return recovered;
+  }
+
+  /// R03-A6：运行一个回合。[resume] 非空 = 从检查点**恢复**（重发请求 + 跳过已处理块）。
+  Future<void> _runTurn(AssistantTurnHandle handle,
+      {AssistantTurnCheckpoint? resume}) async {
     final conversation = handle.conversation;
     final db = AppDatabase.instance;
     final now = DateTime.now().millisecondsSinceEpoch;
+    final resumed = resume != null;
 
-    final userMsg = ChatMessage(
-      id: _uuid.v4(),
-      conversationId: conversation.id,
-      role: ChatRole.user,
-      content: handle.text,
-      attachments: handle.attachments,
-      status: ChatMessageStatus.done,
-      createdAt: now,
-    );
-    await db.insertChatMessage(userMsg);
-    // 首条用户消息截断生成对话标题（design-v3 §1.4）
-    if (conversation.title == '新对话') {
-      final title = deriveConversationTitle(handle.text);
-      // 纯附件回合没有文本：保留「新对话」，等第一条有文本的消息再命名
-      if (title.isNotEmpty) {
-        await db.renameConversation(conversation.id, title);
+    late final ChatMessage assistantMsg;
+    if (!resumed) {
+      final userMsg = ChatMessage(
+        id: _uuid.v4(),
+        conversationId: conversation.id,
+        role: ChatRole.user,
+        content: handle.text,
+        attachments: handle.attachments,
+        status: ChatMessageStatus.done,
+        createdAt: now,
+      );
+      await db.insertChatMessage(userMsg);
+      // 首条用户消息截断生成对话标题（design-v3 §1.4）
+      if (conversation.title == '新对话') {
+        final title = deriveConversationTitle(handle.text);
+        // 纯附件回合没有文本：保留「新对话」，等第一条有文本的消息再命名
+        if (title.isNotEmpty) {
+          await db.renameConversation(conversation.id, title);
+        }
       }
-    }
-    await db.touchConversation(conversation.id);
+      await db.touchConversation(conversation.id);
 
-    final assistantMsg = ChatMessage(
-      id: _uuid.v4(),
-      conversationId: conversation.id,
-      role: ChatRole.assistant,
-      content: '',
-      status: ChatMessageStatus.streaming,
-      createdAt: DateTime.now().millisecondsSinceEpoch,
-    );
-    await db.insertChatMessage(assistantMsg);
-    // 用户消息与占位已落库：让对话页立即刷新上屏（不等首个 token）
-    handle._emit(const AssistantTurnStarted());
+      assistantMsg = ChatMessage(
+        id: _uuid.v4(),
+        conversationId: conversation.id,
+        role: ChatRole.assistant,
+        content: '',
+        status: ChatMessageStatus.streaming,
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      await db.insertChatMessage(assistantMsg);
+      // 用户消息与占位已落库：让对话页立即刷新上屏（不等首个 token）
+      handle._emit(const AssistantTurnStarted());
+    } else {
+      // 恢复：复用原 assistant 消息；不新建、不重发用户消息、不 emit TurnStarted。
+      final existing = await db.getChatMessageById(resume.assistantMessageId);
+      if (existing == null ||
+          existing.status != ChatMessageStatus.streaming ||
+          await db.getConversationById(conversation.id) == null) {
+        if (existing != null) {
+          await db.updateChatMessageStatus(
+              existing.id, ChatMessageStatus.error);
+        }
+        try {
+          await db.deleteTurnCheckpoint(resume.assistantMessageId);
+        } catch (e) {
+          _warnCheckpoint('turn.checkpoint.delete', e);
+        }
+        // 不得静默标 done：明确告知恢复失败
+        handle._emit(const AssistantTurnError(
+            '恢复失败：原生成消息不存在或已非流式状态，本次未继续生成'));
+        return;
+      }
+      assistantMsg = existing;
+    }
 
     final vision = await handle.channel.isVisionCapable(conversation.modelConfigId);
     final expanded =
@@ -516,7 +648,8 @@ class AssistantService {
     // 未选中的消息不进 triage、不产提案。
     final selectedMessageIds = selectedMessageIdsOf(handle.attachments);
 
-    final visible = StringBuffer();
+    // R03-A6：恢复时已生成正文接着往后追加（不重复输出）
+    final visible = StringBuffer(resumed ? resume.visibleText : '');
     var interrupted = false;
     String? errorText;
 
@@ -534,28 +667,78 @@ class AssistantService {
     // 3. 续跑上限 [maxToolContinuations] 轮（首轮之外），防连环只读烧额度；
     // 4. 出错 / 中断早退；**审批通过后的续跑属 Q13，本轮不做**。
     const maxToolContinuations = 2;
-    var continuationRound = 0;
+    // R03-A6：恢复沿用检查点里的轮数 —— 恢复**不能**多送轮数，仍受上限约束
+    var continuationRound = resumed ? resume.continuationRound : 0;
+    // 恢复的首轮要按「续跑」处理历史（让模型看到已生成正文）
+    var forceContinuationOnce = resumed;
+    // 已处理块的序号（跨轮保存，供检查点使用）
+    var lastBlockCount = resumed ? resume.nextBlockIndex : 0;
+    // 首轮解析器从检查点块序号继续：已处理过的块不会再产出
+    var nextParserStart = resumed ? resume.nextBlockIndex : 0;
     // F33：本轮各段思考文本（section → 文本），回合收尾落库到 assistant 消息。
     final thinkingBySection = <int, String>{};
+    // R03-A6：恢复时回填已生成思考文本（历史「过程」行续上）
+    if (resumed && resume.thinkingText.isNotEmpty) {
+      thinkingBySection[0] = resume.thinkingText;
+    }
     // F35：协议级推理内容（reasoning_content）单独占一个段号，避免与 <think> 段冲突。
     const reasoningSection = 10000;
     final reasoningBuf = StringBuffer();
     // F35：思考起止时间（首次/末次思考事件），用于落库真实耗时。
     DateTime? thinkingStartedAt;
     DateTime? thinkingLastAt;
+
+    /// R03-A6：检查点写入的**唯一入口**（去抖 400ms 合并；落库失败只 warn）。
+    ///
+    /// 内容 = 恢复所需的最小状态；不阻塞事件 pump。
+    Timer? checkpointTimer;
+    Future<void> writeCheckpoint() async {
+      try {
+        final thinking = thinkingBySection.values
+            .where((t) => t.trim().isNotEmpty)
+            .join('\n\n');
+        await db.upsertTurnCheckpoint(AssistantTurnCheckpoint(
+          assistantMessageId: assistantMsg.id,
+          conversationId: conversation.id,
+          phase: handle.phase.value.name,
+          visibleText: visible.toString(),
+          thinkingText: thinking,
+          nextBlockIndex: lastBlockCount,
+          continuationRound: continuationRound,
+          inputText: handle.text,
+          inputAttachments: handle.attachments,
+          reasoning: handle.reasoning,
+          updatedAt: DateTime.now().millisecondsSinceEpoch,
+        ));
+      } catch (e) {
+        // 检查点只是崩溃恢复的辅助：写失败绝不中断回合
+        _warnCheckpoint('turn.checkpoint.write', e);
+      }
+    }
+
+    /// 去抖版（delta 高频调用）；闭合块/续跑前直接 await [writeCheckpoint]。
+    void scheduleCheckpoint() {
+      checkpointTimer?.cancel();
+      checkpointTimer = Timer(const Duration(milliseconds: 400), () {
+        unawaited(writeCheckpoint());
+      });
+    }
+
     void markThinking() {
       final now = DateTime.now();
       thinkingStartedAt ??= now;
       thinkingLastAt = now;
+      scheduleCheckpoint();
     }
 
     while (true) {
-      final isContinuation = continuationRound > 0;
+      final isContinuation = continuationRound > 0 || forceContinuationOnce;
       if (isContinuation) {
         // 续跑前把本轮已生成的正文先落库：第二轮请求要带上这段 narration，
         // 否则模型看不到自己上一轮说过什么，容易重复生成同一段。
         await db.updateChatMessageContent(assistantMsg.id, visible.toString());
       }
+      forceContinuationOnce = false;
       // ---- 每轮：重建历史与请求（续跑必须看到上一轮回注的工具结果）----
       final history = (await db.getChatMessages(conversation.id))
           .where((m) {
@@ -582,7 +765,10 @@ class AssistantService {
       ];
 
       final thinkParser = ThinkTagParser();
-      final parser = ToolBlockParser();
+      // 恢复的首轮从检查点块序号继续（已处理块不再产出）；后续轮是新流，从 0 开始
+      final parser = ToolBlockParser(startBlockIndex: nextParserStart);
+      nextParserStart = 0;
+      lastBlockCount = parser.blockCount;
 
       /// 本轮只读工具结果条数 / 本轮待审批提案条数（B19 续跑判据）。
       var readResultsThisRound = 0;
@@ -612,8 +798,10 @@ class AssistantService {
             break;
           case ProposalValidationFailure():
             final content = '一个动作未能理解，已跳过：${outcome.reason}';
-            await ProposalExecutor.instance
-                .reportToolMessage(conversation.id, content);
+            // R03②：只读/失败的确定性回注 id（同一条 assistant 消息 + block 序号）
+            await ProposalExecutor.instance.reportToolMessage(
+                conversation.id, content,
+                messageId: '${assistantMsg.id}_b${block.index}_result');
             pendingEvents.add(AssistantToolMessage(block.index, content));
           case ReadToolResult():
             readResultsThisRound++;
@@ -622,11 +810,33 @@ class AssistantService {
             final tool = block.tool ?? 'tool';
             final resultText = outcome.text;
             final content = '[$tool] $resultText';
-            await ProposalExecutor.instance
-                .reportToolMessage(conversation.id, content);
+            // R03②：只读工具回注也走确定性 id，重复执行同一 block 只有 1 条
+            await ProposalExecutor.instance.reportToolMessage(
+                conversation.id, content,
+                messageId: '${assistantMsg.id}_b${block.index}_result');
             pendingEvents.add(AssistantToolMessage(block.index, content));
         }
       }
+
+    // R03-A5（task-112）：**发请求前**做请求级预算硬闸门。
+    // 每轮循环顶部判定（续跑轮也要，因为工具结果会加进历史）；
+    // 超限 → 直接走既有 error 收尾（break 出 while），不发起网络请求、不静默截断。
+    // desktop 路径的窗口本地不可知（见 contextWindowFor 注释）→ window==null 不判定。
+    final window =
+        await handle.channel.contextWindowFor(conversation.modelConfigId);
+    if (window != null) {
+      final budget = estimateRequestBudget(
+        messages: requestMessages,
+        attachments: expanded,
+        limitTokens: window.tokens,
+      );
+      if (budget.over100) {
+        errorText = '上下文超出上限：估算 $budget.usedTokens tokens / 上限 '
+            '${formatContextWindowTokens(window.tokens)}（字符估算，本次未发送请求）。'
+            '请精简历史/附件，或改用窗口更大的模型。';
+        break;
+      }
+    }
 
     try {
       await for (final ev in handle.channel.chat(
@@ -657,9 +867,15 @@ class AssistantService {
             if (res.text.isNotEmpty) {
               visible.write(res.text);
               handle._emit(AssistantTextDelta(res.text, visible.toString()));
+              scheduleCheckpoint(); // R03-A6：正文增量去抖落检查点
             }
             for (final block in res.blocks) {
               await handleBlock(block);
+            }
+            if (res.blocks.isNotEmpty) {
+              // R03-A6：闭合块处理后**立即**落检查点（避免崩溃后重放已处理块）
+              lastBlockCount = parser.blockCount;
+              await writeCheckpoint();
             }
           case ChatReasoningDelta():
             // F35：协议级推理内容（reasoning_content）直接作为思考段上报，
@@ -730,6 +946,8 @@ class AssistantService {
           proposalsThisRound == 0 &&
           continuationRound < maxToolContinuations;
       if (!shouldContinue) break;
+      // R03-A6：续跑前把当前进度落检查点（取消/崩溃也能从这里恢复）
+      await writeCheckpoint();
       continuationRound++;
       // 续跑沿用**同一个** handle 与 assistantMsg：阶段拨回「思考中」，
       // 界面继续显示同一个进行态；不新增事件类型（避免 UI 改动）。
@@ -751,15 +969,19 @@ class AssistantService {
           thinkingMs: ms);
     }
 
+    // R03-A6：终态（done / error / 取消后落到 done）先写终态、再删检查点。
+    checkpointTimer?.cancel();
     if (errorText != null) {
       await db.updateChatMessageContent(assistantMsg.id, visible.toString());
       await db.updateChatMessageStatus(
           assistantMsg.id, ChatMessageStatus.error);
+      await _deleteCheckpointQuietly(db, assistantMsg.id);
       handle._emit(AssistantTurnError(errorText));
     } else {
       await db.updateChatMessageContent(assistantMsg.id, visible.toString());
       await db.updateChatMessageStatus(
           assistantMsg.id, ChatMessageStatus.done);
+      await _deleteCheckpointQuietly(db, assistantMsg.id);
       handle._emit(const AssistantTurnDone());
     }
 

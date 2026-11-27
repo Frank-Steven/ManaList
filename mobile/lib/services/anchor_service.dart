@@ -43,6 +43,8 @@ class AnchorService {
     String? label,
     String createdBy = AnchorCreatedBy.user,
     String actor = OpActor.user,
+    // R03②：提案执行路径传确定性 op_id（同一提案/字段可重放识别）
+    String? opId,
   }) async {
     final db = AppDatabase.instance;
     final exists = switch (targetType) {
@@ -77,17 +79,17 @@ class AnchorService {
       createdBy: createdBy,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
-    await db.insertAnchor(anchor, actor: actor);
+    await db.insertAnchor(anchor, actor: actor, opId: opId);
     return AnchorInsertResult(anchor: anchor);
   }
 
   /// 移除锚点（只删表行；OR-Set 移除只覆盖观察到的 tag，
   /// 并发再添加的新 tag 按 add-wins 保留）。锚点不存在返回 false。
   Future<bool> removeAnchor(String anchorId,
-      {String actor = OpActor.user}) async {
+      {String actor = OpActor.user, String? opId}) async {
     final db = AppDatabase.instance;
     if (await db.getAnchorById(anchorId) == null) return false;
-    await db.deleteAnchor(anchorId, actor: actor);
+    await db.deleteAnchor(anchorId, actor: actor, opId: opId);
     return true;
   }
 }

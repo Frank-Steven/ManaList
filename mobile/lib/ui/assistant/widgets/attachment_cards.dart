@@ -1,10 +1,21 @@
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../../../models/library_file.dart';
+// 本文件只用到字符估算；其余符号由下方 export 转发给既有 UI 调用点。
+import '../../../services/token_estimate.dart' show estimateTokensFromChars;
 import '../../../services/assistant/models.dart';
+
+// R03-A5：唯一定义已搬到 services/token_estimate.dart（服务层预算要用同一口径）。
+// 这里只做**转发**，既有 UI 调用点（chat_page.dart 等）零改动；禁止再保留本地实现。
+export '../../../services/token_estimate.dart'
+    show
+        kInlineImageMaxSide,
+        kImageTokenAreaDivisor,
+        kConservativeImageTokens,
+        estimateImageTokens,
+        estimateTokensFromChars;
 import '../../../services/context_window.dart';
 import '../../../services/library_file_service.dart'
     show isImageFile;
@@ -44,46 +55,11 @@ class AttachmentMeta {
   });
 }
 
-/// token 估算（§3.6）：字符数 / 2（CJK 保守估计）。
-int estimateTokensFromChars(int chars) => (chars / 2).ceil();
-
-/// 图片内联口径：encodeInlineImage 默认把长边缩到 [kInlineImageMaxSide]
-/// （services/assistant/image_encoder.dart:16）。视觉开销与**像素面积**相关、
-/// 与文件字节数无关 —— 用字节数会把 50KB JPEG 算成 2.5 万 token（F22）。
-const int kInlineImageMaxSide = 1024;
-
-/// 视觉 token ≈ 缩放后像素面积 / 750（业界常用近似，仅用于预算提示）。
-const int kImageTokenAreaDivisor = 750;
-
-/// 宽高未知时的**保守上界**：1024×1024 / 750 ≈ 1398.1 → 取 1400。
-const int kConservativeImageTokens = 1400;
-
 /// 未知大小的**文本/其它附件**保守下界（B29）：按 200 字符估算 → 100 tokens。
 /// 用于「库里 size 列为 NULL」的存量行，避免附件预算静默算 0；
 /// 这个值明显小于任何真实附件，不会把预算撑爆，但能让「0 token」不再出现。
 const int kUnknownTextAttachmentChars = 200;
 const int kUnknownTextAttachmentTokens = 100;
-
-/// 图片附件的 token 估算（F22 修复）：按长边 [maxSide] 等比缩放后的面积算，
-/// 不用文件字节数。宽/高未知或非法 → 回退 [kConservativeImageTokens]。
-int estimateImageTokens({
-  int? width,
-  int? height,
-  int maxSide = kInlineImageMaxSide,
-}) {
-  if (width == null || height == null || width <= 0 || height <= 0) {
-    return kConservativeImageTokens;
-  }
-  var w = width;
-  var h = height;
-  final longest = math.max(w, h);
-  if (maxSide > 0 && longest > maxSide) {
-    final scale = maxSide / longest;
-    w = math.max(1, (w * scale).round());
-    h = math.max(1, (h * scale).round());
-  }
-  return math.max(1, (w * h / kImageTokenAreaDivisor).ceil());
-}
 
 /// 草稿附件 token 估算合计（§3.6）：图片走 [AttachmentMeta.imageTokens]，
 /// 其余类型沿用「字符/2」。

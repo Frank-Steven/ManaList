@@ -14,6 +14,7 @@ import '../models/task.dart';
 import 'app_log.dart';
 import 'assistant/models.dart';
 import 'crdt.dart';
+import 'fold_markers.dart' show isChatSource;
 import 'reminder_service.dart';
 
 /// 收件箱按应用筛选用的来源应用项。
@@ -305,6 +306,31 @@ Future<void> migrateToV15(DatabaseExecutor db) async {
   await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_undo_anchors_created ON undo_deleted_anchors(created_at)');
 }
+
+/// v16（R03-A6）：回合检查点 —— 崩溃/被杀后重启恢复在途回合。
+///
+/// 只存「恢复请求所需的最小状态」：已生成正文/思考、下一个待处理块序号、
+/// 已用续跑轮数、输入文本与附件。恢复走「重发请求 + 跳过已处理块」，
+/// **不是**续接上游流。onCreate 与 v15→v16 迁移共用，IF NOT EXISTS 保证幂等。
+Future<void> migrateToV16(DatabaseExecutor db) async {
+  await db.execute('''
+    CREATE TABLE IF NOT EXISTS assistant_turn_checkpoints(
+      assistant_message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      visible_text TEXT NOT NULL DEFAULT '',
+      thinking_text TEXT NOT NULL DEFAULT '',
+      next_block_index INTEGER NOT NULL DEFAULT 0,
+      continuation_round INTEGER NOT NULL DEFAULT 0,
+      input_text TEXT NOT NULL,
+      input_attachments TEXT NOT NULL DEFAULT '[]',
+      reasoning TEXT,
+      updated_at INTEGER NOT NULL
+    )
+  ''');
+  await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_turn_checkpoints_conversation ON assistant_turn_checkpoints(conversation_id)');
+}
 /// op_log 建表（crdt.md §2.2/§7，DB v12）。onCreate 与 v12 迁移共用。
 Future<void> createOpLogTable(DatabaseExecutor db) async {
   await db.execute('''
@@ -413,6 +439,30 @@ Future<void> normalizeAnchorsToObjectLevel(DatabaseExecutor db) async {
 /// 批量入库的分块大小：SQLite 的绑定变量上限（老版本 999），留足余量。
 const int kMessageHashLookupChunk = 400;
 
+/// D01（2026-11-27，用户选定「非聊天来源 2 秒」）：非聊天来源的**近重复窗口**。
+///
+/// 同一 key（packageName + title + body + sender）在 ±[kMessageNearDupWindowMs]
+/// 内（**含边界**）只保留第一条 —— 天气/音乐这类来源会在 20ms~1.3s 内重复推送
+/// 同一内容，但每次 contentHash 不同（时间戳/计数变化），UNIQUE 拦不住。
+///
+/// 聊天来源**不适用**（同一句话连发两次是正常的），窗口只作用于
+/// !isChatSource(packageName, appName) 的行。
+const int kMessageNearDupWindowMs = 2000;
+
+/// 近重复比较用的内容 key（不含 postedAt）。
+///
+/// 用 U+001F 分隔（与近重复查询里的 char(31) 一致），避免正文含分隔符导致串味；
+/// sender 为 null 按空串处理（与 SQL 的 ifnull 保持一致）。
+String messageNearDupKey({
+  required String packageName,
+  required String title,
+  required String body,
+  String? sender,
+}) {
+  const sep = '\u001f';
+  return '$packageName$sep$title$sep$body$sep${sender ?? ''}';
+}
+
 /// 「按 contentHash 去重后批量插入」的事务内实现（O03，2026-10-21）。
 ///
 /// 语义与**逐条**调用 [AppDatabase.insertMessageIfNew] 等价：
@@ -429,11 +479,33 @@ Future<int> insertMessagesIfNewInto(
     DatabaseExecutor txn, List<Message> messages) async {
   if (messages.isEmpty) return 0;
 
-  // 1) 批内去重：同 hash 只留第一条，避免同一批里的重复通知被插两次
+  // 1) 批内按 hash 去重：同 hash 只留第一条（先到先得）
   final seenHashes = <String>{};
-  final candidates = <Message>[];
+  final hashUnique = <Message>[];
   for (final m in messages) {
-    if (seenHashes.add(m.contentHash)) candidates.add(m);
+    if (seenHashes.add(m.contentHash)) hashUnique.add(m);
+  }
+
+  // 1b) 批内非聊天近重复：同 key 只有在**窗口内**才跳（窗口外必须保留）。
+  // 记录每个 key 已保留的 postedAt 列表，逐条比较 |Δ| <= 2000。
+  final seenNearTimes = <String, List<int>>{};
+  final candidates = <Message>[];
+  for (final m in hashUnique) {
+    if (isChatSource(m.packageName, m.appName)) {
+      candidates.add(m); // 聊天来源不做近重复拦截
+      continue;
+    }
+    final key = messageNearDupKey(
+        packageName: m.packageName,
+        title: m.title,
+        body: m.body,
+        sender: m.sender);
+    final times = seenNearTimes[key];
+    final isNearDup = times != null &&
+        times.any((t) => (t - m.postedAt).abs() <= kMessageNearDupWindowMs);
+    if (isNearDup) continue; // 窗口内同内容：拦掉
+    (times ?? (seenNearTimes[key] = <int>[])).add(m.postedAt);
+    candidates.add(m);
   }
 
   // 2) 一次查出库中已存在的 hash（分块，避免超出 SQLite 绑定变量上限）
@@ -454,11 +526,92 @@ Future<int> insertMessagesIfNewInto(
     }
   }
 
+  // 2b) 库内非聊天近重复：**一次**时间窗查询取回相关行，内存里比较 |ΔpostedAt|。
+  //     窗口取 [批内最早 - 2000, 批内最晚 + 2000]：逐条只需 ±2000，故整体并集足够。
+  //     只查一次（不按条数 N 次 SQL），候选行里再用 isChatSource 排除聊天来源。
+  final nearCandidates = <Message>[
+    for (final m in candidates)
+      if (!isChatSource(m.packageName, m.appName)) m,
+  ];
+  final nearBlocked = <String>{}; // 用 message id 记录被拦下的行
+  if (nearCandidates.isNotEmpty) {
+    var minAt = nearCandidates.first.postedAt;
+    var maxAt = minAt;
+    for (final m in nearCandidates) {
+      if (m.postedAt < minAt) minAt = m.postedAt;
+      if (m.postedAt > maxAt) maxAt = m.postedAt;
+    }
+    // 只取「时间窗内 **且** 内容 key 命中」的行：时间窗避免跨日回放扫全天，
+    // key IN 分块（≤400）避免绑定变量超限；两者都不做逐条 SQL。
+    final nearKeys = <String>[];
+    final nearKeySet = <String>{};
+    for (final m in nearCandidates) {
+      final k = messageNearDupKey(
+          packageName: m.packageName,
+          title: m.title,
+          body: m.body,
+          sender: m.sender);
+      if (nearKeySet.add(k)) nearKeys.add(k);
+    }
+    final existingByKey = <String, List<int>>{};
+    for (var i = 0; i < nearKeys.length; i += kMessageHashLookupChunk) {
+      final end = i + kMessageHashLookupChunk <= nearKeys.length
+          ? i + kMessageHashLookupChunk
+          : nearKeys.length;
+      final part = nearKeys.sublist(i, end);
+      final placeholders = List.filled(part.length, '?').join(',');
+      final nearRows = await txn.query(
+        'messages',
+        columns: const [
+          'package_name',
+          'app_name',
+          'title',
+          'body',
+          'sender',
+          'posted_at',
+        ],
+        // key 表达式必须与 messageNearDupKey 完全一致（U+001F = char(31)、sender ifnull ''）
+        where: 'posted_at >= ? AND posted_at <= ? AND '
+            "(package_name||char(31)||title||char(31)||body||char(31)||ifnull(sender,'')) IN ($placeholders)",
+        whereArgs: [
+          minAt - kMessageNearDupWindowMs,
+          maxAt + kMessageNearDupWindowMs,
+          ...part,
+        ],
+      );
+      for (final r in nearRows) {
+        final pkg = (r['package_name'] as String?) ?? '';
+        if (isChatSource(pkg, r['app_name'] as String?)) continue;
+        final key = messageNearDupKey(
+          packageName: pkg,
+          title: (r['title'] as String?) ?? '',
+          body: (r['body'] as String?) ?? '',
+          sender: r['sender'] as String?,
+        );
+        existingByKey.putIfAbsent(key, () => <int>[]).add(
+            (r['posted_at'] as num).toInt());
+      }
+    }
+    for (final m in nearCandidates) {
+      final at = existingByKey[messageNearDupKey(
+        packageName: m.packageName,
+        title: m.title,
+        body: m.body,
+        sender: m.sender,
+      )];
+      if (at == null) continue;
+      if (at.any((t) => (t - m.postedAt).abs() <= kMessageNearDupWindowMs)) {
+        nearBlocked.add(m.id);
+      }
+    }
+  }
+
   // 3) 只插新的（batch = 事务内的多条 insert，一次性提交）
   final batch = txn.batch();
   var inserted = 0;
   for (final m in candidates) {
     if (existing.contains(m.contentHash)) continue;
+    if (nearBlocked.contains(m.id)) continue;
     batch.insert('messages', m.toRow());
     inserted++;
   }
@@ -538,8 +691,8 @@ class AppDatabase {
   /// 列表默认上限（P3-8）：超出时调用方应提示「仅显示前 N 条」而不是静默截断。
   static const defaultMessageLimit = 500;
 
-  /// 库结构版本（B46：v15 增撤销备份表）。测试可直接断言它被升到 15。
-  static const dbVersion = 15;
+  /// 库结构版本（A6/R03：v16 增回合检查点表）。测试可直接断言它被升到 16。
+  static const dbVersion = 16;
 
   /// B46：撤销备份 TTL（与 UndoService 的 10 秒撤销窗口一致）。
   static const undoBackupTtl = Duration(seconds: 10);
@@ -579,13 +732,28 @@ class AppDatabase {
     required String kind,
     Map<String, dynamic>? payload,
     OpStamp? base,
+    // R03②：提案执行路径传确定性 op_id（提案ID_字段目标），
+    // 使同一提案的多字段写各不相同的 op 且可重放识别；人工/其它调用方不传 = UUID。
+    String? opId,
   }) async {
     final db = await database;
     _lamport += 1;
     final lamport = _lamport;
     final effectiveBase = base ?? await currentVersion(target);
+    // R03②（修正）：确定性 op_id 只用于「同一次执行」的去重。撤销后再审批
+    // 同一提案是**新的合法执行**，而 op_log 是 append-only —— 不能覆盖旧 op，
+    // 也不能让主键冲突把这次执行打成失败。做法：保留确定性前缀（恢复逻辑
+    // 用 `op_id LIKE '<提案ID>\_%'` 判定领域写入是否已发生），追加唯一后缀。
+    var effectiveOpId = opId ?? const Uuid().v4();
+    if (opId != null) {
+      final dup = await db.query('op_log',
+          columns: ['op_id'], where: 'op_id = ?', whereArgs: [effectiveOpId], limit: 1);
+      if (dup.isNotEmpty) {
+        effectiveOpId = '$opId#${const Uuid().v4()}';
+      }
+    }
     await db.insert('op_log', {
-      'op_id': const Uuid().v4(),
+      'op_id': effectiveOpId,
       'actor': actor,
       'lamport': lamport,
       'target': target,
@@ -595,6 +763,23 @@ class AppDatabase {
       'created_at': DateTime.now().millisecondsSinceEpoch,
     });
     return lamport;
+  }
+
+  /// R03③：是否存在以「提案ID」为前缀的 op（A2 确定性 op_id 约定：$提案ID_$字段目标）。
+  /// 崩溃恢复据此判断该提案的领域写入是否已经发生，避免重复执行。
+  Future<bool> hasOpForProposalPrefix(String proposalId) async {
+    final db = await database;
+    // op_id 形如「提案ID_字段目标」；LIKE 里 '_' 是通配符，必须 ESCAPE 成字面量
+    final escaped = proposalId
+        .replaceAll('\\', '\\\\')
+        .replaceAll('%', '\\%')
+        .replaceAll('_', '\\_');
+    final rows = await db.query('op_log',
+        columns: ['op_id'],
+        where: "op_id LIKE ? ESCAPE '\\'",
+        whereArgs: ['$escaped\\_%'],
+        limit: 1);
+    return rows.isNotEmpty;
   }
 
   /// 某 target（精确寻址串）的当前版本：lamport 最大的那条 op。
@@ -721,6 +906,10 @@ class AppDatabase {
       // v15（B46）：已归档批量删除的撤销备份表（messages / task_anchors 原行 JSON）。
       await migrateToV15(db);
     }
+    if (oldVersion < 16) {
+      // v16（R03-A6）：回合检查点表（崩溃/被杀后恢复在途回合）。
+      await migrateToV16(db);
+    }
   }
 
   /// 拆分系统折叠通知留下的存量消息：body 形如 "[5条]周辰羽: 。"、
@@ -809,6 +998,8 @@ class AppDatabase {
     await migrateToV12(db);
     // v15 起初始建库直接带上撤销备份表（B46）
     await migrateToV15(db);
+    // v16 起初始建库直接带上回合检查点表（R03-A6）
+    await migrateToV16(db);
   }
 
   /// v2 数据层建表（设计 §1.1 messages、§1.2 tasks、§1.3 笔记三级）。
@@ -1033,17 +1224,13 @@ class AppDatabase {
 
   // ---- v2: messages ----
 
-  /// 入库前按 contentHash 查重；返回是否为新插入。
+  /// 入库前按 contentHash（+ 非聊天近重复窗口）查重；返回是否为新插入。
+  ///
+  /// D01：为避免单条/批量两套判定走偏，这里**委托**批量实现（等价于
+  /// 逐条 check-then-insert 的老语义，只是多了非聊天 2 秒近重复这一条规则）。
   Future<bool> insertMessageIfNew(Message message) async {
-    final db = await database;
-    final rows = await db.query('messages',
-        columns: ['id'],
-        where: 'content_hash = ?',
-        whereArgs: [message.contentHash],
-        limit: 1);
-    if (rows.isNotEmpty) return false;
-    await db.insert('messages', message.toRow());
-    return true;
+    final inserted = await insertMessagesIfNew(<Message>[message]);
+    return inserted == 1;
   }
 
   /// 批量「去重后插入」，**整批一个事务**（O03，2026-10-21）：通知队列一次拉取
@@ -1178,7 +1365,7 @@ class AppDatabase {
   }
 
   Future<void> updateMessagePriority(List<String> ids, String priority,
-      {String actor = OpActor.user}) async {
+      {String actor = OpActor.user, String? opId}) async {
     if (ids.isEmpty) return;
     final db = await database;
     final placeholders = List.filled(ids.length, '?').join(',');
@@ -1189,7 +1376,11 @@ class AppDatabase {
           actor: actor,
           target: messageFieldTarget(id, 'priority'),
           kind: OpKind.lwwSet,
-          payload: {'value': priority});
+          payload: {'value': priority},
+          // 多 ID 时追加 id 后缀，保证各自 op_id 唯一（R03②）
+          opId: opId == null
+              ? null
+              : (ids.length == 1 ? opId : '${opId}_$id'));
     }
   }
 
@@ -1272,7 +1463,7 @@ class AppDatabase {
       };
 
   Future<void> insertAnchor(TaskAnchor anchor,
-      {String actor = OpActor.user}) async {
+      {String actor = OpActor.user, String? opId}) async {
     final db = await database;
     await db.insert('task_anchors', _anchorToRow(anchor),
         conflictAlgorithm: ConflictAlgorithm.replace);
@@ -1284,7 +1475,11 @@ class AppDatabase {
           'tag': anchor.id,
           'targetType': anchor.targetType,
           'targetId': anchor.targetId,
-        });
+        },
+        // R03②：提案路径传确定性 op_id（提案ID_tasks:<id>:anchors:<tag>）
+        opId: opId == null
+            ? null
+            : '${opId}_tasks:${anchor.taskId}:anchors:${anchor.id}');
   }
 
   Future<TaskAnchor?> getAnchorById(String id) async {
@@ -1339,7 +1534,8 @@ class AppDatabase {
     return rows.map(_anchorFromRow).toList();
   }
 
-  Future<void> deleteAnchor(String id, {String actor = OpActor.user}) async {
+  Future<void> deleteAnchor(String id,
+      {String actor = OpActor.user, String? opId}) async {
     final db = await database;
     final rows = await db.query('task_anchors',
         where: 'id = ?', whereArgs: [id], limit: 1);
@@ -1350,7 +1546,8 @@ class AppDatabase {
           actor: actor,
           target: anchorSetTarget(rows.first['task_id'] as String),
           kind: OpKind.orRemove,
-          payload: {'tags': [id]});
+          payload: {'tags': [id]},
+          opId: opId == null ? null : '${opId}_anchors-remove:$id');
     }
   }
 
@@ -1604,7 +1801,8 @@ class AppDatabase {
 
   /// 全字段更新并自动刷新 updated_at。
   /// v12：逐字段 diff 落 lww_set op（crdt.md §4.1 字段级寄存器）。
-  Future<void> updateTask(Task task, {String actor = OpActor.user}) async {
+  Future<void> updateTask(Task task,
+      {String actor = OpActor.user, String? opId}) async {
     final db = await database;
     final old = await getTaskById(task.id);
     await db.update(
@@ -1632,7 +1830,10 @@ class AppDatabase {
             actor: actor,
             target: taskFieldTarget(task.id, e.key),
             kind: OpKind.lwwSet,
-            payload: {'value': e.value});
+            payload: {'value': e.value},
+            // R03②：同一提案的多个字段写 → op_id 前缀相同、字段后缀不同；
+            // 不传 opId 时保持 UUID（人工编辑路径）。
+            opId: opId == null ? null : '${opId}_tasks:${task.id}:${e.key}');
       }
     }
     _rescheduleReminders();
@@ -1797,7 +1998,7 @@ class AppDatabase {
   /// 需要可撤销的调用方：删除前先 [snapshotTaskDeletion]，撤销时
   /// [restoreTaskDeletionSnapshot] + 回插任务行。
   Future<void> deleteTasks(List<String> ids,
-      {String actor = OpActor.user}) async {
+      {String actor = OpActor.user, String? opId}) async {
     if (ids.isEmpty) return;
     final db = await database;
     final placeholders = List.filled(ids.length, '?').join(',');
@@ -1808,7 +2009,11 @@ class AppDatabase {
     });
     for (final id in ids) {
       await recordOp(
-          actor: actor, target: taskPrefix(id), kind: OpKind.tombstone);
+          actor: actor,
+          target: taskPrefix(id),
+          kind: OpKind.tombstone,
+          // R03②：多 ID 时后缀区分，保证同提案内 op_id 唯一
+          opId: opId == null ? null : (ids.length == 1 ? opId : '${opId}_$id'));
     }
     _rescheduleReminders();
   }
@@ -1921,7 +2126,9 @@ class AppDatabase {
 
   Future<void> insertNotebook(Notebook notebook) async {
     final db = await database;
-    await db.insert('notebooks', notebook.toRow());
+    // R03②：提案路径会用确定性 id（提案ID_notebook）重复写入 → 必须幂等
+    await db.insert('notebooks', notebook.toRow(),
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<void> renameNotebook(String id, String name) async {
@@ -1957,7 +2164,8 @@ class AppDatabase {
 
   Future<void> insertChapter(Chapter chapter) async {
     final db = await database;
-    await db.insert('chapters', chapter.toRow());
+    await db.insert('chapters', chapter.toRow(),
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<void> renameChapter(String id, String name) async {
@@ -2011,7 +2219,8 @@ class AppDatabase {
   Future<void> updateNote(Note note,
       {String actor = OpActor.user,
       String opKind = OpKind.lwwSet,
-      Map<String, dynamic>? opPayload}) async {
+      Map<String, dynamic>? opPayload,
+      String? opId}) async {
     final db = await database;
     final old = await getNoteById(note.id);
     await db.update(
@@ -2025,7 +2234,8 @@ class AppDatabase {
           actor: actor,
           target: noteFieldTarget(note.id, 'content'),
           kind: opKind,
-          payload: opPayload ?? {'value': note.content});
+          payload: opPayload ?? {'value': note.content},
+          opId: opId == null ? null : '${opId}_notes:${note.id}:content');
     }
   }
 
@@ -2432,6 +2642,110 @@ class AppDatabase {
         'resolved_at': p.resolvedAt,
       };
 
+  /// R03③（task-110）：提案**收尾**的原子事务。
+  ///
+  /// 只在 approved 状态下成功（CAS：id + status='approved'，affected==1），
+  /// 并在**同一事务**内完成：写 undo payload、写确定性结果消息（replace）、
+  /// touchConversation（更新 updated_at）。
+  ///
+  /// 返回 false = 状态已被其它执行者改走 → 调用方不得再回注/注册撤销。
+  Future<bool> completeProposal(
+    String proposalId,
+    String to, {
+    Map<String, dynamic>? undoPayload,
+    ChatMessage? resultMessage,
+    String? conversationId,
+  }) async {
+    final db = await database;
+    return db.transaction((txn) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      // 仅允许 approved → applied/failed/superseded
+      if (to != ProposalStatus.applied &&
+          to != ProposalStatus.failed &&
+          to != ProposalStatus.superseded) {
+        return false;
+      }
+      final affected = await txn.update(
+        'change_proposals',
+        {'status': to, 'resolved_at': now},
+        where: 'id = ? AND status = ?',
+        whereArgs: [proposalId, ProposalStatus.approved],
+      );
+      if (affected != 1) return false;
+
+      if (undoPayload != null) {
+        final rows = await txn.query('change_proposals',
+            columns: ['payload'],
+            where: 'id = ?',
+            whereArgs: [proposalId],
+            limit: 1);
+        if (rows.isNotEmpty) {
+          final raw = rows.first['payload'];
+          final map = <String, dynamic>{};
+          if (raw is String && raw.isNotEmpty) {
+            final decoded = jsonDecode(raw);
+            if (decoded is Map) map.addAll(decoded.cast<String, dynamic>());
+          }
+          map['_undo'] = undoPayload;
+          await txn.update('change_proposals', {'payload': jsonEncode(map)},
+              where: 'id = ?', whereArgs: [proposalId]);
+        }
+      }
+
+      if (resultMessage != null) {
+        // 确定性 result id + replace → 重复恢复也只有 1 条
+        await txn.insert('chat_messages', resultMessage.toRow(),
+            conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+
+      if (conversationId != null) {
+        await txn.update('conversations', {'updated_at': now},
+            where: 'id = ?', whereArgs: [conversationId]);
+      }
+      return true;
+    });
+  }
+
+// ---- R03-A6：回合检查点（v16） ----
+
+  /// 写入/覆盖一条回合检查点（主键 = assistant 消息 id）。
+  Future<void> upsertTurnCheckpoint(AssistantTurnCheckpoint c) async {
+    final db = await database;
+    await db.insert('assistant_turn_checkpoints', c.toRow(),
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// 全部检查点（按 updated_at 升序，恢复时同会话取最新）。
+  Future<List<AssistantTurnCheckpoint>> getTurnCheckpoints() async {
+    final db = await database;
+    final rows = await db.query('assistant_turn_checkpoints',
+        orderBy: 'updated_at ASC');
+    return rows.map(AssistantTurnCheckpoint.fromRow).toList();
+  }
+
+  Future<AssistantTurnCheckpoint?> getTurnCheckpoint(
+      String assistantMessageId) async {
+    final db = await database;
+    final rows = await db.query('assistant_turn_checkpoints',
+        where: 'assistant_message_id = ?',
+        whereArgs: [assistantMessageId],
+        limit: 1);
+    return rows.isEmpty ? null : AssistantTurnCheckpoint.fromRow(rows.first);
+  }
+
+  Future<void> deleteTurnCheckpoint(String assistantMessageId) async {
+    final db = await database;
+    await db.delete('assistant_turn_checkpoints',
+        where: 'assistant_message_id = ?', whereArgs: [assistantMessageId]);
+  }
+
+  Future<void> deleteTurnCheckpointsForConversation(
+      String conversationId) async {
+    final db = await database;
+    await db.delete('assistant_turn_checkpoints',
+        where: 'conversation_id = ?', whereArgs: [conversationId]);
+  }
+
   Future<void> insertProposal(ChangeProposal proposal) async {
     final db = await database;
     await db.insert('change_proposals', _proposalToRow(proposal),
@@ -2480,6 +2794,11 @@ class AppDatabase {
   /// applied→pending 为「撤销已应用的变更」（details §3.2 历史区撤销入口）：
   /// 逆操作由 proposal_executor 先执行，再把提案退回待确认区。
   /// 非法流转或不存在的 id 返回 false；流转成功打 resolved_at。
+  ///
+  /// R03①（task-107）：这里是**审批 CAS** 的唯一落点 —— 更新条件带
+  /// 「id = ? AND status = <读到的 from>」，以 **affected rows == 1** 作为成功。
+  /// 并发两个执行者同时审批同一提案时，只有第一个能把 pending→approved，
+  /// 第二个 affected=0 → 返回 false（调用方必须据此停止，不得继续执行/回注）。
   Future<bool> transitionProposal(String id, String to) async {
     const allowed = {
       ProposalStatus.pending: {ProposalStatus.approved, ProposalStatus.rejected},
@@ -2498,15 +2817,16 @@ class AppDatabase {
       if (rows.isEmpty) return false;
       final from = rows.first['status'] as String;
       if (!(allowed[from]?.contains(to) ?? false)) return false;
-      await txn.update(
+      // CAS：where 里带上读到的 from；并发者改了状态时这里 affected=0
+      final affected = await txn.update(
           'change_proposals',
           {
             'status': to,
             'resolved_at': DateTime.now().millisecondsSinceEpoch,
           },
-          where: 'id = ?',
-          whereArgs: [id]);
-      return true;
+          where: 'id = ? AND status = ?',
+          whereArgs: [id, from]);
+      return affected == 1;
     });
   }
 }

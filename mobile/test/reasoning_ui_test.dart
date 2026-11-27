@@ -1,5 +1,6 @@
 import "package:flutter/material.dart";
 import "package:flutter_test/flutter_test.dart";
+import "package:msgrepo_mobile/services/context_window.dart";
 import "package:msgrepo_mobile/services/model_capabilities.dart";
 import "package:msgrepo_mobile/ui/assistant/widgets/context_meter.dart";
 import "package:msgrepo_mobile/ui/assistant/widgets/reasoning_pill_row.dart";

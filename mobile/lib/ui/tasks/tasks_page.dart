@@ -161,6 +161,8 @@ class TasksPageState extends State<TasksPage>
       floatingActionButton: _listSelecting
           ? null
           : FloatingActionButton(
+              // B44：与库页/会话页 FAB 并存，无共享元素转场 → 显式 null
+              heroTag: null,
               tooltip: '新建任务',
               onPressed: _createTask,
               child: const Icon(Icons.add),

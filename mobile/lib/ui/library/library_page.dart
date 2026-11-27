@@ -111,6 +111,10 @@ class LibraryPageState extends State<LibraryPage>
         ),
     };
     return FloatingActionButton(
+      // B44：库页/任务页/会话页的 FAB 可能同时存在于 HomeShell 页面栈中，
+      // 且它们之间没有共享元素转场需求 —— 显式 heroTag:null 避免「同一 Hero tag 多个」警告。
+      // （不设成各自字符串 tag：那会造成无意义的慢速 Hero 动画。）
+      heroTag: null,
       tooltip: tooltip,
       onPressed: onPressed,
       child: Icon(icon),
